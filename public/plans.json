@@ -1,0 +1,323 @@
+{
+  "savedPlans": [
+    {
+      "id": "demo-tokyo",
+      "name": "도쿄 2박3일 · 풀코스",
+      "meta": "최근 수정 · 동선 최적화됨",
+      "detail": "아사쿠사→우에노→오다이바까지 데모용 전체 일정",
+      "country": "일본",
+      "region": "도쿄",
+      "duration": "2박 3일",
+      "defaultLodgingId": "lodging-shinjuku",
+      "contentIds": [
+        "sensoji", "ameyoko", "ueno", "tokyo-museum", "akihabara",
+        "meiji", "takeshita", "omotesando", "shibuya", "shinjuku",
+        "tsukiji", "teamlab", "odaiba", "ginza", "tokyo-station"
+      ]
+    }
+  ],
+  "contents": [
+    {
+      "id": "sensoji",
+      "name": "센소지 사원",
+      "type": "역사 유적",
+      "summary": "아침 방문 추천, 전통 골목 연계",
+      "time": "09:00",
+      "latlng": [35.7148, 139.7967],
+      "img": "https://images.unsplash.com/photo-1549693578-d683be217e58?auto=format&fit=crop&w=300&q=70",
+      "day": 1,
+      "seq": 1,
+      "area": "아사쿠사",
+      "visitScore": 4,
+      "llmStayNote": "예배·둘러보기·사원가 대기행렬까지 약 2~2.5h 상당",
+      "indoor": false
+    },
+    {
+      "id": "ameyoko",
+      "name": "아메요코 시장",
+      "type": "쇼핑/로컬",
+      "summary": "간식, 로컬 쇼핑, 길거리 음식",
+      "time": "10:50",
+      "latlng": [35.7099, 139.7741],
+      "img": "https://images.unsplash.com/photo-1492571350019-22de08371fd3?auto=format&fit=crop&w=300&q=70",
+      "day": 1,
+      "seq": 2,
+      "area": "우에노",
+      "visitScore": 3,
+      "llmStayNote": "시장 구경·간식·짧은 쇼핑에 약 1~1.5h",
+      "indoor": false
+    },
+    {
+      "id": "ueno",
+      "name": "우에노 공원",
+      "type": "자연/산책",
+      "summary": "점심 전후 산책 코스",
+      "time": "12:10",
+      "latlng": [35.7156, 139.7731],
+      "img": "https://images.unsplash.com/photo-1528360983277-13d401cdc186?auto=format&fit=crop&w=300&q=70",
+      "day": 1,
+      "seq": 3,
+      "area": "우에노",
+      "visitScore": 3,
+      "llmStayNote": "넓은 공원 산책·벤치 휴식 포함 1~1.5h",
+      "indoor": false
+    },
+    {
+      "id": "tokyo-museum",
+      "name": "도쿄국립박물관",
+      "type": "역사/전시",
+      "summary": "일본문화 핵심 전시",
+      "time": "14:00",
+      "latlng": [35.7188, 139.7765],
+      "img": "https://images.unsplash.com/photo-1518998053901-5348d3961a04?auto=format&fit=crop&w=300&q=70",
+      "day": 1,
+      "seq": 4,
+      "area": "우에노",
+      "visitScore": 5,
+      "llmStayNote": "전시 동선 길고 해설 위주 시 3h+ 가능 → 5점",
+      "indoor": true
+    },
+    {
+      "id": "akihabara",
+      "name": "아키하바라",
+      "type": "쇼핑/서브컬처",
+      "summary": "테마샵 탐방 및 저녁 식사",
+      "time": "18:30",
+      "latlng": [35.6984, 139.7731],
+      "img": "https://images.unsplash.com/photo-1480796927426-f609979314bd?auto=format&fit=crop&w=300&q=70",
+      "day": 1,
+      "seq": 5,
+      "area": "아키하바라",
+      "visitScore": 4,
+      "llmStayNote": "매장 탐방·굿즈 구매에 2h 전후 부담 큼",
+      "indoor": true
+    },
+    {
+      "id": "meiji",
+      "name": "메이지 신궁",
+      "type": "역사 유적",
+      "summary": "오전 숲길 산책",
+      "time": "09:00",
+      "latlng": [35.6764, 139.6993],
+      "img": "https://images.unsplash.com/photo-1490806843957-31f4c9a91c65?auto=format&fit=crop&w=300&q=70",
+      "day": 2,
+      "seq": 1,
+      "area": "하라주쿠",
+      "visitScore": 3,
+      "llmStayNote": "참배·숲길 산책 1~1.5h",
+      "indoor": false
+    },
+    {
+      "id": "takeshita",
+      "name": "다케시타 거리",
+      "type": "쇼핑/트렌드",
+      "summary": "디저트와 스트리트 패션",
+      "time": "10:40",
+      "latlng": [35.6702, 139.7026],
+      "img": "https://images.unsplash.com/photo-1526481280695-3c4696d52e58?auto=format&fit=crop&w=300&q=70",
+      "day": 2,
+      "seq": 2,
+      "area": "하라주쿠",
+      "visitScore": 4,
+      "llmStayNote": "줄 서는 디저트·골목 쇼핑으로 2h 내외",
+      "indoor": false
+    },
+    {
+      "id": "omotesando",
+      "name": "오모테산도",
+      "type": "카페/디자인",
+      "summary": "브런치와 편집숍",
+      "time": "12:00",
+      "latlng": [35.6655, 139.7123],
+      "img": "https://images.unsplash.com/photo-1467269204594-9661b134dd2b?auto=format&fit=crop&w=300&q=70",
+      "day": 2,
+      "seq": 3,
+      "area": "오모테산도",
+      "visitScore": 3,
+      "llmStayNote": "브런치+편집숍 둘러보기 1~1.5h",
+      "indoor": false
+    },
+    {
+      "id": "shibuya",
+      "name": "시부야 스카이",
+      "type": "쇼핑/전망",
+      "summary": "일몰 시간대 뷰포인트",
+      "time": "17:30",
+      "latlng": [35.6595, 139.7005],
+      "img": "https://images.unsplash.com/photo-1536098561742-ca998e48cbcc?auto=format&fit=crop&w=300&q=70",
+      "day": 2,
+      "seq": 4,
+      "area": "시부야",
+      "visitScore": 4,
+      "llmStayNote": "입장·전망·굿즈 대기 포함 약 2h",
+      "indoor": true
+    },
+    {
+      "id": "shinjuku",
+      "name": "신주쿠 골든가이",
+      "type": "야경/미식",
+      "summary": "저녁 바 거리 탐방",
+      "time": "20:00",
+      "latlng": [35.6938, 139.7046],
+      "img": "https://images.unsplash.com/photo-1533929736458-ca588d08c8be?auto=format&fit=crop&w=300&q=70",
+      "day": 2,
+      "seq": 5,
+      "area": "신주쿠",
+      "visitScore": 4,
+      "llmStayNote": "바 호핑·야경 카페까지 2h 이상 여유 권장",
+      "indoor": true
+    },
+    {
+      "id": "tsukiji",
+      "name": "츠키지 장외시장",
+      "type": "미식/로컬",
+      "summary": "아침 해산물 브런치",
+      "time": "08:30",
+      "latlng": [35.6654, 139.7707],
+      "img": "https://images.unsplash.com/photo-1544481923-a6918bd997bc?auto=format&fit=crop&w=300&q=70",
+      "day": 3,
+      "seq": 1,
+      "area": "긴자",
+      "visitScore": 3,
+      "llmStayNote": "시장 돌며 브런치 1~1.5h",
+      "indoor": false
+    },
+    {
+      "id": "teamlab",
+      "name": "팀랩 플래닛",
+      "type": "전시/체험",
+      "summary": "몰입형 디지털 아트 체험",
+      "time": "10:30",
+      "latlng": [35.6492, 139.7898],
+      "img": "https://images.unsplash.com/photo-1501612780327-45045538702b?auto=format&fit=crop&w=300&q=70",
+      "day": 3,
+      "seq": 2,
+      "area": "토요스",
+      "visitScore": 5,
+      "llmStayNote": "입장 예약·체험 동선 길면 3h 가깝게 소요",
+      "indoor": true
+    },
+    {
+      "id": "odaiba",
+      "name": "오다이바 해변공원",
+      "type": "자연/뷰포인트",
+      "summary": "도쿄만 산책과 사진 스팟",
+      "time": "13:00",
+      "latlng": [35.6298, 139.7753],
+      "img": "https://images.unsplash.com/photo-1471623432079-b009d30b6729?auto=format&fit=crop&w=300&q=70",
+      "day": 3,
+      "seq": 3,
+      "area": "오다이바",
+      "visitScore": 3,
+      "llmStayNote": "산책·촬영 위주 1~1.5h",
+      "indoor": false
+    },
+    {
+      "id": "ginza",
+      "name": "긴자",
+      "type": "쇼핑/미식",
+      "summary": "기념품 쇼핑 및 디너",
+      "time": "17:00",
+      "latlng": [35.6717, 139.765],
+      "img": "https://images.unsplash.com/photo-1513407030348-c983a97b98d8?auto=format&fit=crop&w=300&q=70",
+      "day": 3,
+      "seq": 4,
+      "area": "긴자",
+      "visitScore": 4,
+      "llmStayNote": "백화점·디너·쇼핑 2h 전후",
+      "indoor": true
+    },
+    {
+      "id": "tokyo-station",
+      "name": "도쿄역 마루노우치",
+      "type": "야경/마무리",
+      "summary": "마지막 야경과 귀환 동선",
+      "time": "19:30",
+      "latlng": [35.6812, 139.7671],
+      "img": "https://images.unsplash.com/photo-1554797589-7241bb691973?auto=format&fit=crop&w=300&q=70",
+      "day": 3,
+      "seq": 5,
+      "area": "마루노우치",
+      "visitScore": 2,
+      "llmStayNote": "야경·사진·짧은 산책 45분~1h",
+      "indoor": false
+    }
+  ],
+  "lodgings": [
+    {
+      "id": "lodging-shinjuku",
+      "name": "신주쿠 숙소 (베이스)",
+      "summary": "교통 허브 접근이 좋아 첫 도쿄 여행에 안정적",
+      "latlng": [35.6912, 139.6998],
+      "area": "신주쿠"
+    },
+    {
+      "id": "lodging-ueno",
+      "name": "우에노 숙소",
+      "summary": "박물관·공원 접근이 좋아 오전 일정 시작이 편함",
+      "latlng": [35.7138, 139.7774],
+      "area": "우에노"
+    },
+    {
+      "id": "lodging-shibuya",
+      "name": "시부야 숙소",
+      "summary": "쇼핑·야경 중심 동선에 유리한 트렌디한 베이스",
+      "latlng": [35.6595, 139.7005],
+      "area": "시부야"
+    },
+    {
+      "id": "lodging-ginza",
+      "name": "긴자 숙소",
+      "summary": "미식/비즈니스 중심지로 저녁 일정 마무리가 쉬움",
+      "latlng": [35.6717, 139.765],
+      "area": "긴자"
+    }
+  ],
+  "movingOptions": [
+    {
+      "id": "public",
+      "name": "대중교통",
+      "detail": "JR·지하철·버스 조합, 정시성과 비용 균형",
+      "score": "추천도 96%",
+      "line": "긴자선 · 야마노테선 · 유리카모메 등",
+      "fare": "약 1,980엔~ (3일 통행권 활용 시 절감)",
+      "duration": "3일 합산 이동 약 4시간 10분",
+      "transfer": "우에노 · 시부야 · 신바시 등 환승",
+      "note": "러시아워(07:30~09:30) 구간은 여유 15분 권장"
+    },
+    {
+      "id": "taxi",
+      "name": "택시",
+      "detail": "문앞 픽업, 짐·동선 부담 최소",
+      "score": "추천도 78%",
+      "line": "도로 주행 (데모 시각화)",
+      "fare": "구간당 약 1,200~3,800엔 (예상)",
+      "duration": "3일 합산 이동 약 3시간 20분",
+      "transfer": "환승 없음, 정체 시 시간 변동",
+      "note": "심야 할증 구간은 LLM이 별도 표기 가능"
+    },
+    {
+      "id": "car",
+      "name": "렌터카",
+      "detail": "이동 자유도 높음, 주차·ETC 반영",
+      "score": "추천도 72%",
+      "line": "간선도로 위주 (데모 시각화)",
+      "fare": "렌트+주차+연료 약 28,000엔대 (예상)",
+      "duration": "3일 합산 이동 약 3시간 50분",
+      "transfer": "주차장 이동 포함",
+      "note": "도심은 역세권 주차 후 도보 연계 추천"
+    }
+  ],
+  "metroLines": [
+    { "id": "ginza",      "name": "긴자선",      "color": "#f4b400" },
+    { "id": "yamanote",   "name": "야마노테선",  "color": "#32a852" },
+    { "id": "hanzomon",   "name": "한조몬선",    "color": "#8f6ad8" },
+    { "id": "yurikamome", "name": "유리카모메",  "color": "#2f9edb" },
+    { "id": "marunouchi", "name": "마루노우치선","color": "#e34d4d" }
+  ],
+  "lineSequence": [
+    "ginza","yamanote","hanzomon","ginza","marunouchi",
+    "ginza","yurikamome","yurikamome","ginza","marunouchi",
+    "yamanote","ginza","hanzomon","ginza"
+  ]
+}
