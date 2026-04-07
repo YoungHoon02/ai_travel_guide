@@ -3,6 +3,18 @@ import { AnimatePresence, motion } from "framer-motion";
 import { MapContainer, Marker, Polyline, Popup, TileLayer } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
+import {
+  timeToMinutes,
+  minutesToTime,
+  calcProgress,
+  escapeHtml,
+  distSq,
+  orderNearestNeighborFrom,
+  buildTransitLikeRoute,
+  sumVisitScores as sumVisitScoresUtil,
+  assignOptimalDays as assignOptimalDaysUtil,
+  simulateLLMResponse,
+} from "./utils.js";
 
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -209,58 +221,6 @@ ${planText}
 추가 정보가 필요하면 재질문하세요. 항상 한국어로 응답하세요.`;
 }
 
-function simulateLLMResponse(userMessage, plan, currentTimeStr) {
-  const msg = userMessage;
-  const hourMatch = msg.match(/(\d{1,2})\s*시/);
-  const mentionedHour = hourMatch ? parseInt(hourMatch[1], 10) : null;
-
-  const isDelay = /늦잠|늦게|늦어|출발|지각|12시|오후|지연/.test(msg);
-  const isRain = /비|우천|날씨|폭우|우산/.test(msg);
-  const isCancellation = /취소|못|안|빠질|건너|skip/.test(msg);
-  const mentionedSpot = plan.find((item) => msg.includes(item.name));
-
-  if (isDelay && mentionedHour !== null) {
-    const cutMins = mentionedHour * 60;
-    const remaining = plan.filter((item) => timeToMinutes(item.time) >= cutMins);
-    const skipped = plan.filter((item) => timeToMinutes(item.time) < cutMins);
-    const skippedNames = skipped.map((i) => i.name).join(", ");
-    const modifiedSchedule = remaining.length ? remaining : plan;
-    return {
-      text: `✅ **상황 분석**: 현재 ${mentionedHour}시 출발로 인해 ${skippedNames ? `**${skippedNames}**` : "일부 오전 일정"}은 시간상 불가능합니다.\n\n📋 **수정 제안**: ${String(mentionedHour).padStart(2, "0")}:00 이후 일정부터 시작합니다. ${remaining.length === 0 ? "남은 일정이 없습니다 — 자유 여행을 즐기세요 😊" : `총 ${remaining.length}개 장소가 유지됩니다.`}`,
-      modifiedSchedule,
-    };
-  }
-
-  if (isRain) {
-    const outdoorSpots = plan.filter((item) => !item.indoor);
-    const indoorSpots = plan.filter((item) => item.indoor);
-    if (outdoorSpots.length === 0) {
-      return {
-        text: "☔ **날씨 분석**: 현재 일정은 모두 실내 위주입니다. 비가 오더라도 일정 변동 없이 진행 가능합니다!",
-        modifiedSchedule: null,
-      };
-    }
-    const outdoorNames = outdoorSpots.map((i) => i.name).join(", ");
-    return {
-      text: `☔ **날씨 분석**: **${outdoorNames}**는 야외 일정입니다. 비가 올 경우 이동 시 우산 필수이며, 특히 야외 공원·신사는 관람이 불편할 수 있습니다.\n\n💡 **제안**: 실내 일정(${indoorSpots.map((i) => i.name).join(", ")})을 먼저 배치하고, 날씨 호전 시 야외로 이동하는 것을 추천합니다. 일정 순서를 조정할까요?`,
-      modifiedSchedule: null,
-    };
-  }
-
-  if (isCancellation && mentionedSpot) {
-    const modified = plan.filter((item) => item.id !== mentionedSpot.id);
-    return {
-      text: `✅ **${mentionedSpot.name}** 일정을 제거했습니다. 남은 ${modified.length}개 일정으로 여행을 진행합니다. 해당 시간(${mentionedSpot.time})에 주변 장소를 탐방하거나 휴식을 취할 수 있습니다.`,
-      modifiedSchedule: modified,
-    };
-  }
-
-  return {
-    text: `🤔 **상황 파악 중**: "${userMessage.slice(0, 40)}..." — 현재 일정(${plan.length}개 장소)을 분석했습니다.\n\n현재 시간 ${currentTimeStr} 기준으로 일정 조정이 필요하신가요? 구체적인 상황을 알려주시면 더 정확한 도움을 드릴 수 있습니다.\n\n예: "늦잠 자서 12시에 출발", "비가 와서 야외 일정 변경", "팀랩 예약 취소"`,
-    modifiedSchedule: null,
-  };
-}
-
 async function callLLM({ userMessage, plan, currentTime, location, weather, progress, history, directions }) {
   if (!OPENAI_KEY) {
     await new Promise((r) => setTimeout(r, 700));
@@ -295,26 +255,10 @@ async function callLLM({ userMessage, plan, currentTime, location, weather, prog
   }
 }
 
-// ─── Utility: parse "HH:MM" to minutes since midnight ────────────────────────
-function timeToMinutes(hhmm) {
-  const [h, m] = (hhmm ?? "00:00").split(":").map(Number);
-  return h * 60 + (m || 0);
-}
+// ─── Utility aliases (imported from utils.js) ─────────────────────────────────
+// timeToMinutes, minutesToTime, calcProgress, distSq, orderNearestNeighborFrom,
+// buildTransitLikeRoute, escapeHtml are imported at the top of this file.
 
-function minutesToTime(mins) {
-  const h = Math.floor(mins / 60) % 24;
-  const m = mins % 60;
-  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
-}
-
-// ─── Calculate plan progress based on current time ───────────────────────────
-function calcProgress(schedule, currentTimeStr) {
-  const nowMins = timeToMinutes(currentTimeStr);
-  const done = schedule.filter((item) => timeToMinutes(item.time) < nowMins);
-  const remaining = schedule.filter((item) => timeToMinutes(item.time) >= nowMins);
-  const next = remaining[0] ?? null;
-  return { done, remaining, next, nowMins };
-}
 
 const STEP_LABELS = ["계정/플랜", "나라/지역/일정", "여행 성향", "이동 옵션", "숙소 선택", "LLM 컨텐츠", "최종 플랜"];
 
@@ -460,61 +404,14 @@ function findDayInBuckets(buckets, id) {
   return null;
 }
 
-function distSq(a, b) {
-  const dy = a[0] - b[0];
-  const dx = a[1] - b[1];
-  return dx * dx + dy * dy;
-}
+// distSq, orderNearestNeighborFrom imported from utils.js
 
-function orderNearestNeighborFrom(spots, originLatLng) {
-  if (spots.length === 0) return [];
-  const remaining = [...spots];
-  const ordered = [];
-  let cur = originLatLng;
-  while (remaining.length) {
-    let bestI = 0;
-    let bestD = Infinity;
-    remaining.forEach((p, i) => {
-      const d = distSq(cur, p.latlng);
-      if (d < bestD) {
-        bestD = d;
-        bestI = i;
-      }
-    });
-    const next = remaining.splice(bestI, 1)[0];
-    ordered.push(next);
-    cur = next.latlng;
-  }
-  return ordered;
-}
-
-/**
- * 숙소→가까운 순 NN으로 방문 순서를 만든 뒤,
- * LLM 체류 부하(1~5점) 누적이「3일 평균 부하」(총점÷3)에 도달하면 다음 일차로 넘깁니다.
- */
 function assignOptimalDays(ids, lodgingLatLng) {
-  const spots = ids.map((id) => CONTENTS.find((c) => c.id === id)).filter(Boolean);
-  if (spots.length === 0) return { 1: [], 2: [], 3: [] };
-  const ordered = orderNearestNeighborFrom(spots, lodgingLatLng);
-  const totalScore = ordered.reduce((s, p) => s + (p.visitScore ?? 3), 0);
-  const targetPerDay = totalScore / 3;
-  const buckets = { 1: [], 2: [], 3: [] };
-  let day = 1;
-  let daySum = 0;
-  for (const p of ordered) {
-    const sc = p.visitScore ?? 3;
-    if (day < 3 && daySum >= targetPerDay && buckets[day].length > 0) {
-      day += 1;
-      daySum = 0;
-    }
-    buckets[day].push(p.id);
-    daySum += sc;
-  }
-  return buckets;
+  return assignOptimalDaysUtil(ids, lodgingLatLng, CONTENTS);
 }
 
 function sumVisitScores(ids) {
-  return ids.reduce((s, id) => s + (CONTENTS.find((c) => c.id === id)?.visitScore ?? 0), 0);
+  return sumVisitScoresUtil(ids, CONTENTS);
 }
 
 function normalizeSelectionForDemo(ids, targetLoad) {
@@ -1454,29 +1351,7 @@ function Select({ label, value, onChange, options }) {
   );
 }
 
-function buildTransitLikeRoute(points, moveId) {
-  if (points.length < 2) return points;
-  const route = [];
-  const bendScale = moveId === "taxi" ? 0.0035 : moveId === "car" ? 0.0052 : 0.0045;
-
-  for (let i = 0; i < points.length - 1; i += 1) {
-    const [lat1, lng1] = points[i];
-    const [lat2, lng2] = points[i + 1];
-    const midLat = (lat1 + lat2) / 2;
-    const midLng = (lng1 + lng2) / 2;
-    const bend = bendScale * (i + 1);
-    const phase = moveId === "car" ? 0.35 : 0.2;
-
-    route.push(
-      [lat1, lng1],
-      [lat1, midLng - bend],
-      [midLat + bend * phase, midLng - bend * (1 + phase)],
-      [midLat + bend * 0.5, lng2 + bend * 0.25],
-      [lat2, lng2]
-    );
-  }
-  return route;
-}
+// buildTransitLikeRoute imported from utils.js
 
 function buildMoveSegmentDefs(contents, moveId) {
   if (contents.length < 2) return [];
@@ -1588,14 +1463,7 @@ function RoutedPolylines({ defs, moveId, onSegmentClick }) {
 }
 
 // ─── VariableHandlerPanel ────────────────────────────────────────────────────
-function escapeHtml(str) {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#x27;");
-}
+// escapeHtml imported from utils.js
 
 function renderMarkdownLike(text) {
   return text.split("\n").map((line, i) => {
