@@ -51,7 +51,16 @@ async function fetchWeather(lat, lng) {
 }
 
 // ─── Google Maps nearby places (requires window.google loaded) ────────────────
-function fetchNearbyPlaces(lat, lng) {
+const PLACE_TYPES = [
+  { id: "tourist_attraction", label: "관광지", icon: "🏛️" },
+  { id: "restaurant", label: "식당", icon: "🍽️" },
+  { id: "cafe", label: "카페", icon: "☕" },
+  { id: "hospital", label: "병원", icon: "🏥" },
+  { id: "pharmacy", label: "약국", icon: "💊" },
+  { id: "convenience_store", label: "편의점", icon: "🏪" },
+];
+
+function fetchNearbyPlaces(lat, lng, type = "tourist_attraction", radius = 1500) {
   return new Promise((resolve) => {
     if (!window.google?.maps?.places) {
       resolve([]);
@@ -59,7 +68,7 @@ function fetchNearbyPlaces(lat, lng) {
     }
     const svc = new window.google.maps.places.PlacesService(document.createElement("div"));
     svc.nearbySearch(
-      { location: { lat, lng }, radius: 1500, type: "tourist_attraction" },
+      { location: { lat, lng }, radius, type },
       (results, status) => {
         if (status === window.google.maps.places.PlacesServiceStatus.OK) {
           resolve(
@@ -67,6 +76,8 @@ function fetchNearbyPlaces(lat, lng) {
               name: p.name,
               vicinity: p.vicinity,
               rating: p.rating,
+              priceLevel: p.price_level,
+              openNow: p.opening_hours?.open_now ?? null,
               id: p.place_id,
             }))
           );
@@ -76,6 +87,66 @@ function fetchNearbyPlaces(lat, lng) {
       }
     );
   });
+}
+
+// ─── Google Maps Directions API ───────────────────────────────────────────────
+const GMAPS_TRAVEL_MODE_MAP = {
+  public: "TRANSIT",
+  taxi: "DRIVING",
+  car: "DRIVING",
+  walking: "WALKING",
+  bicycle: "BICYCLING",
+};
+
+function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING") {
+  return new Promise((resolve) => {
+    if (!window.google?.maps?.DirectionsService) {
+      resolve(null);
+      return;
+    }
+    const svc = new window.google.maps.DirectionsService();
+    svc.route(
+      {
+        origin: { lat: originLatLng[0], lng: originLatLng[1] },
+        destination: { lat: destLatLng[0], lng: destLatLng[1] },
+        travelMode: window.google.maps.TravelMode[travelMode],
+        language: "ko",
+      },
+      (result, status) => {
+        if (status === window.google.maps.DirectionsStatus.OK) {
+          const leg = result.routes?.[0]?.legs?.[0];
+          resolve({
+            duration: leg?.duration?.text ?? null,
+            durationSecs: leg?.duration?.value ?? null,
+            distance: leg?.distance?.text ?? null,
+            steps: (leg?.steps ?? []).slice(0, 5).map((s) => ({
+              instruction: escapeHtml((s.instructions ?? "").replace(/<[^>]*>/g, "").slice(0, 80)),
+              duration: s.duration?.text ?? "",
+              distance: s.distance?.text ?? "",
+              travelMode: s.travel_mode ?? travelMode,
+            })),
+            polylinePath: result.routes?.[0]?.overview_path?.map((p) => [p.lat(), p.lng()]) ?? null,
+          });
+        } else {
+          resolve(null);
+        }
+      }
+    );
+  });
+}
+
+async function fetchScheduleDirections(schedule, moveId) {
+  const travelMode = GMAPS_TRAVEL_MODE_MAP[moveId] ?? "DRIVING";
+  if (!window.google?.maps?.DirectionsService || schedule.length < 2) return [];
+  const results = await Promise.all(
+    schedule.slice(0, -1).map((from, idx) => {
+      const to = schedule[idx + 1];
+      return fetchGoogleDirections(from.latlng, to.latlng, travelMode).then((dir) =>
+        dir ? { fromId: from.id, toId: to.id, fromName: from.name, toName: to.name, ...dir } : null
+      );
+    })
+  );
+  return results.filter(Boolean);
 }
 
 // ─── Reverse geocode via Google Maps (city name) ─────────────────────────────
@@ -101,15 +172,20 @@ function reverseGeocode(lat, lng) {
 // ─── LLM call (OpenAI or rule-based simulation) ───────────────────────────────
 const OPENAI_KEY = import.meta.env.VITE_OPENAI_API_KEY;
 
-function buildSystemPrompt({ plan, currentTime, location, weather, progress }) {
+function buildSystemPrompt({ plan, currentTime, location, weather, progress, directions }) {
   const planText = plan
     .map(
       (item) =>
-        `DAY${item.assignedDay} ${item.time} [${item.area}] ${item.name} (${item.type}) 체류점수:${item.visitScore}`
+        `DAY${item.assignedDay} ${item.time} [${item.area}] ${item.name} (${item.type}) 체류점수:${item.visitScore} ${item.indoor ? "실내" : "야외"}`
     )
     .join("\n");
   const doneNames = progress.done.map((i) => i.name).join(", ") || "없음";
   const remainNames = progress.remaining.map((i) => i.name).join(", ") || "없음";
+  const dirText = directions && directions.length > 0
+    ? "\n이동 경로 정보 (Google Maps Directions):\n" + directions.map(
+        (d) => `  ${d.fromName} → ${d.toName}: ${d.duration ?? "?"} / ${d.distance ?? "?"}`
+      ).join("\n")
+    : "";
   return `당신은 AI 여행 도우미입니다. 사용자의 도쿄 2박3일 여행 일정을 실시간으로 관리합니다.
 
 현재 정보:
@@ -117,7 +193,7 @@ function buildSystemPrompt({ plan, currentTime, location, weather, progress }) {
 - 현재 위치: ${location ?? "위치 미확인"}
 - 날씨: ${weather ? `${weather.icon} ${weather.description} ${weather.temp} 습도${weather.humidity} 바람${weather.wind}` : "정보 없음"}
 - 완료된 일정: ${doneNames}
-- 남은 일정: ${remainNames}
+- 남은 일정: ${remainNames}${dirText}
 
 전체 여행 계획:
 ${planText}
@@ -144,13 +220,13 @@ function simulateLLMResponse(userMessage, plan, currentTimeStr) {
   const mentionedSpot = plan.find((item) => msg.includes(item.name));
 
   if (isDelay && mentionedHour !== null) {
-    const cutHHMM = `${String(mentionedHour).padStart(2, "0")}:00`;
-    const remaining = plan.filter((item) => item.time >= cutHHMM);
-    const skipped = plan.filter((item) => item.time < cutHHMM);
+    const cutMins = mentionedHour * 60;
+    const remaining = plan.filter((item) => timeToMinutes(item.time) >= cutMins);
+    const skipped = plan.filter((item) => timeToMinutes(item.time) < cutMins);
     const skippedNames = skipped.map((i) => i.name).join(", ");
     const modifiedSchedule = remaining.length ? remaining : plan;
     return {
-      text: `✅ **상황 분석**: 현재 ${mentionedHour}시 출발로 인해 ${skippedNames ? `**${skippedNames}**` : "일부 오전 일정"}은 시간상 불가능합니다.\n\n📋 **수정 제안**: ${cutHHMM} 이후 일정부터 시작합니다. ${remaining.length === 0 ? "남은 일정이 없습니다 — 자유 여행을 즐기세요 😊" : `총 ${remaining.length}개 장소가 유지됩니다.`}`,
+      text: `✅ **상황 분석**: 현재 ${mentionedHour}시 출발로 인해 ${skippedNames ? `**${skippedNames}**` : "일부 오전 일정"}은 시간상 불가능합니다.\n\n📋 **수정 제안**: ${String(mentionedHour).padStart(2, "0")}:00 이후 일정부터 시작합니다. ${remaining.length === 0 ? "남은 일정이 없습니다 — 자유 여행을 즐기세요 😊" : `총 ${remaining.length}개 장소가 유지됩니다.`}`,
       modifiedSchedule,
     };
   }
@@ -185,13 +261,13 @@ function simulateLLMResponse(userMessage, plan, currentTimeStr) {
   };
 }
 
-async function callLLM({ userMessage, plan, currentTime, location, weather, progress, history }) {
+async function callLLM({ userMessage, plan, currentTime, location, weather, progress, history, directions }) {
   if (!OPENAI_KEY) {
     await new Promise((r) => setTimeout(r, 700));
     return simulateLLMResponse(userMessage, plan, currentTime);
   }
   try {
-    const systemContent = buildSystemPrompt({ plan, currentTime, location, weather, progress });
+    const systemContent = buildSystemPrompt({ plan, currentTime, location, weather, progress, directions });
     const messages = [
       { role: "system", content: systemContent },
       ...history.map((h) => ({ role: h.role, content: h.content })),
@@ -313,21 +389,21 @@ const SAVED_PLANS = [
 ];
 
 const CONTENTS = [
-  { id: "sensoji", name: "센소지 사원", type: "역사 유적", summary: "아침 방문 추천, 전통 골목 연계", time: "09:00", latlng: [35.7148, 139.7967], img: "https://images.unsplash.com/photo-1549693578-d683be217e58?auto=format&fit=crop&w=300&q=70", day: 1, seq: 1, area: "아사쿠사", visitScore: 4, llmStayNote: "예배·둘러보기·사원가 대기행렬까지 약 2~2.5h 상당" },
-  { id: "ameyoko", name: "아메요코 시장", type: "쇼핑/로컬", summary: "간식, 로컬 쇼핑, 길거리 음식", time: "10:50", latlng: [35.7099, 139.7741], img: "https://images.unsplash.com/photo-1492571350019-22de08371fd3?auto=format&fit=crop&w=300&q=70", day: 1, seq: 2, area: "우에노", visitScore: 3, llmStayNote: "시장 구경·간식·짧은 쇼핑에 약 1~1.5h" },
-  { id: "ueno", name: "우에노 공원", type: "자연/산책", summary: "점심 전후 산책 코스", time: "12:10", latlng: [35.7156, 139.7731], img: "https://images.unsplash.com/photo-1528360983277-13d401cdc186?auto=format&fit=crop&w=300&q=70", day: 1, seq: 3, area: "우에노", visitScore: 3, llmStayNote: "넓은 공원 산책·벤치 휴식 포함 1~1.5h" },
-  { id: "tokyo-museum", name: "도쿄국립박물관", type: "역사/전시", summary: "일본문화 핵심 전시", time: "14:00", latlng: [35.7188, 139.7765], img: "https://images.unsplash.com/photo-1518998053901-5348d3961a04?auto=format&fit=crop&w=300&q=70", day: 1, seq: 4, area: "우에노", visitScore: 5, llmStayNote: "전시 동선 길고 해설 위주 시 3h+ 가능 → 5점" },
-  { id: "akihabara", name: "아키하바라", type: "쇼핑/서브컬처", summary: "테마샵 탐방 및 저녁 식사", time: "18:30", latlng: [35.6984, 139.7731], img: "https://images.unsplash.com/photo-1480796927426-f609979314bd?auto=format&fit=crop&w=300&q=70", day: 1, seq: 5, area: "아키하바라", visitScore: 4, llmStayNote: "매장 탐방·굿즈 구매에 2h 전후 부담 큼" },
-  { id: "meiji", name: "메이지 신궁", type: "역사 유적", summary: "오전 숲길 산책", time: "09:00", latlng: [35.6764, 139.6993], img: "https://images.unsplash.com/photo-1490806843957-31f4c9a91c65?auto=format&fit=crop&w=300&q=70", day: 2, seq: 1, area: "하라주쿠", visitScore: 3, llmStayNote: "참배·숲길 산책 1~1.5h" },
-  { id: "takeshita", name: "다케시타 거리", type: "쇼핑/트렌드", summary: "디저트와 스트리트 패션", time: "10:40", latlng: [35.6702, 139.7026], img: "https://images.unsplash.com/photo-1526481280695-3c4696d52e58?auto=format&fit=crop&w=300&q=70", day: 2, seq: 2, area: "하라주쿠", visitScore: 4, llmStayNote: "줄 서는 디저트·골목 쇼핑으로 2h 내외" },
-  { id: "omotesando", name: "오모테산도", type: "카페/디자인", summary: "브런치와 편집숍", time: "12:00", latlng: [35.6655, 139.7123], img: "https://images.unsplash.com/photo-1467269204594-9661b134dd2b?auto=format&fit=crop&w=300&q=70", day: 2, seq: 3, area: "오모테산도", visitScore: 3, llmStayNote: "브런치+편집숍 둘러보기 1~1.5h" },
-  { id: "shibuya", name: "시부야 스카이", type: "쇼핑/전망", summary: "일몰 시간대 뷰포인트", time: "17:30", latlng: [35.6595, 139.7005], img: "https://images.unsplash.com/photo-1536098561742-ca998e48cbcc?auto=format&fit=crop&w=300&q=70", day: 2, seq: 4, area: "시부야", visitScore: 4, llmStayNote: "입장·전망·굿즈 대기 포함 약 2h" },
-  { id: "shinjuku", name: "신주쿠 골든가이", type: "야경/미식", summary: "저녁 바 거리 탐방", time: "20:00", latlng: [35.6938, 139.7046], img: "https://images.unsplash.com/photo-1533929736458-ca588d08c8be?auto=format&fit=crop&w=300&q=70", day: 2, seq: 5, area: "신주쿠", visitScore: 4, llmStayNote: "바 호핑·야경 카페까지 2h 이상 여유 권장" },
-  { id: "tsukiji", name: "츠키지 장외시장", type: "미식/로컬", summary: "아침 해산물 브런치", time: "08:30", latlng: [35.6654, 139.7707], img: "https://images.unsplash.com/photo-1544481923-a6918bd997bc?auto=format&fit=crop&w=300&q=70", day: 3, seq: 1, area: "긴자", visitScore: 3, llmStayNote: "시장 돌며 브런치 1~1.5h" },
-  { id: "teamlab", name: "팀랩 플래닛", type: "전시/체험", summary: "몰입형 디지털 아트 체험", time: "10:30", latlng: [35.6492, 139.7898], img: "https://images.unsplash.com/photo-1501612780327-45045538702b?auto=format&fit=crop&w=300&q=70", day: 3, seq: 2, area: "토요스", visitScore: 5, llmStayNote: "입장 예약·체험 동선 길면 3h 가깝게 소요" },
-  { id: "odaiba", name: "오다이바 해변공원", type: "자연/뷰포인트", summary: "도쿄만 산책과 사진 스팟", time: "13:00", latlng: [35.6298, 139.7753], img: "https://images.unsplash.com/photo-1471623432079-b009d30b6729?auto=format&fit=crop&w=300&q=70", day: 3, seq: 3, area: "오다이바", visitScore: 3, llmStayNote: "산책·촬영 위주 1~1.5h" },
-  { id: "ginza", name: "긴자", type: "쇼핑/미식", summary: "기념품 쇼핑 및 디너", time: "17:00", latlng: [35.6717, 139.765], img: "https://images.unsplash.com/photo-1513407030348-c983a97b98d8?auto=format&fit=crop&w=300&q=70", day: 3, seq: 4, area: "긴자", visitScore: 4, llmStayNote: "백화점·디너·쇼핑 2h 전후" },
-  { id: "tokyo-station", name: "도쿄역 마루노우치", type: "야경/마무리", summary: "마지막 야경과 귀환 동선", time: "19:30", latlng: [35.6812, 139.7671], img: "https://images.unsplash.com/photo-1554797589-7241bb691973?auto=format&fit=crop&w=300&q=70", day: 3, seq: 5, area: "마루노우치", visitScore: 2, llmStayNote: "야경·사진·짧은 산책 45분~1h" },
+  { id: "sensoji", name: "센소지 사원", type: "역사 유적", summary: "아침 방문 추천, 전통 골목 연계", time: "09:00", latlng: [35.7148, 139.7967], img: "https://images.unsplash.com/photo-1549693578-d683be217e58?auto=format&fit=crop&w=300&q=70", day: 1, seq: 1, area: "아사쿠사", visitScore: 4, llmStayNote: "예배·둘러보기·사원가 대기행렬까지 약 2~2.5h 상당", indoor: false },
+  { id: "ameyoko", name: "아메요코 시장", type: "쇼핑/로컬", summary: "간식, 로컬 쇼핑, 길거리 음식", time: "10:50", latlng: [35.7099, 139.7741], img: "https://images.unsplash.com/photo-1492571350019-22de08371fd3?auto=format&fit=crop&w=300&q=70", day: 1, seq: 2, area: "우에노", visitScore: 3, llmStayNote: "시장 구경·간식·짧은 쇼핑에 약 1~1.5h", indoor: false },
+  { id: "ueno", name: "우에노 공원", type: "자연/산책", summary: "점심 전후 산책 코스", time: "12:10", latlng: [35.7156, 139.7731], img: "https://images.unsplash.com/photo-1528360983277-13d401cdc186?auto=format&fit=crop&w=300&q=70", day: 1, seq: 3, area: "우에노", visitScore: 3, llmStayNote: "넓은 공원 산책·벤치 휴식 포함 1~1.5h", indoor: false },
+  { id: "tokyo-museum", name: "도쿄국립박물관", type: "역사/전시", summary: "일본문화 핵심 전시", time: "14:00", latlng: [35.7188, 139.7765], img: "https://images.unsplash.com/photo-1518998053901-5348d3961a04?auto=format&fit=crop&w=300&q=70", day: 1, seq: 4, area: "우에노", visitScore: 5, llmStayNote: "전시 동선 길고 해설 위주 시 3h+ 가능 → 5점", indoor: true },
+  { id: "akihabara", name: "아키하바라", type: "쇼핑/서브컬처", summary: "테마샵 탐방 및 저녁 식사", time: "18:30", latlng: [35.6984, 139.7731], img: "https://images.unsplash.com/photo-1480796927426-f609979314bd?auto=format&fit=crop&w=300&q=70", day: 1, seq: 5, area: "아키하바라", visitScore: 4, llmStayNote: "매장 탐방·굿즈 구매에 2h 전후 부담 큼", indoor: true },
+  { id: "meiji", name: "메이지 신궁", type: "역사 유적", summary: "오전 숲길 산책", time: "09:00", latlng: [35.6764, 139.6993], img: "https://images.unsplash.com/photo-1490806843957-31f4c9a91c65?auto=format&fit=crop&w=300&q=70", day: 2, seq: 1, area: "하라주쿠", visitScore: 3, llmStayNote: "참배·숲길 산책 1~1.5h", indoor: false },
+  { id: "takeshita", name: "다케시타 거리", type: "쇼핑/트렌드", summary: "디저트와 스트리트 패션", time: "10:40", latlng: [35.6702, 139.7026], img: "https://images.unsplash.com/photo-1526481280695-3c4696d52e58?auto=format&fit=crop&w=300&q=70", day: 2, seq: 2, area: "하라주쿠", visitScore: 4, llmStayNote: "줄 서는 디저트·골목 쇼핑으로 2h 내외", indoor: false },
+  { id: "omotesando", name: "오모테산도", type: "카페/디자인", summary: "브런치와 편집숍", time: "12:00", latlng: [35.6655, 139.7123], img: "https://images.unsplash.com/photo-1467269204594-9661b134dd2b?auto=format&fit=crop&w=300&q=70", day: 2, seq: 3, area: "오모테산도", visitScore: 3, llmStayNote: "브런치+편집숍 둘러보기 1~1.5h", indoor: true },
+  { id: "shibuya", name: "시부야 스카이", type: "쇼핑/전망", summary: "일몰 시간대 뷰포인트", time: "17:30", latlng: [35.6595, 139.7005], img: "https://images.unsplash.com/photo-1536098561742-ca998e48cbcc?auto=format&fit=crop&w=300&q=70", day: 2, seq: 4, area: "시부야", visitScore: 4, llmStayNote: "입장·전망·굿즈 대기 포함 약 2h", indoor: true },
+  { id: "shinjuku", name: "신주쿠 골든가이", type: "야경/미식", summary: "저녁 바 거리 탐방", time: "20:00", latlng: [35.6938, 139.7046], img: "https://images.unsplash.com/photo-1533929736458-ca588d08c8be?auto=format&fit=crop&w=300&q=70", day: 2, seq: 5, area: "신주쿠", visitScore: 4, llmStayNote: "바 호핑·야경 카페까지 2h 이상 여유 권장", indoor: false },
+  { id: "tsukiji", name: "츠키지 장외시장", type: "미식/로컬", summary: "아침 해산물 브런치", time: "08:30", latlng: [35.6654, 139.7707], img: "https://images.unsplash.com/photo-1544481923-a6918bd997bc?auto=format&fit=crop&w=300&q=70", day: 3, seq: 1, area: "긴자", visitScore: 3, llmStayNote: "시장 돌며 브런치 1~1.5h", indoor: false },
+  { id: "teamlab", name: "팀랩 플래닛", type: "전시/체험", summary: "몰입형 디지털 아트 체험", time: "10:30", latlng: [35.6492, 139.7898], img: "https://images.unsplash.com/photo-1501612780327-45045538702b?auto=format&fit=crop&w=300&q=70", day: 3, seq: 2, area: "토요스", visitScore: 5, llmStayNote: "입장 예약·체험 동선 길면 3h 가깝게 소요", indoor: true },
+  { id: "odaiba", name: "오다이바 해변공원", type: "자연/뷰포인트", summary: "도쿄만 산책과 사진 스팟", time: "13:00", latlng: [35.6298, 139.7753], img: "https://images.unsplash.com/photo-1471623432079-b009d30b6729?auto=format&fit=crop&w=300&q=70", day: 3, seq: 3, area: "오다이바", visitScore: 3, llmStayNote: "산책·촬영 위주 1~1.5h", indoor: false },
+  { id: "ginza", name: "긴자", type: "쇼핑/미식", summary: "기념품 쇼핑 및 디너", time: "17:00", latlng: [35.6717, 139.765], img: "https://images.unsplash.com/photo-1513407030348-c983a97b98d8?auto=format&fit=crop&w=300&q=70", day: 3, seq: 4, area: "긴자", visitScore: 4, llmStayNote: "백화점·디너·쇼핑 2h 전후", indoor: true },
+  { id: "tokyo-station", name: "도쿄역 마루노우치", type: "야경/마무리", summary: "마지막 야경과 귀환 동선", time: "19:30", latlng: [35.6812, 139.7671], img: "https://images.unsplash.com/photo-1554797589-7241bb691973?auto=format&fit=crop&w=300&q=70", day: 3, seq: 5, area: "마루노우치", visitScore: 2, llmStayNote: "야경·사진·짧은 산책 45분~1h", indoor: false },
 ];
 
 const METRO_LINES = [
@@ -634,15 +710,27 @@ export default function App() {
 
   // ── Nearby places (Google Maps) ────────────────────────────────────────────
   const [nearbyPlaces, setNearbyPlaces] = useState([]);
+  const [nearbyPlaceType, setNearbyPlaceType] = useState("tourist_attraction");
+  const fetchNearby = useCallback((type) => {
+    if (!userLocation) return;
+    const run = () => fetchNearbyPlaces(userLocation.lat, userLocation.lng, type).then(setNearbyPlaces);
+    if (window.__googleMapsLoaded) run();
+    else window.addEventListener("googlemapsloaded", run, { once: true });
+  }, [userLocation]);
+
   useEffect(() => {
     if (!userLocation) return;
-    const handler = () => {
-      fetchNearbyPlaces(userLocation.lat, userLocation.lng).then(setNearbyPlaces);
-    };
-    if (window.__googleMapsLoaded) handler();
-    else window.addEventListener("googlemapsloaded", handler, { once: true });
-    return () => window.removeEventListener("googlemapsloaded", handler);
-  }, [userLocation]);
+    // Intentionally omit nearbyPlaceType: type changes are handled by handleNearbyTypeChange.
+    // This effect only runs on location change to fetch the current type's places.
+    fetchNearby(nearbyPlaceType);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userLocation, fetchNearby]);
+
+  const handleNearbyTypeChange = (type) => {
+    setNearbyPlaceType(type);
+    setNearbyPlaces([]);
+    fetchNearby(type);
+  };
 
   // ── Variable Handler (AI 변수 조치) ─────────────────────────────────────────
   const [showVarHandler, setShowVarHandler] = useState(false);
@@ -788,6 +876,7 @@ export default function App() {
     setShowVarHandler(false);
     setChatHistory([]);
     setModifiedSchedule(null);
+    setScheduleDirections([]);
   };
 
   const toggleTag = (tag) => setTags((prev) => (prev.includes(tag) ? prev.filter((item) => item !== tag) : [...prev, tag]));
@@ -798,6 +887,25 @@ export default function App() {
     () => calcProgress(activeSchedule, currentTimeStr),
     [activeSchedule, currentTimeStr]
   );
+
+  // ── Schedule Directions (Google Maps Directions API) ──────────────────────
+  const [scheduleDirections, setScheduleDirections] = useState([]);
+  const [gmapsReady, setGmapsReady] = useState(Boolean(window.__googleMapsLoaded));
+
+  useEffect(() => {
+    if (window.__googleMapsLoaded) return;
+    const handler = () => setGmapsReady(true);
+    window.addEventListener("googlemapsloaded", handler, { once: true });
+    return () => window.removeEventListener("googlemapsloaded", handler);
+  }, []);
+
+  useEffect(() => {
+    if (!gmapsReady || activeSchedule.length < 2) {
+      setScheduleDirections([]);
+      return;
+    }
+    fetchScheduleDirections(activeSchedule, move).then(setScheduleDirections);
+  }, [gmapsReady, activeSchedule, move]);
 
   const handleSendToLLM = useCallback(async () => {
     const text = chatInput.trim();
@@ -815,6 +923,7 @@ export default function App() {
         weather,
         progress: planProgress,
         history: chatHistory,
+        directions: scheduleDirections,
       });
       setChatHistory((h) => [...h, { role: "assistant", content: result.text, modifiedSchedule: result.modifiedSchedule }]);
       if (result.modifiedSchedule && result.modifiedSchedule.length > 0) {
@@ -830,7 +939,7 @@ export default function App() {
     } finally {
       setIsLLMLoading(false);
     }
-  }, [chatInput, isLLMLoading, activeSchedule, currentTimeStr, locationName, userLocation, weather, planProgress, chatHistory]);
+  }, [chatInput, isLLMLoading, activeSchedule, currentTimeStr, locationName, userLocation, weather, planProgress, chatHistory, scheduleDirections]);
 
   const progressActiveIndex = step >= RESULT_STEP ? STEP_LABELS.length - 1 : step;
 
@@ -1231,16 +1340,17 @@ export default function App() {
                     <RoutedPolylines
                       defs={segmentDefs}
                       moveId={move}
-                      onSegmentClick={(segment, e) => {
-                        setMapInfo(`${segment.modeLabel} · ${segment.from.name} → ${segment.to.name} (${segment.duration})`);
+                      onSegmentClick={(segment, e, dirInfo) => {
+                        const eta = dirInfo?.duration ? ` · ${dirInfo.duration} (${dirInfo.distance})` : ` (${segment.duration})`;
+                        setMapInfo(`${segment.modeLabel} · ${segment.from.name} → ${segment.to.name}${eta}`);
                         setHighlightIds([segment.from.id, segment.to.id]);
-                        setTransitPopup({ position: e.latlng, segment, moveProfile });
+                        setTransitPopup({ position: e.latlng, segment, moveProfile, dirInfo });
                       }}
                     />
 
                     {transitPopup && moveProfile && (
                       <Popup position={transitPopup.position} eventHandlers={{ remove: () => setTransitPopup(null) }}>
-                        <div className="transit-popup-inner">{renderMovePopup(transitPopup.segment, moveProfile)}</div>
+                        <div className="transit-popup-inner">{renderMovePopup(transitPopup.segment, moveProfile, transitPopup.dirInfo)}</div>
                       </Popup>
                     )}
                   </MapContainer>
@@ -1275,7 +1385,10 @@ export default function App() {
               modifiedSchedule={modifiedSchedule}
               onApplyOriginal={() => setModifiedSchedule(null)}
               nearbyPlaces={nearbyPlaces}
+              nearbyPlaceType={nearbyPlaceType}
+              onNearbyTypeChange={handleNearbyTypeChange}
               hasGoogleMaps={Boolean(window.__googleMapsLoaded)}
+              scheduleDirections={scheduleDirections}
             />
           </motion.div>
         )}
@@ -1284,17 +1397,39 @@ export default function App() {
   );
 }
 
-function renderMovePopup(segment, moveProfile) {
+function renderMovePopup(segment, moveProfile, dirInfo) {
   const { from, to, duration, lineLabel } = segment;
+  const hasGdir = dirInfo && (dirInfo.duration || dirInfo.distance);
   return (
     <>
       <strong>{moveProfile.name} 구간 안내</strong>
       <div>
         구간: {from.name} {"→"} {to.name}
       </div>
-      <div>예상 소요: {duration}</div>
-      <div>경로 유형: {lineLabel}</div>
-      <hr className="popup-hr" />
+      {hasGdir ? (
+        <>
+          <div>소요 시간: {dirInfo.duration}</div>
+          <div>이동 거리: {dirInfo.distance}</div>
+          {dirInfo.steps && dirInfo.steps.length > 0 && (
+            <>
+              <hr className="popup-hr" />
+              <strong>단계별 안내</strong>
+              <ol style={{ margin: "4px 0 0 14px", padding: 0, fontSize: "11px" }}>
+                {dirInfo.steps.map((s, i) => (
+                  <li key={i} style={{ marginBottom: "2px" }}>{s.instruction} ({s.duration})</li>
+                ))}
+              </ol>
+            </>
+          )}
+          <hr className="popup-hr" />
+        </>
+      ) : (
+        <>
+          <div>예상 소요: {duration}</div>
+          <div>경로 유형: {lineLabel}</div>
+          <hr className="popup-hr" />
+        </>
+      )}
       <div>이동 방식 요약: {moveProfile.detail}</div>
       <div>비용 참고: {moveProfile.fare}</div>
       <div>3일 합산 이동: {moveProfile.duration}</div>
@@ -1384,17 +1519,38 @@ function buildMoveSegmentDefs(contents, moveId) {
 
 function RoutedPolylines({ defs, moveId, onSegmentClick }) {
   const [geoms, setGeoms] = useState({});
+  const [directionDetails, setDirectionDetails] = useState({});
 
   useEffect(() => {
     let cancelled = false;
     if (!defs.length) {
       setGeoms({});
+      setDirectionDetails({});
       return undefined;
     }
     const seed = Object.fromEntries(defs.map((d) => [d.id, buildTransitLikeRoute([d.from.latlng, d.to.latlng], moveId)]));
     setGeoms(seed);
-    const profile = osrmProfileForMove(moveId);
+
+    // Try Google Directions first; fall back to OSRM
+    const travelMode = GMAPS_TRAVEL_MODE_MAP[moveId] ?? "DRIVING";
     (async () => {
+      if (window.__googleMapsLoaded) {
+        const entries = await Promise.all(
+          defs.map(async (def) => {
+            const dir = await fetchGoogleDirections(def.from.latlng, def.to.latlng, travelMode);
+            if (dir?.polylinePath && dir.polylinePath.length >= 2) {
+              return { id: def.id, path: dir.polylinePath, dir };
+            }
+            return { id: def.id, path: seed[def.id], dir: null };
+          })
+        );
+        if (cancelled) return;
+        setGeoms(Object.fromEntries(entries.map((e) => [e.id, e.path])));
+        setDirectionDetails(Object.fromEntries(entries.filter((e) => e.dir).map((e) => [e.id, e.dir])));
+        return;
+      }
+      // Fallback: OSRM
+      const profile = osrmProfileForMove(moveId);
       const entries = await Promise.all(
         defs.map(async (def) => {
           const g = await fetchOsrmGeometry(def.from.latlng, def.to.latlng, profile);
@@ -1423,7 +1579,7 @@ function RoutedPolylines({ defs, moveId, onSegmentClick }) {
           }}
           positions={geoms[def.id] ?? [def.from.latlng, def.to.latlng]}
           eventHandlers={{
-            click: (e) => onSegmentClick(def, e),
+            click: (e) => onSegmentClick(def, e, directionDetails[def.id] ?? null),
           }}
         />
       ))}
@@ -1455,7 +1611,8 @@ function VariableHandlerPanel({
   chatHistory, chatInput, onChatInputChange, onSend, isLoading,
   currentTime, location, weather, progress,
   modifiedSchedule, onApplyOriginal,
-  nearbyPlaces, hasGoogleMaps,
+  nearbyPlaces, nearbyPlaceType, onNearbyTypeChange, hasGoogleMaps,
+  scheduleDirections,
 }) {
   const chatEndRef = useRef(null);
   const inputRef = useRef(null);
@@ -1471,7 +1628,10 @@ function VariableHandlerPanel({
     "늦잠 자서 12시에 출발하는데 일정 변동 있나요?",
     "비가 오는데 야외 일정 조정해주세요",
     "팀랩 예약이 취소됐어요",
+    "다음 장소까지 이동 시간이 얼마나 걸리나요?",
   ];
+
+  const nextDir = scheduleDirections?.[0] ?? null;
 
   return (
     <div className={`var-handler ${show ? "var-handler--open" : ""}`}>
@@ -1503,6 +1663,13 @@ function VariableHandlerPanel({
               <span className="var-ctx__label">진행 상황</span>
               <span className="var-ctx__val">완료 {progress.done.length} / 남은 {progress.remaining.length}</span>
             </div>
+            {nextDir && (
+              <div className="var-ctx__col var-ctx__col--dir">
+                <span className="var-ctx__label">🗺️ 다음 구간</span>
+                <span className="var-ctx__val">{nextDir.fromName} → {nextDir.toName}</span>
+                <span className="var-ctx__sub">{nextDir.duration} · {nextDir.distance}</span>
+              </div>
+            )}
             {modifiedSchedule && (
               <div className="var-ctx__col var-ctx__col--modified">
                 <span className="var-ctx__label">일정 상태</span>
@@ -1514,17 +1681,61 @@ function VariableHandlerPanel({
             )}
           </div>
 
-          {/* Nearby places (Google Maps) */}
-          {hasGoogleMaps && nearbyPlaces.length > 0 && (
-            <div className="var-nearby">
-              <span className="var-nearby__label">📍 현재 위치 주변 (Google Maps)</span>
-              <div className="var-nearby__list">
-                {nearbyPlaces.map((p, idx) => (
-                  <span key={p.id ? `${p.id}-${idx}` : idx} className="var-nearby__chip" title={p.vicinity}>
-                    {p.name} {p.rating ? `★${p.rating}` : ""}
-                  </span>
+          {/* Schedule Directions (Google Maps) */}
+          {hasGoogleMaps && scheduleDirections && scheduleDirections.length > 0 && (
+            <div className="var-directions">
+              <span className="var-directions__label">🗺️ 경로 안내 (Google Maps Directions)</span>
+              <div className="var-directions__list">
+                {scheduleDirections.map((d, idx) => (
+                  <div key={`${d.fromId}-${d.toId}-${idx}`} className="var-directions__item">
+                    <span className="var-directions__route">{d.fromName} → {d.toName}</span>
+                    <span className="var-directions__meta">{d.duration} · {d.distance}</span>
+                    {d.steps && d.steps.length > 0 && (
+                      <ol className="var-directions__steps">
+                        {d.steps.slice(0, 3).map((s, si) => (
+                          <li key={si}>{s.instruction} ({s.duration})</li>
+                        ))}
+                      </ol>
+                    )}
+                  </div>
                 ))}
               </div>
+            </div>
+          )}
+
+          {/* Nearby places (Google Maps) */}
+          {hasGoogleMaps && (
+            <div className="var-nearby">
+              <div className="var-nearby__header">
+                <span className="var-nearby__label">📍 현재 위치 주변</span>
+                <div className="var-nearby__type-btns">
+                  {PLACE_TYPES.map((pt) => (
+                    <button
+                      key={pt.id}
+                      type="button"
+                      className={`var-nearby__type-btn ${nearbyPlaceType === pt.id ? "active" : ""}`}
+                      onClick={() => onNearbyTypeChange(pt.id)}
+                      title={pt.label}
+                    >
+                      {pt.icon} {pt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {nearbyPlaces.length > 0 ? (
+                <div className="var-nearby__list">
+                  {nearbyPlaces.map((p, idx) => (
+                    <span key={p.id ? `${p.id}-${idx}` : idx} className="var-nearby__chip" title={p.vicinity}>
+                      {p.name}
+                      {p.rating ? ` ★${p.rating}` : ""}
+                      {p.openNow === true && " ✅"}
+                      {p.openNow === false && " 🔴"}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <p className="var-nearby__empty">검색 중…</p>
+              )}
             </div>
           )}
 
