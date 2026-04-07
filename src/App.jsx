@@ -181,9 +181,21 @@ function reverseGeocode(lat, lng) {
   });
 }
 
-// ─── LLM call (OpenAI or rule-based simulation) ───────────────────────────────
+// ─── LLM call (OpenAI / Gemini / Claude or rule-based simulation) ────────────
+const LLM_PROVIDER = (import.meta.env.VITE_LLM_PROVIDER || "openai").trim().toLowerCase();
 const OPENAI_KEY = import.meta.env.VITE_OPENAI_API_KEY;
 const OPENAI_MODEL = (import.meta.env.VITE_OPENAI_MODEL || "gpt-4o-mini").trim();
+const GEMINI_KEY = import.meta.env.VITE_GEMINI_API_KEY;
+const GEMINI_MODEL = (import.meta.env.VITE_GEMINI_MODEL || "gemini-2.0-flash").trim();
+const CLAUDE_KEY = import.meta.env.VITE_CLAUDE_API_KEY;
+const CLAUDE_MODEL = (import.meta.env.VITE_CLAUDE_MODEL || "claude-3-5-sonnet-latest").trim();
+
+const LLM_SETTINGS = {
+  openai: { provider: "openai", label: "OpenAI", key: OPENAI_KEY, model: OPENAI_MODEL, keyEnv: "VITE_OPENAI_API_KEY" },
+  gemini: { provider: "gemini", label: "Gemini", key: GEMINI_KEY, model: GEMINI_MODEL, keyEnv: "VITE_GEMINI_API_KEY" },
+  claude: { provider: "claude", label: "Claude", key: CLAUDE_KEY, model: CLAUDE_MODEL, keyEnv: "VITE_CLAUDE_API_KEY" },
+};
+const ACTIVE_LLM = LLM_SETTINGS[LLM_PROVIDER] ?? LLM_SETTINGS.openai;
 
 function buildSystemPrompt({ plan, currentTime, location, weather, progress, directions }) {
   const planText = plan
@@ -223,32 +235,76 @@ ${planText}
 }
 
 async function callLLM({ userMessage, plan, currentTime, location, weather, progress, history, directions }) {
-  if (!OPENAI_KEY) {
+  if (!ACTIVE_LLM.key) {
     await new Promise((r) => setTimeout(r, 700));
     return simulateLLMResponse(userMessage, plan, currentTime);
   }
   try {
     const systemContent = buildSystemPrompt({ plan, currentTime, location, weather, progress, directions });
-    const messages = [
-      { role: "system", content: systemContent },
-      ...history.map((h) => ({ role: h.role, content: h.content })),
-      { role: "user", content: userMessage },
-    ];
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_KEY}` },
-      body: JSON.stringify({ model: OPENAI_MODEL, messages, max_tokens: 1200, temperature: 0.7 }),
-    });
-    if (!res.ok) throw new Error("openai");
-    const data = await res.json();
-    const raw = data.choices?.[0]?.message?.content ?? "";
+    const chatMessages = [...history.map((h) => ({ role: h.role, content: h.content })), { role: "user", content: userMessage }];
+    let raw = "";
+
+    if (ACTIVE_LLM.provider === "openai") {
+      const messages = [{ role: "system", content: systemContent }, ...chatMessages];
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${ACTIVE_LLM.key}` },
+        body: JSON.stringify({ model: ACTIVE_LLM.model, messages, max_tokens: 1200, temperature: 0.7 }),
+      });
+      if (!res.ok) throw new Error("openai");
+      const data = await res.json();
+      raw = data.choices?.[0]?.message?.content ?? "";
+    } else if (ACTIVE_LLM.provider === "gemini") {
+      const geminiMessages = chatMessages.map((m) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.content }],
+      }));
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(ACTIVE_LLM.model)}:generateContent?key=${encodeURIComponent(ACTIVE_LLM.key)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: systemContent }] },
+            contents: geminiMessages,
+            generationConfig: { temperature: 0.7, maxOutputTokens: 1200 },
+          }),
+        }
+      );
+      if (!res.ok) throw new Error("gemini");
+      const data = await res.json();
+      raw = (data.candidates?.[0]?.content?.parts ?? []).map((p) => p.text).filter(Boolean).join("\n");
+    } else if (ACTIVE_LLM.provider === "claude") {
+      const claudeMessages = chatMessages.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": ACTIVE_LLM.key,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: ACTIVE_LLM.model,
+          system: systemContent,
+          max_tokens: 1200,
+          temperature: 0.7,
+          messages: claudeMessages,
+        }),
+      });
+      if (!res.ok) throw new Error("claude");
+      const data = await res.json();
+      raw = (data.content ?? []).map((item) => item.text).filter(Boolean).join("\n");
+    }
+
     const jsonMatch = raw.match(/```json\s*([\s\S]*?)```/);
     let modifiedSchedule = null;
     if (jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[1]);
         modifiedSchedule = parsed.modifiedSchedule ?? null;
-      } catch (e) { console.error("[LLM] JSON parse error:", e); }
+      } catch (e) {
+        console.error("[LLM] JSON parse error:", e);
+      }
     }
     return { text: raw.replace(/```json[\s\S]*?```/g, "").trim(), modifiedSchedule };
   } catch {
@@ -1683,9 +1739,9 @@ function VariableHandlerPanel({
             </button>
           </div>
           <p className="var-hint">
-            {OPENAI_KEY
-              ? `OpenAI GPT 연결됨 (${OPENAI_MODEL})`
-              : "시뮬레이션 모드 (VITE_OPENAI_API_KEY 미설정)"}
+            {ACTIVE_LLM.key
+              ? `${ACTIVE_LLM.label} 연결됨 (${ACTIVE_LLM.model})`
+              : `시뮬레이션 모드 (${ACTIVE_LLM.keyEnv} 미설정)`}
             {" · "}
             {OWM_KEY ? "날씨 API 연결됨" : "날씨 시뮬레이션"}
             {" · "}
