@@ -10,6 +10,11 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/osrm/, ""),
       },
+      "/owm": {
+        target: "https://api.openweathermap.org",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/owm/, ""),
+      },
     },
   },
 });

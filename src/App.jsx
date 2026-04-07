@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { MapContainer, Marker, Polyline, Popup, TileLayer } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
@@ -10,6 +10,235 @@ L.Icon.Default.mergeOptions({
   iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
   shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
 });
+
+// ─── Local JSON DB loader ──────────────────────────────────────────────────────
+async function loadPlansDB() {
+  try {
+    const r = await fetch("/plans.json");
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+// ─── Weather (OpenWeatherMap or simulated) ────────────────────────────────────
+const OWM_KEY = import.meta.env.VITE_OPENWEATHER_API_KEY;
+async function fetchWeather(lat, lng) {
+  if (!OWM_KEY) {
+    return { description: "맑음 (시뮬)", temp: "21°C", icon: "☀️", humidity: "52%", wind: "3m/s", raw: null };
+  }
+  const base = import.meta.env.DEV ? "/owm" : "https://api.openweathermap.org";
+  try {
+    const r = await fetch(
+      `${base}/data/2.5/weather?lat=${lat}&lon=${lng}&appid=${OWM_KEY}&units=metric&lang=kr`
+    );
+    if (!r.ok) throw new Error("owm");
+    const d = await r.json();
+    const iconMap = { "01": "☀️", "02": "⛅", "03": "☁️", "04": "☁️", "09": "🌧️", "10": "🌦️", "11": "⛈️", "13": "❄️", "50": "🌫️" };
+    const code = d.weather?.[0]?.icon?.slice(0, 2) ?? "01";
+    return {
+      description: d.weather?.[0]?.description ?? "",
+      temp: `${Math.round(d.main?.temp ?? 0)}°C`,
+      icon: iconMap[code] ?? "🌡️",
+      humidity: `${d.main?.humidity ?? "--"}%`,
+      wind: `${d.wind?.speed ?? "--"}m/s`,
+      raw: d,
+    };
+  } catch {
+    return { description: "날씨 조회 실패", temp: "--", icon: "🌡️", humidity: "--", wind: "--", raw: null };
+  }
+}
+
+// ─── Google Maps nearby places (requires window.google loaded) ────────────────
+function fetchNearbyPlaces(lat, lng) {
+  return new Promise((resolve) => {
+    if (!window.google?.maps?.places) {
+      resolve([]);
+      return;
+    }
+    const svc = new window.google.maps.places.PlacesService(document.createElement("div"));
+    svc.nearbySearch(
+      { location: { lat, lng }, radius: 1500, type: "tourist_attraction" },
+      (results, status) => {
+        if (status === window.google.maps.places.PlacesServiceStatus.OK) {
+          resolve(
+            (results ?? []).slice(0, 6).map((p) => ({
+              name: p.name,
+              vicinity: p.vicinity,
+              rating: p.rating,
+              id: p.place_id,
+            }))
+          );
+        } else {
+          resolve([]);
+        }
+      }
+    );
+  });
+}
+
+// ─── Reverse geocode via Google Maps (city name) ─────────────────────────────
+function reverseGeocode(lat, lng) {
+  return new Promise((resolve) => {
+    if (!window.google?.maps?.Geocoder) {
+      resolve(null);
+      return;
+    }
+    new window.google.maps.Geocoder().geocode({ location: { lat, lng } }, (results, status) => {
+      if (status === "OK" && results?.[0]) {
+        const locality = results[0].address_components?.find((c) =>
+          c.types.includes("locality")
+        );
+        resolve(locality?.long_name ?? results[0].formatted_address ?? null);
+      } else {
+        resolve(null);
+      }
+    });
+  });
+}
+
+// ─── LLM call (OpenAI or rule-based simulation) ───────────────────────────────
+const OPENAI_KEY = import.meta.env.VITE_OPENAI_API_KEY;
+
+function buildSystemPrompt({ plan, currentTime, location, weather, progress }) {
+  const planText = plan
+    .map(
+      (item) =>
+        `DAY${item.assignedDay} ${item.time} [${item.area}] ${item.name} (${item.type}) 체류점수:${item.visitScore}`
+    )
+    .join("\n");
+  const doneNames = progress.done.map((i) => i.name).join(", ") || "없음";
+  const remainNames = progress.remaining.map((i) => i.name).join(", ") || "없음";
+  return `당신은 AI 여행 도우미입니다. 사용자의 도쿄 2박3일 여행 일정을 실시간으로 관리합니다.
+
+현재 정보:
+- 현재 시간: ${currentTime}
+- 현재 위치: ${location ?? "위치 미확인"}
+- 날씨: ${weather ? `${weather.icon} ${weather.description} ${weather.temp} 습도${weather.humidity} 바람${weather.wind}` : "정보 없음"}
+- 완료된 일정: ${doneNames}
+- 남은 일정: ${remainNames}
+
+전체 여행 계획:
+${planText}
+
+사용자가 변수 상황(늦잠, 날씨, 일정 취소 등)을 알려주면:
+1. 상황을 간결히 분석하세요.
+2. 영향받는 일정을 파악하세요.
+3. 수정된 일정을 제안하고, 마지막에 반드시 아래 JSON 블록을 포함하세요:
+\`\`\`json
+{"modifiedSchedule":[{"id":"...","name":"...","time":"HH:MM","assignedDay":1,"area":"...","type":"...","visitScore":0},...]}
+\`\`\`
+수정이 불필요하면 \`{"modifiedSchedule":null}\` 를 출력하세요.
+추가 정보가 필요하면 재질문하세요. 항상 한국어로 응답하세요.`;
+}
+
+function simulateLLMResponse(userMessage, plan, currentTimeStr) {
+  const msg = userMessage;
+  const hourMatch = msg.match(/(\d{1,2})\s*시/);
+  const mentionedHour = hourMatch ? parseInt(hourMatch[1], 10) : null;
+
+  const isDelay = /늦잠|늦게|늦어|출발|지각|12시|오후|지연/.test(msg);
+  const isRain = /비|우천|날씨|폭우|우산/.test(msg);
+  const isCancellation = /취소|못|안|빠질|건너|skip/.test(msg);
+  const mentionedSpot = plan.find((item) => msg.includes(item.name));
+
+  if (isDelay && mentionedHour !== null) {
+    const cutHHMM = `${String(mentionedHour).padStart(2, "0")}:00`;
+    const remaining = plan.filter((item) => item.time >= cutHHMM);
+    const skipped = plan.filter((item) => item.time < cutHHMM);
+    const skippedNames = skipped.map((i) => i.name).join(", ");
+    const modifiedSchedule = remaining.length ? remaining : plan;
+    return {
+      text: `✅ **상황 분석**: 현재 ${mentionedHour}시 출발로 인해 ${skippedNames ? `**${skippedNames}**` : "일부 오전 일정"}은 시간상 불가능합니다.\n\n📋 **수정 제안**: ${cutHHMM} 이후 일정부터 시작합니다. ${remaining.length === 0 ? "남은 일정이 없습니다 — 자유 여행을 즐기세요 😊" : `총 ${remaining.length}개 장소가 유지됩니다.`}`,
+      modifiedSchedule,
+    };
+  }
+
+  if (isRain) {
+    const outdoorSpots = plan.filter((item) => !item.indoor);
+    const indoorSpots = plan.filter((item) => item.indoor);
+    if (outdoorSpots.length === 0) {
+      return {
+        text: "☔ **날씨 분석**: 현재 일정은 모두 실내 위주입니다. 비가 오더라도 일정 변동 없이 진행 가능합니다!",
+        modifiedSchedule: null,
+      };
+    }
+    const outdoorNames = outdoorSpots.map((i) => i.name).join(", ");
+    return {
+      text: `☔ **날씨 분석**: **${outdoorNames}**는 야외 일정입니다. 비가 올 경우 이동 시 우산 필수이며, 특히 야외 공원·신사는 관람이 불편할 수 있습니다.\n\n💡 **제안**: 실내 일정(${indoorSpots.map((i) => i.name).join(", ")})을 먼저 배치하고, 날씨 호전 시 야외로 이동하는 것을 추천합니다. 일정 순서를 조정할까요?`,
+      modifiedSchedule: null,
+    };
+  }
+
+  if (isCancellation && mentionedSpot) {
+    const modified = plan.filter((item) => item.id !== mentionedSpot.id);
+    return {
+      text: `✅ **${mentionedSpot.name}** 일정을 제거했습니다. 남은 ${modified.length}개 일정으로 여행을 진행합니다. 해당 시간(${mentionedSpot.time})에 주변 장소를 탐방하거나 휴식을 취할 수 있습니다.`,
+      modifiedSchedule: modified,
+    };
+  }
+
+  return {
+    text: `🤔 **상황 파악 중**: "${userMessage.slice(0, 40)}..." — 현재 일정(${plan.length}개 장소)을 분석했습니다.\n\n현재 시간 ${currentTimeStr} 기준으로 일정 조정이 필요하신가요? 구체적인 상황을 알려주시면 더 정확한 도움을 드릴 수 있습니다.\n\n예: "늦잠 자서 12시에 출발", "비가 와서 야외 일정 변경", "팀랩 예약 취소"`,
+    modifiedSchedule: null,
+  };
+}
+
+async function callLLM({ userMessage, plan, currentTime, location, weather, progress, history }) {
+  if (!OPENAI_KEY) {
+    await new Promise((r) => setTimeout(r, 700));
+    return simulateLLMResponse(userMessage, plan, currentTime);
+  }
+  try {
+    const systemContent = buildSystemPrompt({ plan, currentTime, location, weather, progress });
+    const messages = [
+      { role: "system", content: systemContent },
+      ...history.map((h) => ({ role: h.role, content: h.content })),
+      { role: "user", content: userMessage },
+    ];
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_KEY}` },
+      body: JSON.stringify({ model: "gpt-4o-mini", messages, max_tokens: 1200, temperature: 0.7 }),
+    });
+    if (!res.ok) throw new Error("openai");
+    const data = await res.json();
+    const raw = data.choices?.[0]?.message?.content ?? "";
+    const jsonMatch = raw.match(/```json\s*([\s\S]*?)```/);
+    let modifiedSchedule = null;
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[1]);
+        modifiedSchedule = parsed.modifiedSchedule ?? null;
+      } catch (e) { console.error("[LLM] JSON parse error:", e); }
+    }
+    return { text: raw.replace(/```json[\s\S]*?```/g, "").trim(), modifiedSchedule };
+  } catch {
+    return simulateLLMResponse(userMessage, plan, currentTime);
+  }
+}
+
+// ─── Utility: parse "HH:MM" to minutes since midnight ────────────────────────
+function timeToMinutes(hhmm) {
+  const [h, m] = (hhmm ?? "00:00").split(":").map(Number);
+  return h * 60 + (m || 0);
+}
+
+function minutesToTime(mins) {
+  const h = Math.floor(mins / 60) % 24;
+  const m = mins % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+// ─── Calculate plan progress based on current time ───────────────────────────
+function calcProgress(schedule, currentTimeStr) {
+  const nowMins = timeToMinutes(currentTimeStr);
+  const done = schedule.filter((item) => timeToMinutes(item.time) < nowMins);
+  const remaining = schedule.filter((item) => timeToMinutes(item.time) >= nowMins);
+  const next = remaining[0] ?? null;
+  return { done, remaining, next, nowMins };
+}
 
 const STEP_LABELS = ["계정/플랜", "나라/지역/일정", "여행 성향", "이동 옵션", "숙소 선택", "LLM 컨텐츠", "최종 플랜"];
 
@@ -348,6 +577,15 @@ export default function App() {
   const [step, setStep] = useState(0);
   const [selectedPlanId, setSelectedPlanId] = useState("demo-tokyo");
 
+  // ── Local JSON DB ──────────────────────────────────────────────────────────
+  const [dbData, setDbData] = useState(null);
+  useEffect(() => {
+    loadPlansDB().then((data) => {
+      if (data) setDbData(data);
+    });
+  }, []);
+  const savedPlans = dbData?.savedPlans ?? SAVED_PLANS;
+
   const [country, setCountry] = useState("일본");
   const [region, setRegion] = useState("도쿄");
   const [days, setDays] = useState("2박 3일");
@@ -361,6 +599,57 @@ export default function App() {
   const [transitPopup, setTransitPopup] = useState(null);
   const [highlightIds, setHighlightIds] = useState([]);
   const [activeCategory, setActiveCategory] = useState("전체");
+
+  // ── Real-time clock ────────────────────────────────────────────────────────
+  const [nowDate, setNowDate] = useState(new Date());
+  useEffect(() => {
+    const id = setInterval(() => setNowDate(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const currentTimeStr = `${String(nowDate.getHours()).padStart(2, "0")}:${String(nowDate.getMinutes()).padStart(2, "0")}`;
+  const currentDateStr = nowDate.toLocaleDateString("ko-KR", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
+
+  // ── Browser Geolocation ────────────────────────────────────────────────────
+  const [userLocation, setUserLocation] = useState(null);
+  const [locationName, setLocationName] = useState(null);
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        setUserLocation(loc);
+        const name = await reverseGeocode(loc.lat, loc.lng);
+        setLocationName(name);
+      },
+      () => setUserLocation({ lat: 35.6812, lng: 139.7671 })
+    );
+  }, []);
+
+  // ── Weather ────────────────────────────────────────────────────────────────
+  const [weather, setWeather] = useState(null);
+  useEffect(() => {
+    if (!userLocation) return;
+    fetchWeather(userLocation.lat, userLocation.lng).then(setWeather);
+  }, [userLocation]);
+
+  // ── Nearby places (Google Maps) ────────────────────────────────────────────
+  const [nearbyPlaces, setNearbyPlaces] = useState([]);
+  useEffect(() => {
+    if (!userLocation) return;
+    const handler = () => {
+      fetchNearbyPlaces(userLocation.lat, userLocation.lng).then(setNearbyPlaces);
+    };
+    if (window.__googleMapsLoaded) handler();
+    else window.addEventListener("googlemapsloaded", handler, { once: true });
+    return () => window.removeEventListener("googlemapsloaded", handler);
+  }, [userLocation]);
+
+  // ── Variable Handler (AI 변수 조치) ─────────────────────────────────────────
+  const [showVarHandler, setShowVarHandler] = useState(false);
+  const [chatHistory, setChatHistory] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [isLLMLoading, setIsLLMLoading] = useState(false);
+  const [modifiedSchedule, setModifiedSchedule] = useState(null);
 
   const moveProfile = MOVES.find((m) => m.id === move);
   const selectedLodging = LODGINGS.find((l) => l.id === selectedLodgingId) ?? LODGINGS[0];
@@ -411,6 +700,18 @@ export default function App() {
   const segmentDefs = useMemo(() => buildMoveSegmentDefs(pickedContents, move), [pickedContents, move]);
 
   const scheduleByDay = useMemo(() => {
+    // When modifiedSchedule is active, use it (it's a flat array with assignedDay)
+    if (modifiedSchedule) {
+      const days = [1, 2, 3];
+      return days
+        .map((d) => ({
+          day: d,
+          items: modifiedSchedule
+            .filter((item) => item.assignedDay === d)
+            .sort((a, b) => a.time.localeCompare(b.time)),
+        }))
+        .filter((g) => g.items.length > 0);
+    }
     if (!optimizedDayPicks) return [];
     return [1, 2, 3]
       .map((d) => ({
@@ -421,7 +722,7 @@ export default function App() {
         }).filter(Boolean),
       }))
       .filter((g) => g.items.length > 0);
-  }, [optimizedDayPicks]);
+  }, [optimizedDayPicks, modifiedSchedule]);
 
   const groupedPickContents = useMemo(() => {
     const base = recommended.length ? recommended : CONTENTS;
@@ -484,9 +785,52 @@ export default function App() {
     setHighlightIds([]);
     setTransitPopup(null);
     setMapInfo("핀 또는 이동 경로를 클릭하면 해당 일정이 강조됩니다.");
+    setShowVarHandler(false);
+    setChatHistory([]);
+    setModifiedSchedule(null);
   };
 
   const toggleTag = (tag) => setTags((prev) => (prev.includes(tag) ? prev.filter((item) => item !== tag) : [...prev, tag]));
+
+  // ── LLM send handler ────────────────────────────────────────────────────────
+  const activeSchedule = modifiedSchedule ?? pickedContents;
+  const planProgress = useMemo(
+    () => calcProgress(activeSchedule, currentTimeStr),
+    [activeSchedule, currentTimeStr]
+  );
+
+  const handleSendToLLM = useCallback(async () => {
+    const text = chatInput.trim();
+    if (!text || isLLMLoading) return;
+    const userMsg = { role: "user", content: text };
+    setChatHistory((h) => [...h, userMsg]);
+    setChatInput("");
+    setIsLLMLoading(true);
+    try {
+      const result = await callLLM({
+        userMessage: text,
+        plan: activeSchedule,
+        currentTime: currentTimeStr,
+        location: locationName ?? (userLocation ? `${userLocation.lat.toFixed(4)},${userLocation.lng.toFixed(4)}` : null),
+        weather,
+        progress: planProgress,
+        history: chatHistory,
+      });
+      setChatHistory((h) => [...h, { role: "assistant", content: result.text, modifiedSchedule: result.modifiedSchedule }]);
+      if (result.modifiedSchedule && result.modifiedSchedule.length > 0) {
+        const enriched = result.modifiedSchedule.map((item) => {
+          const original = CONTENTS.find((c) => c.id === item.id);
+          // Merge: start with original data (for display fields), then apply LLM-provided scheduling fields
+          return original
+            ? { ...original, time: item.time, assignedDay: item.assignedDay }
+            : item;
+        });
+        setModifiedSchedule(enriched);
+      }
+    } finally {
+      setIsLLMLoading(false);
+    }
+  }, [chatInput, isLLMLoading, activeSchedule, currentTimeStr, locationName, userLocation, weather, planProgress, chatHistory]);
 
   const progressActiveIndex = step >= RESULT_STEP ? STEP_LABELS.length - 1 : step;
 
@@ -527,7 +871,7 @@ export default function App() {
                   <div>
                     <p className="plan-picker-title">플랜 선택</p>
                     <div className="plan-list">
-                      {SAVED_PLANS.map((plan) => (
+                      {savedPlans.map((plan) => (
                         <button
                           key={plan.id}
                           type="button"
@@ -735,153 +1079,204 @@ export default function App() {
         ) : (
           <motion.div
             key="result"
-            className="result-layout"
+            className="result-page"
             initial={{ opacity: 0, y: 28, scale: 0.99 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 20 }}
             transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
           >
-            <aside className="panel sidebar">
-              <div className="panel-header">
-                <h3>
-                  {country} · {region} · {days}
-                </h3>
-                <p>
-                  {moveProfile?.name} · 숙소: {selectedLodging.name}
-                </p>
-              </div>
-              <div className="panel-body panel-body--schedule">
-                <div className={`lodging-strip ${highlightIds.includes(selectedLodging.id) ? "lodging-strip--highlight" : ""}`}>
-                  <span className="lodging-strip-icon" aria-hidden="true">
-                    🏨
-                  </span>
-                  <div>
-                    <strong>숙소 (베이스)</strong>
-                    <p>{selectedLodging.name} · {selectedLodging.area}</p>
-                  </div>
+            {/* ── Real-time Status Bar ─────────────────────────────────────── */}
+            <div className="realtime-bar">
+              <span className="realtime-bar__item">
+                🕐 <strong>{currentTimeStr}</strong>
+                <span className="realtime-bar__sub">{currentDateStr}</span>
+              </span>
+              <span className="realtime-bar__item">
+                📍 {locationName ?? (userLocation ? `${userLocation.lat.toFixed(3)}, ${userLocation.lng.toFixed(3)}` : "위치 확인 중…")}
+              </span>
+              {weather && (
+                <span className="realtime-bar__item">
+                  {weather.icon} {weather.description} {weather.temp}
+                  <span className="realtime-bar__sub">습도 {weather.humidity} · 바람 {weather.wind}</span>
+                </span>
+              )}
+              <span className="realtime-bar__item realtime-bar__progress">
+                ✅ 완료 {planProgress.done.length}곳 · 남은 {planProgress.remaining.length}곳
+                {planProgress.next && <span className="realtime-bar__sub">다음: {planProgress.next.name} ({planProgress.next.time})</span>}
+              </span>
+              {modifiedSchedule && (
+                <span className="realtime-bar__badge--modified">🔄 AI 수정 일정 적용 중</span>
+              )}
+            </div>
+
+            <div className="result-layout">
+              <aside className="panel sidebar">
+                <div className="panel-header">
+                  <h3>
+                    {country} · {region} · {days}
+                  </h3>
+                  <p>
+                    {moveProfile?.name} · 숙소: {selectedLodging.name}
+                  </p>
                 </div>
-                <table className="schedule-table">
-                  <thead>
-                    <tr>
-                      <th>DAY</th>
-                      <th>시간</th>
-                      <th>일정</th>
-                      <th>체류</th>
-                      <th>이미지</th>
-                    </tr>
-                  </thead>
-                  {scheduleByDay.map((group) => (
-                    <tbody key={group.day} className={`schedule-day-group schedule-day-group--${group.day}`}>
-                      <tr className="day-separator-row">
-                        <td colSpan={5}>
-                          <span className="day-separator-label">DAY {group.day}</span>
-                        </td>
+                <div className="panel-body panel-body--schedule">
+                  <div className={`lodging-strip ${highlightIds.includes(selectedLodging.id) ? "lodging-strip--highlight" : ""}`}>
+                    <span className="lodging-strip-icon" aria-hidden="true">
+                      🏨
+                    </span>
+                    <div>
+                      <strong>숙소 (베이스)</strong>
+                      <p>{selectedLodging.name} · {selectedLodging.area}</p>
+                    </div>
+                  </div>
+                  <table className="schedule-table">
+                    <thead>
+                      <tr>
+                        <th>DAY</th>
+                        <th>시간</th>
+                        <th>일정</th>
+                        <th>체류</th>
+                        <th>이미지</th>
                       </tr>
-                      {group.items.map((p) => (
-                        <tr key={p.id} className={highlightIds.includes(p.id) ? "row-highlight" : ""}>
-                          <td>DAY{p.assignedDay}</td>
-                          <td>{p.time}</td>
-                          <td>
-                            {p.name}
-                            <br />
-                            <small>
-                              {p.type} · {p.area}
-                            </small>
-                            {p.llmStayNote ? (
-                              <small className="schedule-stay-note">{p.llmStayNote}</small>
-                            ) : null}
-                          </td>
-                          <td className="schedule-stay-cell">
-                            <ScoreStars value={p.visitScore} />
-                          </td>
-                          <td>
-                            <img className={`thumb ${highlightIds.includes(p.id) ? "thumb-highlight" : ""}`} src={p.img} alt={p.name} />
+                    </thead>
+                    {scheduleByDay.map((group) => (
+                      <tbody key={group.day} className={`schedule-day-group schedule-day-group--${group.day}`}>
+                        <tr className="day-separator-row">
+                          <td colSpan={5}>
+                            <span className="day-separator-label">DAY {group.day}</span>
                           </td>
                         </tr>
-                      ))}
-                    </tbody>
-                  ))}
-                </table>
-              </div>
-            </aside>
-
-            <section className="panel map-area">
-              <div className="map-top">
-                <h3>지도 · {moveProfile?.name} 경로</h3>
-                <button type="button" className="btn ghost" onClick={restartScenario}>
-                  처음부터
-                </button>
-              </div>
-              <div className="map-box">
-                <MapContainer center={[35.6804, 139.769]} zoom={12} style={{ height: "100%", width: "100%" }}>
-                  <TileLayer
-                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>'
-                    url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
-                  />
-                  <Marker
-                    key={selectedLodging.id}
-                    position={selectedLodging.latlng}
-                    icon={lodgingMapIcon}
-                    zIndexOffset={800}
-                    eventHandlers={{
-                      click: () => {
-                        setMapInfo(`숙소 · ${selectedLodging.name} — ${selectedLodging.summary}`);
-                        setHighlightIds([selectedLodging.id]);
-                      },
-                    }}
-                  >
-                    <Popup>{selectedLodging.name}</Popup>
-                  </Marker>
-
-                  {pickedContents.map((p) => {
-                    const num = spotNumberById.get(p.id) ?? 0;
-                    return (
-                      <Marker
-                        key={p.id}
-                        position={p.latlng}
-                        icon={dayNumberIcon(p.assignedDay, num)}
-                        zIndexOffset={400}
-                        eventHandlers={{
-                          click: () => {
-                            setMapInfo(`DAY${p.assignedDay} · ${num}. ${p.name} — ${p.summary}`);
-                            setHighlightIds([p.id]);
-                          },
-                        }}
-                      >
-                        <Popup>{p.name}</Popup>
-                      </Marker>
-                    );
-                  })}
-
-                  <RoutedPolylines
-                    defs={segmentDefs}
-                    moveId={move}
-                    onSegmentClick={(segment, e) => {
-                      setMapInfo(`${segment.modeLabel} · ${segment.from.name} → ${segment.to.name} (${segment.duration})`);
-                      setHighlightIds([segment.from.id, segment.to.id]);
-                      setTransitPopup({ position: e.latlng, segment, moveProfile });
-                    }}
-                  />
-
-                  {transitPopup && moveProfile && (
-                    <Popup position={transitPopup.position} eventHandlers={{ remove: () => setTransitPopup(null) }}>
-                      <div className="transit-popup-inner">{renderMovePopup(transitPopup.segment, moveProfile)}</div>
-                    </Popup>
-                  )}
-                </MapContainer>
-                <div className="map-info">{mapInfo}</div>
-                {move === "public" && (
-                  <div className="line-legend">
-                    {METRO_LINES.map((line) => (
-                      <span key={line.id}>
-                        <b style={{ background: line.color }} />
-                        {line.name}
-                      </span>
+                        {group.items.map((p) => {
+                          const isDone = planProgress.done.some((d) => d.id === p.id);
+                          const isNext = planProgress.next?.id === p.id;
+                          return (
+                            <tr key={p.id} className={`${highlightIds.includes(p.id) ? "row-highlight" : ""} ${isDone ? "row-done" : ""} ${isNext ? "row-next" : ""}`}>
+                              <td>DAY{p.assignedDay}</td>
+                              <td>{p.time}</td>
+                              <td>
+                                {p.name}
+                                {isDone && <span className="schedule-done-badge">✓ 완료</span>}
+                                {isNext && <span className="schedule-next-badge">▶ 다음</span>}
+                                <br />
+                                <small>
+                                  {p.type} · {p.area}
+                                </small>
+                                {p.llmStayNote ? (
+                                  <small className="schedule-stay-note">{p.llmStayNote}</small>
+                                ) : null}
+                              </td>
+                              <td className="schedule-stay-cell">
+                                <ScoreStars value={p.visitScore} />
+                              </td>
+                              <td>
+                                <img className={`thumb ${highlightIds.includes(p.id) ? "thumb-highlight" : ""}`} src={p.img} alt={p.name} />
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
                     ))}
-                  </div>
-                )}
-              </div>
-            </section>
+                  </table>
+                </div>
+              </aside>
+
+              <section className="panel map-area">
+                <div className="map-top">
+                  <h3>지도 · {moveProfile?.name} 경로</h3>
+                  <button type="button" className="btn ghost" onClick={restartScenario}>
+                    처음부터
+                  </button>
+                </div>
+                <div className="map-box">
+                  <MapContainer center={[35.6804, 139.769]} zoom={12} style={{ height: "100%", width: "100%" }}>
+                    <TileLayer
+                      attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>'
+                      url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+                    />
+                    <Marker
+                      key={selectedLodging.id}
+                      position={selectedLodging.latlng}
+                      icon={lodgingMapIcon}
+                      zIndexOffset={800}
+                      eventHandlers={{
+                        click: () => {
+                          setMapInfo(`숙소 · ${selectedLodging.name} — ${selectedLodging.summary}`);
+                          setHighlightIds([selectedLodging.id]);
+                        },
+                      }}
+                    >
+                      <Popup>{selectedLodging.name}</Popup>
+                    </Marker>
+
+                    {pickedContents.map((p) => {
+                      const num = spotNumberById.get(p.id) ?? 0;
+                      return (
+                        <Marker
+                          key={p.id}
+                          position={p.latlng}
+                          icon={dayNumberIcon(p.assignedDay, num)}
+                          zIndexOffset={400}
+                          eventHandlers={{
+                            click: () => {
+                              setMapInfo(`DAY${p.assignedDay} · ${num}. ${p.name} — ${p.summary}`);
+                              setHighlightIds([p.id]);
+                            },
+                          }}
+                        >
+                          <Popup>{p.name}</Popup>
+                        </Marker>
+                      );
+                    })}
+
+                    <RoutedPolylines
+                      defs={segmentDefs}
+                      moveId={move}
+                      onSegmentClick={(segment, e) => {
+                        setMapInfo(`${segment.modeLabel} · ${segment.from.name} → ${segment.to.name} (${segment.duration})`);
+                        setHighlightIds([segment.from.id, segment.to.id]);
+                        setTransitPopup({ position: e.latlng, segment, moveProfile });
+                      }}
+                    />
+
+                    {transitPopup && moveProfile && (
+                      <Popup position={transitPopup.position} eventHandlers={{ remove: () => setTransitPopup(null) }}>
+                        <div className="transit-popup-inner">{renderMovePopup(transitPopup.segment, moveProfile)}</div>
+                      </Popup>
+                    )}
+                  </MapContainer>
+                  <div className="map-info">{mapInfo}</div>
+                  {move === "public" && (
+                    <div className="line-legend">
+                      {METRO_LINES.map((line) => (
+                        <span key={line.id}>
+                          <b style={{ background: line.color }} />
+                          {line.name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </section>
+            </div>
+
+            {/* ── AI 변수 조치 Panel ────────────────────────────────────────── */}
+            <VariableHandlerPanel
+              show={showVarHandler}
+              onToggle={() => setShowVarHandler((v) => !v)}
+              chatHistory={chatHistory}
+              chatInput={chatInput}
+              onChatInputChange={setChatInput}
+              onSend={handleSendToLLM}
+              isLoading={isLLMLoading}
+              currentTime={currentTimeStr}
+              location={locationName ?? (userLocation ? `${userLocation.lat.toFixed(3)}, ${userLocation.lng.toFixed(3)}` : null)}
+              weather={weather}
+              progress={planProgress}
+              modifiedSchedule={modifiedSchedule}
+              onApplyOriginal={() => setModifiedSchedule(null)}
+              nearbyPlaces={nearbyPlaces}
+              hasGoogleMaps={Boolean(window.__googleMapsLoaded)}
+            />
           </motion.div>
         )}
       </AnimatePresence>
@@ -1033,5 +1428,189 @@ function RoutedPolylines({ defs, moveId, onSegmentClick }) {
         />
       ))}
     </>
+  );
+}
+
+// ─── VariableHandlerPanel ────────────────────────────────────────────────────
+function escapeHtml(str) {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#x27;");
+}
+
+function renderMarkdownLike(text) {
+  return text.split("\n").map((line, i) => {
+    const formatted = escapeHtml(line)
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/`(.+?)`/g, "<code>$1</code>");
+    return <p key={i} dangerouslySetInnerHTML={{ __html: formatted || "&nbsp;" }} style={{ margin: "3px 0" }} />;
+  });
+}
+
+function VariableHandlerPanel({
+  show, onToggle,
+  chatHistory, chatInput, onChatInputChange, onSend, isLoading,
+  currentTime, location, weather, progress,
+  modifiedSchedule, onApplyOriginal,
+  nearbyPlaces, hasGoogleMaps,
+}) {
+  const chatEndRef = useRef(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (show) {
+      chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      inputRef.current?.focus();
+    }
+  }, [show, chatHistory.length]);
+
+  const suggestions = [
+    "늦잠 자서 12시에 출발하는데 일정 변동 있나요?",
+    "비가 오는데 야외 일정 조정해주세요",
+    "팀랩 예약이 취소됐어요",
+  ];
+
+  return (
+    <div className={`var-handler ${show ? "var-handler--open" : ""}`}>
+      <button type="button" className="var-handler__toggle" onClick={onToggle}>
+        <span className="var-handler__toggle-icon">🤖</span>
+        AI 변수 조치 {show ? "▲ 접기" : "▼ 열기"}
+        {modifiedSchedule && <span className="var-handler__modified-dot" title="수정된 일정 적용 중" />}
+      </button>
+
+      {show && (
+        <div className="var-handler__body">
+          {/* Context strip */}
+          <div className="var-ctx">
+            <div className="var-ctx__col">
+              <span className="var-ctx__label">현재 시간</span>
+              <span className="var-ctx__val">{currentTime}</span>
+            </div>
+            <div className="var-ctx__col">
+              <span className="var-ctx__label">현재 위치</span>
+              <span className="var-ctx__val">{location ?? "확인 중…"}</span>
+            </div>
+            <div className="var-ctx__col">
+              <span className="var-ctx__label">날씨</span>
+              <span className="var-ctx__val">
+                {weather ? `${weather.icon} ${weather.temp} ${weather.description}` : "로딩…"}
+              </span>
+            </div>
+            <div className="var-ctx__col">
+              <span className="var-ctx__label">진행 상황</span>
+              <span className="var-ctx__val">완료 {progress.done.length} / 남은 {progress.remaining.length}</span>
+            </div>
+            {modifiedSchedule && (
+              <div className="var-ctx__col var-ctx__col--modified">
+                <span className="var-ctx__label">일정 상태</span>
+                <span className="var-ctx__val">🔄 AI 수정 적용 중 ({modifiedSchedule.length}곳)</span>
+                <button type="button" className="var-ctx__revert-btn" onClick={onApplyOriginal}>
+                  원래 일정으로
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Nearby places (Google Maps) */}
+          {hasGoogleMaps && nearbyPlaces.length > 0 && (
+            <div className="var-nearby">
+              <span className="var-nearby__label">📍 현재 위치 주변 (Google Maps)</span>
+              <div className="var-nearby__list">
+                {nearbyPlaces.map((p, idx) => (
+                  <span key={p.id ? `${p.id}-${idx}` : idx} className="var-nearby__chip" title={p.vicinity}>
+                    {p.name} {p.rating ? `★${p.rating}` : ""}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Chat history */}
+          <div className="var-chat">
+            {chatHistory.length === 0 && (
+              <div className="var-chat__empty">
+                <p>✨ 예상치 못한 상황을 알려주세요. LLM이 현재 일정을 분석해 수정안을 제안합니다.</p>
+                <div className="var-chat__suggestions">
+                  {suggestions.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      className="var-chat__suggestion-chip"
+                      onClick={() => { onChatInputChange(s); inputRef.current?.focus(); }}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {chatHistory.map((msg, i) => (
+              <div key={i} className={`var-chat__msg var-chat__msg--${msg.role}`}>
+                <span className="var-chat__role">{msg.role === "user" ? "👤 나" : "🤖 AI"}</span>
+                <div className="var-chat__content">
+                  {msg.role === "assistant" ? renderMarkdownLike(msg.content) : <p>{msg.content}</p>}
+                  {msg.modifiedSchedule && msg.modifiedSchedule.length > 0 && (
+                    <div className="var-chat__modified-schedule">
+                      <strong>📋 수정된 일정 ({msg.modifiedSchedule.length}곳)</strong>
+                      <ol>
+                        {msg.modifiedSchedule.map((item, idx) => (
+                           <li key={item.id != null ? `${item.id}-${idx}` : idx}>{item.time} {item.name} ({item.area ?? item.type})</li>
+                        ))}
+                      </ol>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+            {isLoading && (
+              <div className="var-chat__msg var-chat__msg--assistant">
+                <span className="var-chat__role">🤖 AI</span>
+                <div className="var-chat__content var-chat__thinking">
+                  <span>분석 중</span>
+                  <span className="var-chat__dots"><span /><span /><span /></span>
+                </div>
+              </div>
+            )}
+            <div ref={chatEndRef} />
+          </div>
+
+          {/* Input */}
+          <div className="var-input-row">
+            <textarea
+              ref={inputRef}
+              className="var-input"
+              rows={2}
+              placeholder="상황을 입력하세요 (예: 늦잠 자서 12시에 출발, 비가 와서 야외 취소…)"
+              value={chatInput}
+              onChange={(e) => onChatInputChange(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  onSend();
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="btn primary var-send-btn"
+              disabled={!chatInput.trim() || isLoading}
+              onClick={onSend}
+            >
+              {isLoading ? "분석 중…" : "전송"}
+            </button>
+          </div>
+          <p className="var-hint">
+            {OPENAI_KEY ? "OpenAI GPT 연결됨" : "시뮬레이션 모드 (VITE_OPENAI_API_KEY 미설정)"}
+            {" · "}
+            {OWM_KEY ? "날씨 API 연결됨" : "날씨 시뮬레이션"}
+            {" · "}
+            {hasGoogleMaps ? "Google Maps 연결됨" : "Google Maps 미연결"}
+          </p>
+        </div>
+      )}
+    </div>
   );
 }

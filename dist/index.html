@@ -4,10 +4,30 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AI Travel Planner Prototype</title>
-    <script type="module" crossorigin src="/assets/index-DteLTk5-.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-DT5-oQt6.css">
+    <script>
+      (function () {
+        var key = "%VITE_GOOGLE_MAPS_API_KEY%";
+        var placeholder = "%VITE_GOOGLE_MAPS_API_KEY%";
+        if (key && key.length > 0 && key !== placeholder) {
+          var s = document.createElement("script");
+          s.src =
+            "https://maps.googleapis.com/maps/api/js?key=" +
+            key +
+            "&libraries=places,geometry&callback=__gmapsReady";
+          s.async = true;
+          s.defer = true;
+          window.__gmapsReady = function () {
+            window.__googleMapsLoaded = true;
+            window.dispatchEvent(new Event("googlemapsloaded"));
+          };
+          document.head.appendChild(s);
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-Pi1ucX_5.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DUN1VqPX.css">
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root"></div>
   </body>
 </html>
