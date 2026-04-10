@@ -370,6 +370,14 @@ describe("simulateLLMResponse — rain scenario", () => {
 });
 
 describe("simulateLLMResponse — cancellation scenario", () => {
+  const CANCELLATION_PRIORITY_PLAN = [
+    { id: "x", name: "신주쿠 쇼핑 스트리트", type: "쇼핑/트렌드", area: "신주쿠", time: "13:00", visitScore: 3, indoor: true, latlng: [35.693, 139.703] },
+    { id: "y", name: "신주쿠 쇼핑몰", type: "쇼핑/실내", area: "신주쿠", time: "13:30", visitScore: 4, indoor: true, latlng: [35.694, 139.704] },
+    { id: "z", name: "신주쿠 로컬시장", type: "로컬시장", area: "신주쿠", time: "14:00", visitScore: 5, indoor: false, latlng: [35.695, 139.705] },
+    { id: "w", name: "신주쿠 전망대", type: "야경/전망", area: "신주쿠", time: "14:30", visitScore: 5, indoor: true, latlng: [35.696, 139.706] },
+    { id: "q", name: "오다이바 해변", type: "자연/산책", area: "오다이바", time: "16:00", visitScore: 4, indoor: false, latlng: [35.627, 139.775] },
+  ];
+
   it("asks user intent and does not auto-apply schedule changes", () => {
     const res = simulateLLMResponse("아키하바라 취소됐어요", FULL_PLAN);
     expect(res.modifiedSchedule).toBeNull();
@@ -379,6 +387,27 @@ describe("simulateLLMResponse — cancellation scenario", () => {
   it("response text mentions the cancelled spot", () => {
     const res = simulateLLMResponse("신주쿠 골든가이 취소", FULL_PLAN);
     expect(res.text).toContain("신주쿠 골든가이");
+  });
+
+  it("includes replacement priority policy and orders same-theme nearby first", () => {
+    const res = simulateLLMResponse("신주쿠 쇼핑 스트리트 취소", CANCELLATION_PRIORITY_PLAN);
+    const recommendationLines = res.text
+      .split("\n")
+      .filter((line) => /^\d+\.\s/.test(line.trim()));
+    expect(res.text).toContain("일정 대체 우선순위");
+    expect(recommendationLines[0]).toContain("신주쿠 쇼핑몰");
+  });
+
+  it("raises slack-time option priority when constraints are mentioned", () => {
+    const res = simulateLLMResponse("신주쿠 쇼핑 스트리트 취소, 조건이 바뀌어서 무리 없는 일정으로", CANCELLATION_PRIORITY_PLAN);
+    const recommendationLines = res.text
+      .split("\n")
+      .filter((line) => /^\d+\.\s/.test(line.trim()));
+    const slackIndex = recommendationLines.findIndex((line) => line.includes("여유 시간 확보"));
+    const pullForwardIndex = recommendationLines.findIndex((line) => line.includes("일정 당기기"));
+    expect(slackIndex).toBeGreaterThanOrEqual(0);
+    expect(pullForwardIndex).toBeGreaterThanOrEqual(0);
+    expect(slackIndex).toBeLessThan(pullForwardIndex);
   });
 });
 

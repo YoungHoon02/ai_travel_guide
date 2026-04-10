@@ -149,6 +149,53 @@ export function assignOptimalDays(ids, lodgingLatLng, contents) {
  * Rule-based response simulator used when no OpenAI key is configured.
  * Handles three scenarios: late start (delay), rain, and cancellation.
  */
+const MAX_RECOMMENDATIONS = 7;
+const MIN_RECOMMENDATIONS = 3;
+const CONSTRAINT_CHANGE_REGEX = /조건|제약|변경|아이|유아|어르신|휠체어|유모차|피곤|휴식|예산|비용|무리/;
+
+const THEME_FAMILY_MAP = {
+  history: ["역사", "유적", "사원", "신궁", "박물관", "전시"],
+  shopping: ["쇼핑", "시장", "로컬", "트렌드", "서브컬처"],
+  food: ["미식", "카페", "브런치", "디저트"],
+  night: ["야경", "바", "전망", "마무리"],
+  nature: ["자연", "공원", "산책", "해변"],
+  experience: ["체험", "아트", "몰입"],
+};
+
+function parseThemeTokens(type = "") {
+  return String(type).split(/[\/,\s]+/).map((token) => token.trim()).filter(Boolean);
+}
+
+function hasSharedToken(aTokens, bTokens) {
+  return aTokens.some((token) => bTokens.includes(token));
+}
+
+function getThemeFamilies(tokens) {
+  const families = new Set();
+  Object.entries(THEME_FAMILY_MAP).forEach(([family, keywords]) => {
+    if (tokens.some((token) => keywords.some((keyword) => token.includes(keyword)))) families.add(family);
+  });
+  return families;
+}
+
+function hasSimilarTheme(aTokens, bTokens) {
+  const aFamilies = getThemeFamilies(aTokens);
+  const bFamilies = getThemeFamilies(bTokens);
+  return [...aFamilies].some((family) => bFamilies.has(family));
+}
+
+function isNearbySpot(a, b) {
+  if (!a || !b) return false;
+  if (a.area && b.area && a.area === b.area) return true;
+  if (Array.isArray(a.latlng) && Array.isArray(b.latlng)) {
+    return distSq(a.latlng, b.latlng) <= 0.0025;
+  }
+  if (a.time && b.time) {
+    return Math.abs(timeToMinutes(a.time) - timeToMinutes(b.time)) <= 180;
+  }
+  return false;
+}
+
 function buildSelectableRecommendations(plan, primary = []) {
   const seen = new Set();
   const merged = [...primary, ...plan].filter((item) => {
@@ -156,13 +203,56 @@ function buildSelectableRecommendations(plan, primary = []) {
     seen.add(item.id);
     return true;
   });
-  if (merged.length <= 3) return merged;
-  return merged.slice(0, 7);
+  if (merged.length <= MIN_RECOMMENDATIONS) return merged;
+  return merged.slice(0, MAX_RECOMMENDATIONS);
+}
+
+function buildPrioritizedReplacementRecommendations(plan, canceledSpot, userMessage) {
+  const candidates = plan.filter((item) => item.id !== canceledSpot.id);
+  const canceledTokens = parseThemeTokens(canceledSpot.type);
+  const rankedCandidates = candidates
+    .map((item) => {
+      const itemTokens = parseThemeTokens(item.type);
+      const nearby = isNearbySpot(canceledSpot, item);
+      const sameTheme = hasSharedToken(canceledTokens, itemTokens);
+      const similarTheme = !sameTheme && hasSimilarTheme(canceledTokens, itemTokens);
+      let priority = 4;
+      if (sameTheme && nearby) priority = 1;
+      else if (similarTheme && nearby) priority = 2;
+      else if (nearby) priority = 3;
+      return { ...item, replacementPriority: priority, nearby };
+    })
+    .sort((a, b) => {
+      if (a.replacementPriority !== b.replacementPriority) return a.replacementPriority - b.replacementPriority;
+      const aDistance = Array.isArray(a.latlng) && Array.isArray(canceledSpot.latlng) ? distSq(a.latlng, canceledSpot.latlng) : Infinity;
+      const bDistance = Array.isArray(b.latlng) && Array.isArray(canceledSpot.latlng) ? distSq(b.latlng, canceledSpot.latlng) : Infinity;
+      if (aDistance !== bDistance) return aDistance - bDistance;
+      return (b.visitScore ?? 0) - (a.visitScore ?? 0);
+    });
+
+  const constraintChanged = CONSTRAINT_CHANGE_REGEX.test(userMessage);
+  const strategyOptions = constraintChanged
+    ? [
+      { optionLabel: "여유 시간 확보 (조건 변경 반영)", replacementPriority: 4 },
+      { optionLabel: "일정 당기기 + 새로운 일정 추가/수정", replacementPriority: 5 },
+    ]
+    : [
+      { optionLabel: "일정 당기기 + 새로운 일정 추가/수정", replacementPriority: 4 },
+      { optionLabel: "여유 시간 확보", replacementPriority: 5 },
+    ];
+
+  const spotLimit = Math.max(1, MAX_RECOMMENDATIONS - strategyOptions.length);
+  const recommended = [...rankedCandidates.slice(0, spotLimit), ...strategyOptions];
+  return recommended.slice(0, Math.max(MIN_RECOMMENDATIONS, Math.min(MAX_RECOMMENDATIONS, recommended.length)));
 }
 
 function formatRecommendationLines(recommendations) {
   return recommendations
-    .map((item, idx) => `${idx + 1}. ${item.name} (${item.time}${item.area ? `, ${item.area}` : ""})`)
+    .map((item, idx) => {
+      if (item.optionLabel) return `${idx + 1}. ${item.optionLabel}`;
+      const priorityTag = item.replacementPriority ? `P${item.replacementPriority} · ` : "";
+      return `${idx + 1}. ${priorityTag}${item.name} (${item.time}${item.area ? `, ${item.area}` : ""})`;
+    })
     .join("\n");
 }
 
@@ -206,9 +296,10 @@ export function simulateLLMResponse(userMessage, plan) {
   }
 
   if (isCancellation && mentionedSpot) {
-    const recommendations = buildSelectableRecommendations(plan, plan.filter((item) => item.id !== mentionedSpot.id));
+    const recommendations = buildPrioritizedReplacementRecommendations(plan, mentionedSpot, userMessage);
+    const constraintChanged = CONSTRAINT_CHANGE_REGEX.test(userMessage);
     return {
-      text: `✅ **상황 분석**: **${mentionedSpot.name}** 취소 상황을 확인했습니다.\n\n❓ **역질문**: 빈 시간(${mentionedSpot.time})은 어떤 식으로 쓰고 싶으세요?\n- 근처 대체 장소로 채우기\n- 식사/카페로 여유 있게 전환\n- 뒤 일정 당겨서 하루를 압축\n\n🧭 **선택 가능한 추천 컨텐츠 (${recommendations.length}개)**\n${formatRecommendationLines(recommendations)}\n\n선호 방향과 번호를 주시면 그 의도에 맞춰 일정을 수정하겠습니다.`,
+      text: `✅ **상황 분석**: **${mentionedSpot.name}** 취소 상황을 확인했습니다.\n\n📐 **일정 대체 우선순위**\n1) 동일 테마 + 근교\n2) 유사 테마 + 근교\n3) 근교 인기 장소\n4) 일정 당기기 + 새로운 일정 추가/수정\n5) 여유 시간 확보${constraintChanged ? " (조건 변경 감지로 우선순위 상향 적용)" : ""}\n\n❓ **역질문**: 빈 시간(${mentionedSpot.time})은 어떤 식으로 쓰고 싶으세요?\n\n🧭 **우선순위 기반 추천 (${recommendations.length}개)**\n${formatRecommendationLines(recommendations)}\n\n선호 번호를 알려주시면 해당 우선순위를 기준으로 일정을 수정하겠습니다.`,
       modifiedSchedule: null,
     };
   }
