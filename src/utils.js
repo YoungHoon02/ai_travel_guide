@@ -156,8 +156,8 @@ function buildSelectableRecommendations(plan, primary = []) {
     seen.add(item.id);
     return true;
   });
-  const picks = merged.slice(0, 7);
-  return picks.slice(0, Math.max(3, Math.min(7, picks.length)));
+  if (merged.length <= 3) return merged;
+  return merged.slice(0, 7);
 }
 
 function formatRecommendationLines(recommendations) {
@@ -208,7 +208,7 @@ export function simulateLLMResponse(userMessage, plan) {
   if (isCancellation && mentionedSpot) {
     const recommendations = buildSelectableRecommendations(plan, plan.filter((item) => item.id !== mentionedSpot.id));
     return {
-      text: `✅ **상황 분석**: **${mentionedSpot.name}** 취소 상황을 확인했습니다.\n\n❓ **역질문**: 비는 시간(${mentionedSpot.time})은 어떤 식으로 쓰고 싶으세요?\n- 근처 대체 장소로 채우기\n- 식사/카페로 여유 있게 전환\n- 뒤 일정 당겨서 하루를 압축\n\n🧭 **선택 가능한 추천 컨텐츠 (${recommendations.length}개)**\n${formatRecommendationLines(recommendations)}\n\n선호 방향과 번호를 주시면 그 의도에 맞춰 일정을 수정하겠습니다.`,
+      text: `✅ **상황 분석**: **${mentionedSpot.name}** 취소 상황을 확인했습니다.\n\n❓ **역질문**: 빈 시간(${mentionedSpot.time})은 어떤 식으로 쓰고 싶으세요?\n- 근처 대체 장소로 채우기\n- 식사/카페로 여유 있게 전환\n- 뒤 일정 당겨서 하루를 압축\n\n🧭 **선택 가능한 추천 컨텐츠 (${recommendations.length}개)**\n${formatRecommendationLines(recommendations)}\n\n선호 방향과 번호를 주시면 그 의도에 맞춰 일정을 수정하겠습니다.`,
       modifiedSchedule: null,
     };
   }
