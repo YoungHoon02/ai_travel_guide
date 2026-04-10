@@ -242,8 +242,15 @@ function buildPrioritizedReplacementRecommendations(plan, canceledSpot, userMess
     ];
 
   const spotLimit = Math.max(1, MAX_RECOMMENDATIONS - strategyOptions.length);
+  const backupOptions = [
+    { optionLabel: "가까운 다음 일정 우선 진행", replacementPriority: 4 },
+    { optionLabel: "세부 제약 재확인 후 재추천", replacementPriority: 5 },
+  ];
   const recommended = [...rankedCandidates.slice(0, spotLimit), ...strategyOptions];
-  return recommended.slice(0, Math.max(MIN_RECOMMENDATIONS, Math.min(MAX_RECOMMENDATIONS, recommended.length)));
+  while (recommended.length < MIN_RECOMMENDATIONS && backupOptions.length > 0) {
+    recommended.push(backupOptions.shift());
+  }
+  return recommended.slice(0, MAX_RECOMMENDATIONS);
 }
 
 function formatRecommendationLines(recommendations) {
