@@ -323,11 +323,10 @@ const FULL_PLAN = [
 ];
 
 describe("simulateLLMResponse — delay scenario", () => {
-  it("filters out spots before the mentioned hour", () => {
+  it("asks counter-questions and keeps schedule unchanged until user chooses", () => {
     const res = simulateLLMResponse("늦잠 자서 13시에 출발해요", FULL_PLAN);
-    // 10:00 and 11:30 are before 13:00 → should be skipped
-    expect(res.modifiedSchedule).not.toBeNull();
-    expect(res.modifiedSchedule.every((i) => timeToMinutes(i.time) >= 13 * 60)).toBe(true);
+    expect(res.modifiedSchedule).toBeNull();
+    expect(res.text).toContain("역질문");
   });
 
   it("response text mentions the mentioned hour", () => {
@@ -335,16 +334,13 @@ describe("simulateLLMResponse — delay scenario", () => {
     expect(res.text).toContain("12시");
   });
 
-  it("keeps all spots when none are before the mentioned hour", () => {
+  it("provides 3~7 selectable recommendation items", () => {
     const res = simulateLLMResponse("늦잠 자서 8시에 출발", FULL_PLAN);
-    // All spots are at 10:00+ so none should be skipped
-    expect(res.modifiedSchedule).toEqual(FULL_PLAN);
-  });
-
-  it("returns full plan (fallback) when remaining would be empty", () => {
-    const res = simulateLLMResponse("늦잠 자서 23시에 출발합니다", FULL_PLAN);
-    // All spots are before 23:00 → remaining is empty → returns plan
-    expect(res.modifiedSchedule).toHaveLength(FULL_PLAN.length);
+    const recommendationLines = res.text
+      .split("\n")
+      .filter((line) => /^\d+\.\s/.test(line.trim()));
+    expect(recommendationLines.length).toBeGreaterThanOrEqual(3);
+    expect(recommendationLines.length).toBeLessThanOrEqual(7);
   });
 });
 
@@ -357,6 +353,7 @@ describe("simulateLLMResponse — rain scenario", () => {
     // Indoor spots should be in the "recommendation" part
     expect(res.text).toContain("오모테산도");
     expect(res.text).toContain("아키하바라");
+    expect(res.text).toContain("역질문");
   });
 
   it("modifiedSchedule is null for rain (advice only)", () => {
@@ -367,22 +364,50 @@ describe("simulateLLMResponse — rain scenario", () => {
   it("when all spots are indoor, replies with all-indoor message", () => {
     const allIndoor = FULL_PLAN.map((s) => ({ ...s, indoor: true }));
     const res = simulateLLMResponse("비가 오네요", allIndoor);
-    expect(res.text).toContain("실내 위주");
+    expect(res.text).toContain("실내 비중");
     expect(res.modifiedSchedule).toBeNull();
   });
 });
 
 describe("simulateLLMResponse — cancellation scenario", () => {
-  it("removes the mentioned spot from the plan", () => {
+  const CANCELLATION_PRIORITY_PLAN = [
+    { id: "x", name: "신주쿠 쇼핑 스트리트", type: "쇼핑/트렌드", area: "신주쿠", time: "13:00", visitScore: 3, indoor: true, latlng: [35.693, 139.703] },
+    { id: "y", name: "신주쿠 쇼핑몰", type: "쇼핑/실내", area: "신주쿠", time: "13:30", visitScore: 4, indoor: true, latlng: [35.694, 139.704] },
+    { id: "z", name: "신주쿠 로컬시장", type: "로컬시장", area: "신주쿠", time: "14:00", visitScore: 5, indoor: false, latlng: [35.695, 139.705] },
+    { id: "w", name: "신주쿠 전망대", type: "야경/전망", area: "신주쿠", time: "14:30", visitScore: 5, indoor: true, latlng: [35.696, 139.706] },
+    { id: "q", name: "오다이바 해변", type: "자연/산책", area: "오다이바", time: "16:00", visitScore: 4, indoor: false, latlng: [35.627, 139.775] },
+  ];
+
+  it("asks user intent and does not auto-apply schedule changes", () => {
     const res = simulateLLMResponse("아키하바라 취소됐어요", FULL_PLAN);
-    expect(res.modifiedSchedule).not.toBeNull();
-    expect(res.modifiedSchedule.some((i) => i.id === "d")).toBe(false);
-    expect(res.modifiedSchedule).toHaveLength(FULL_PLAN.length - 1);
+    expect(res.modifiedSchedule).toBeNull();
+    expect(res.text).toContain("역질문");
   });
 
   it("response text mentions the cancelled spot", () => {
     const res = simulateLLMResponse("신주쿠 골든가이 취소", FULL_PLAN);
     expect(res.text).toContain("신주쿠 골든가이");
+  });
+
+  it("includes replacement priority policy and orders same-theme nearby first", () => {
+    const res = simulateLLMResponse("신주쿠 쇼핑 스트리트 취소", CANCELLATION_PRIORITY_PLAN);
+    const recommendationLines = res.text
+      .split("\n")
+      .filter((line) => /^\d+\.\s/.test(line.trim()));
+    expect(res.text).toContain("일정 대체 우선순위");
+    expect(recommendationLines[0]).toContain("신주쿠 쇼핑몰");
+  });
+
+  it("raises slack-time option priority when constraints are mentioned", () => {
+    const res = simulateLLMResponse("신주쿠 쇼핑 스트리트 취소, 조건이 바뀌어서 무리 없는 일정으로", CANCELLATION_PRIORITY_PLAN);
+    const recommendationLines = res.text
+      .split("\n")
+      .filter((line) => /^\d+\.\s/.test(line.trim()));
+    const slackIndex = recommendationLines.findIndex((line) => line.includes("여유 시간 확보"));
+    const pullForwardIndex = recommendationLines.findIndex((line) => line.includes("일정 당기기"));
+    expect(slackIndex).toBeGreaterThanOrEqual(0);
+    expect(pullForwardIndex).toBeGreaterThanOrEqual(0);
+    expect(slackIndex).toBeLessThan(pullForwardIndex);
   });
 });
 
