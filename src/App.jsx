@@ -917,6 +917,7 @@ export default function App() {
     setDestLoading(true);
     setDestSuggestions([]);
     setSelectedDest(null);
+    const prevFollowUps = destFollowUps;
     setDestFollowUps([]);
     // Wrap message based on context
     let llmMessage = text;
@@ -928,6 +929,7 @@ export default function App() {
     const reqEntry = { provider: "…", model: "…", userMessage: text, timestamp: new Date().toISOString(), pending: true };
     let logIdx;
     setLlmLogs((prev) => { logIdx = prev.length; return [...prev, reqEntry]; });
+    let succeeded = false;
     try {
       const result = await callDestinationLLM(llmMessage, destChatHistory, (log) => setLlmLogs((prev) => prev.map((entry, i) => i === logIdx ? { ...log, pending: false } : entry)), maxDestCount);
       let dests = result.destinations ?? [];
@@ -953,11 +955,14 @@ export default function App() {
         setDestFlowHistory((prev) => [...prev, ...pair]);
         setDestQueriedText(text);
       }
-      setDestActiveQuestion(null);
+      succeeded = true;
     } finally {
       setDestLoading(false);
+      setDestActiveQuestion(null);
+      // Restore follow-up questions if the call failed so buttons don't disappear
+      if (!succeeded) setDestFollowUps(prevFollowUps);
     }
-  }, [destQuery, destLoading]);
+  }, [destQuery, destLoading, destActiveQuestion, destChatHistory, destFollowUps]);
 
   const handleDestRefreshQuestions = useCallback(async () => {
     if (destRefreshing || !destQueriedText) return;

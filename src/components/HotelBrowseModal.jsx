@@ -161,11 +161,11 @@ export default function HotelBrowseModal({ isOpen, onClose, country, region, onS
 
   // Kick off LLM-based insights for a freshly-loaded hotel list. Runs async so
   // the card list can render immediately; insights fill in when ready.
-  const loadInsightsFor = useCallback(async (list) => {
+  const loadInsightsFor = useCallback(async (list, countryVal, regionVal) => {
     if (!list || list.length === 0) return;
     setInsightsLoading(true);
     try {
-      const result = await generateHotelInsights(list, { country, region }, onLog);
+      const result = await generateHotelInsights(list, { country: countryVal, region: regionVal }, onLog);
       if (!result) return;
       const map = {};
       for (const item of result) {
@@ -175,7 +175,7 @@ export default function HotelBrowseModal({ isOpen, onClose, country, region, onS
     } finally {
       setInsightsLoading(false);
     }
-  }, [country, region, onLog]);
+  }, [onLog]);
 
   // Initial search when modal opens / destination changes
   useEffect(() => {
@@ -189,7 +189,7 @@ export default function HotelBrowseModal({ isOpen, onClose, country, region, onS
       setInsightsById({});
       setLoading(false);
       setSelectedHotel(results[0] ?? null);
-      loadInsightsFor(results);
+      loadInsightsFor(results, country, region);
     });
   }, [isOpen, tab, country, region, loadInsightsFor]);
 
@@ -202,7 +202,7 @@ export default function HotelBrowseModal({ isOpen, onClose, country, region, onS
     setInsightsById({});
     setLoading(false);
     setSelectedHotel(results[0] ?? null);
-    loadInsightsFor(results);
+    loadInsightsFor(results, country, region);
   }, [searchQuery, country, region, loadInsightsFor]);
 
   const handleBrowseSelect = useCallback(() => {
