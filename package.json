@@ -15,11 +15,20 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@chenglou/pretext": "^0.0.5",
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.5.0",
     "framer-motion": "^12.38.0",
     "leaflet": "^1.9.4",
+    "lottie-react": "^2.4.1",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
-    "react-leaflet": "^5.0.0"
+    "react-leaflet": "^5.0.0",
+    "reactflow": "^11.11.4",
+    "three": "^0.183.2"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",
