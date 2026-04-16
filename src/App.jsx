@@ -178,6 +178,33 @@ export default function App() {
   // selectedSpotIds is derived (flat unique list) for backward compat.
   // Shape: { 1: [id, id], 2: [id], 3: [], ... }
   const [dayAssignments, setDayAssignments] = useState({ 1: [], 2: [], 3: [] });
+
+  const deriveDayCount = useCallback(() => {
+    const m = String(days ?? "").match(/(\d+)\s*일/);
+    const n = m ? parseInt(m[1], 10) : 3;
+    return Math.max(1, Math.min(10, n));
+  }, [days]);
+
+  const buildEmptyAssignments = useCallback((count) => {
+    const safeCount = Math.max(1, count ?? 0);
+    const obj = {};
+    for (let d = 1; d <= safeCount; d++) obj[d] = [];
+    return obj;
+  }, []);
+
+  const normalizeDayAssignments = useCallback((assignments, count = deriveDayCount(), clamp = false) => {
+    const entries = Object.entries(assignments ?? {});
+    const maxAssigned = entries.reduce((max, [day]) => Math.max(max, Number(day) || 0), 0);
+    const targetCount = clamp ? count : Math.max(count, maxAssigned);
+    const base = buildEmptyAssignments(targetCount);
+    for (const [day, ids] of entries) {
+      const dayNum = Number(day);
+      if (clamp && dayNum > targetCount) continue;
+      base[dayNum] = ids ?? [];
+    }
+    return base;
+  }, [buildEmptyAssignments, deriveDayCount]);
+
   const [refinePrompt, setRefinePrompt] = useState("");
   const [isRefining, setIsRefining] = useState(false);
   const [optimizedDayPicks, setOptimizedDayPicks] = useState(null);
@@ -328,7 +355,8 @@ export default function App() {
           setDynContents(refined);
           setRecommended(refined);
           setDynItinerary(itinerary);
-          setDayAssignments(newAssignments);
+          const maxDay = Math.max(deriveDayCount(), ...(itinerary.days ?? []).map((d) => Number(d.day) || 0));
+          setDayAssignments(normalizeDayAssignments(newAssignments, maxDay));
         }
       }
     })();
@@ -406,11 +434,20 @@ export default function App() {
   }, [dayAssignments, selectedSpotIds.length]);
 
   // ── Step 2 Edit View derivations ────────────────────────────────────────
-  const dayCount = useMemo(() => {
-    const m = String(days ?? "").match(/(\d+)\s*일/);
-    const n = m ? parseInt(m[1]) : 3;
-    return Math.max(1, Math.min(10, n));
-  }, [days]);
+  const dayCount = useMemo(() => deriveDayCount(), [deriveDayCount]);
+
+  useEffect(() => {
+    setDayAssignments((prev) => {
+      const next = normalizeDayAssignments(prev, dayCount, true);
+      const sameKeys = Object.keys(prev).length === Object.keys(next).length
+        && Object.keys(next).every((key) => {
+          const prevIds = prev[key] ?? [];
+          const nextIds = next[key] ?? [];
+          return prevIds.length === nextIds.length && prevIds.every((id, idx) => id === nextIds[idx]);
+        });
+      return sameKeys ? prev : next;
+    });
+  }, [dayCount, normalizeDayAssignments]);
 
   // Clamp activeDay when dayCount changes
   useEffect(() => {
@@ -573,55 +610,66 @@ export default function App() {
 
   const pickedContents = useMemo(() => {
     if (!optimizedDayPicks) return [];
+    const days = Object.keys(optimizedDayPicks)
+      .map((d) => Number(d))
+      .filter((d) => !Number.isNaN(d))
+      .sort((a, b) => a - b);
     const out = [];
-    [1, 2, 3].forEach((d) => {
-      optimizedDayPicks[d].forEach((id) => {
+    days.forEach((d) => {
+      (optimizedDayPicks[d] ?? []).forEach((id, idx) => {
         const c = activeContents.find((item) => item.id === id);
-        if (c) out.push({ ...c, assignedDay: d });
+        if (c) out.push({ ...c, assignedDay: d, seq: idx + 1 });
       });
     });
     return out;
-  }, [optimizedDayPicks]);
+  }, [optimizedDayPicks, activeContents]);
+
+  const activeSchedule = useMemo(() => modifiedSchedule ?? pickedContents, [modifiedSchedule, pickedContents]);
+
+  const sortedActiveSchedule = useMemo(() => {
+    const list = [...(activeSchedule ?? [])];
+    list.sort((a, b) => {
+      const dayA = Number(a.assignedDay ?? a.day ?? 0);
+      const dayB = Number(b.assignedDay ?? b.day ?? 0);
+      if (dayA !== dayB) return dayA - dayB;
+      const timeA = a.time ?? "";
+      const timeB = b.time ?? "";
+      if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB);
+      const seqA = a.seq ?? 0;
+      const seqB = b.seq ?? 0;
+      if (seqA !== seqB) return seqA - seqB;
+      return (a.name ?? "").localeCompare(b.name ?? "");
+    });
+    return list;
+  }, [activeSchedule]);
+
+  const scheduleDayRange = useMemo(() => {
+    const assignedDays = sortedActiveSchedule.map((item) => Number(item.assignedDay ?? item.day ?? 0)).filter((d) => d > 0);
+    const maxAssigned = assignedDays.length ? Math.max(...assignedDays) : 0;
+    const maxDay = Math.max(dayCount, maxAssigned);
+    return Array.from({ length: Math.max(1, maxDay) }, (_, i) => i + 1);
+  }, [sortedActiveSchedule, dayCount]);
+
+  const scheduleByDay = useMemo(() => {
+    return scheduleDayRange
+      .map((d) => ({
+        day: d,
+        items: sortedActiveSchedule.filter((item) => (item.assignedDay ?? item.day) === d),
+      }))
+      .filter((g) => g.items.length > 0);
+  }, [scheduleDayRange, sortedActiveSchedule]);
 
   const spotNumberById = useMemo(() => {
-    if (!optimizedDayPicks) return new Map();
     const map = new Map();
-    let n = 0;
-    [1, 2, 3].forEach((d) => {
-      optimizedDayPicks[d].forEach((id) => {
-        n += 1;
-        map.set(id, n);
+    scheduleByDay.forEach((group) => {
+      group.items.forEach((item, idx) => {
+        map.set(item.id, idx + 1);
       });
     });
     return map;
-  }, [optimizedDayPicks]);
+  }, [scheduleByDay]);
 
-  const segmentDefs = useMemo(() => buildMoveSegmentDefs(pickedContents, move), [pickedContents, move]);
-
-  const scheduleByDay = useMemo(() => {
-    // When modifiedSchedule is active, use it (it's a flat array with assignedDay)
-    if (modifiedSchedule) {
-      const days = [1, 2, 3];
-      return days
-        .map((d) => ({
-          day: d,
-          items: modifiedSchedule
-            .filter((item) => item.assignedDay === d)
-            .sort((a, b) => a.time.localeCompare(b.time)),
-        }))
-        .filter((g) => g.items.length > 0);
-    }
-    if (!optimizedDayPicks) return [];
-    return [1, 2, 3]
-      .map((d) => ({
-        day: d,
-        items: optimizedDayPicks[d].map((id) => {
-          const c = activeContents.find((item) => item.id === id);
-          return c ? { ...c, assignedDay: d } : null;
-        }).filter(Boolean),
-      }))
-      .filter((g) => g.items.length > 0);
-  }, [optimizedDayPicks, modifiedSchedule]);
+  const segmentDefs = useMemo(() => buildMoveSegmentDefs(sortedActiveSchedule, move), [sortedActiveSchedule, move]);
 
   const groupedPickContents = useMemo(() => {
     const base = recommended.length ? recommended : activeContents;
@@ -716,7 +764,8 @@ export default function App() {
         setDynContents(refined);
         setRecommended(refined);
         setDynItinerary(itinerary);
-        setDayAssignments(newAssignments);
+        const maxDay = Math.max(deriveDayCount(), ...(itinerary.days ?? []).map((d) => Number(d.day) || 0));
+        setDayAssignments(normalizeDayAssignments(newAssignments, maxDay));
         setRefinePrompt("");
       }
     } catch (err) {
@@ -724,7 +773,7 @@ export default function App() {
     } finally {
       setIsRefining(false);
     }
-  }, [refinePrompt, isRefining, country, region, days, move, activeMoves, tags]);
+  }, [refinePrompt, isRefining, country, region, days, move, activeMoves, tags, deriveDayCount, normalizeDayAssignments]);
 
   // ── DnD setup ─────────────────────────────────────────────────────────
   const dndSensors = useSensors(
@@ -847,7 +896,7 @@ export default function App() {
       setDestLoading(false);
       setDiceRolling(false);
     }
-  }, [destLoading, destSuggestions]);
+  }, [destQuery, destLoading, deriveDayCount, normalizeDayAssignments]);
 
   // "FSD Auto-pilot" — user input → AI decides everything → final plan
   const handleAutopilot = useCallback(async () => {
@@ -901,8 +950,10 @@ export default function App() {
         for (const d of itinerary.days) {
           autoAssignments[d.day] = (d.spots ?? []).map((s) => s.id);
         }
-        setDayAssignments(autoAssignments);
-        setOptimizedDayPicks(autoAssignments);
+        const maxDay = Math.max(deriveDayCount(), ...(itinerary.days ?? []).map((d) => Number(d.day) || 0));
+        const normalized = normalizeDayAssignments(autoAssignments, maxDay);
+        setDayAssignments(normalized);
+        setOptimizedDayPicks(normalized);
         setStep(RESULT_STEP);
       }
     } finally {
@@ -1026,7 +1077,7 @@ export default function App() {
 
   const restartScenario = () => {
     setStep(0);
-    setDayAssignments({ 1: [], 2: [], 3: [] });
+    setDayAssignments(normalizeDayAssignments({}, deriveDayCount(), true));
     setSelectedLodgingId(activeLodgings[0]?.id ?? "");
     setOptimizedDayPicks(null);
     setHighlightIds([]);
@@ -1040,10 +1091,9 @@ export default function App() {
 
 
   // ── LLM send handler ────────────────────────────────────────────────────────
-  const activeSchedule = modifiedSchedule ?? pickedContents;
   const planProgress = useMemo(
-    () => calcProgress(activeSchedule, currentTimeStr),
-    [activeSchedule, currentTimeStr]
+    () => calcProgress(sortedActiveSchedule, currentTimeStr),
+    [sortedActiveSchedule, currentTimeStr]
   );
 
   // ── Schedule Directions (Google Maps Directions API) ──────────────────────
@@ -1058,12 +1108,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!gmapsReady || activeSchedule.length < 2) {
+    if (!gmapsReady || sortedActiveSchedule.length < 2) {
       setScheduleDirections([]);
       return;
     }
-    fetchScheduleDirections(activeSchedule, move).then(setScheduleDirections);
-  }, [gmapsReady, activeSchedule, move]);
+    fetchScheduleDirections(sortedActiveSchedule, move).then(setScheduleDirections);
+  }, [gmapsReady, sortedActiveSchedule, move]);
 
   const handleSendToLLM = useCallback(async () => {
     const text = chatInput.trim();
@@ -1079,7 +1129,7 @@ export default function App() {
     try {
       const result = await callLLM({
         userMessage: text,
-        plan: activeSchedule,
+        plan: sortedActiveSchedule,
         currentTime: currentTimeStr,
         location: locationName ?? (userLocation ? `${userLocation.lat.toFixed(4)},${userLocation.lng.toFixed(4)}` : null),
         weather,
@@ -1102,7 +1152,7 @@ export default function App() {
     } finally {
       setIsLLMLoading(false);
     }
-  }, [chatInput, isLLMLoading, activeSchedule, currentTimeStr, locationName, userLocation, weather, planProgress, chatHistory, scheduleDirections]);
+  }, [chatInput, isLLMLoading, sortedActiveSchedule, currentTimeStr, locationName, userLocation, weather, planProgress, chatHistory, scheduleDirections]);
 
   const progressActiveIndex = step >= RESULT_STEP ? STEP_LABELS.length - 1 : step;
 
@@ -1855,17 +1905,18 @@ export default function App() {
                       <Popup>{selectedLodging.name}</Popup>
                     </Marker>
 
-                    {pickedContents.map((p) => {
+                    {sortedActiveSchedule.map((p) => {
                       const num = spotNumberById.get(p.id) ?? 0;
+                      const day = p.assignedDay ?? p.day;
                       return (
                         <Marker
                           key={p.id}
                           position={p.latlng}
-                          icon={dayNumberIcon(p.assignedDay, num)}
+                          icon={dayNumberIcon(day, num)}
                           zIndexOffset={400}
                           eventHandlers={{
                             click: () => {
-                              setMapInfo(`DAY${p.assignedDay} · ${num}. ${p.name} — ${p.summary}`);
+                              setMapInfo(`DAY${day} · ${num}. ${p.name} — ${p.summary}`);
                               setHighlightIds([p.id]);
                             },
                           }}
@@ -2185,4 +2236,3 @@ function renderMovePopup(segment, moveProfile, dirInfo) {
     </>
   );
 }
-
