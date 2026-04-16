@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { RoundedBox, Html, OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
+import { softenContextLoss } from "../utils.js";
 
 function PlanCard({ plan, index, total, onSelect, isSelected, hoveredIdx, onHover }) {
   const ref = useRef();
@@ -98,7 +99,7 @@ export default function PlanCardRow({ plans, selectedId, onSelect }) {
     <div className="plan-card-row-3d">
       <p className="plan-card-row__title">저장된 일정</p>
       <div className="plan-card-row-3d__canvas">
-        <Canvas camera={{ position: [0, 0.3, 6], fov: 50 }}>
+        <Canvas camera={{ position: [0, 0.3, 6], fov: 50 }} onCreated={({ gl }) => softenContextLoss(gl)}>
           <Scene plans={plans} selectedId={selectedId} onSelect={onSelect} />
         </Canvas>
       </div>

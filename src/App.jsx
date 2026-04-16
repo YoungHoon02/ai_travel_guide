@@ -19,7 +19,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import { calcProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil } from "./utils.js";
+import { calcProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil, parseBooleanEnv } from "./utils.js";
 import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callLLM, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
 import {
   STEP_LABELS, RESULT_STEP, LAST_WIZARD_STEP, STAY_LOAD_TARGET, TRAVEL_TAGS,
@@ -63,6 +63,14 @@ L.Icon.Default.mergeOptions({
   };
   document.head.appendChild(s);
 })();
+
+const LLM_LOG_DEBUG = parseBooleanEnv(import.meta.env.VITE_LLM_LOG_DEBUG);
+const sanitizeLogEntry = (entry) => {
+  if (!entry) return entry;
+  if (LLM_LOG_DEBUG) return entry;
+  const { requestBody, responseData, ...rest } = entry;
+  return rest;
+};
 
 export default function App() {
   const [step, setStep] = useState(0);
@@ -252,6 +260,12 @@ export default function App() {
   const [modifiedSchedule, setModifiedSchedule] = useState(null);
   const [llmLogs, setLlmLogs] = useState([]);
   const [llmLogOpen, setLlmLogOpen] = useState(false);
+  const appendLog = useCallback((entry) => {
+    setLlmLogs((prev) => [...prev, sanitizeLogEntry(entry)]);
+  }, []);
+  const resolveLogAt = useCallback((idx, entry) => {
+    setLlmLogs((prev) => prev.map((item, i) => (i === idx ? { ...sanitizeLogEntry(entry), pending: false } : item)));
+  }, []);
   const [iphoneMode, setIphoneMode] = useState(false);
   const [iphoneCollapsed, setIphoneCollapsed] = useState(false);
   const [iphonePos, setIphonePos] = useState(null); // { x, y } top-left; null = centered
@@ -281,11 +295,11 @@ export default function App() {
   // hotel cards and activity cards are already loaded.
   useEffect(() => {
     if (step === 1 && country && region && !dynLodgings && !lodgingPromiseRef.current) {
-      const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+      const logCb = (log) => appendLog(log);
       lodgingPromiseRef.current = generateLodgings(country, region, logCb);
     }
     if (step === 1 && country && region && !dynItinerary && !itineraryPromiseRef.current) {
-      const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+      const logCb = (log) => appendLog(log);
       const moveProfile = activeMoves.find((m) => m.id === move);
       itineraryPromiseRef.current = generateItinerary(country, region, tags, days, moveProfile?.name ?? "혼합", logCb);
     }
@@ -296,7 +310,7 @@ export default function App() {
   useEffect(() => {
     if (step !== 2) return;
     (async () => {
-      const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+      const logCb = (log) => appendLog(log);
       if (lodgingPromiseRef.current && !dynLodgings) {
         const lodgings = await lodgingPromiseRef.current;
         lodgingPromiseRef.current = null;
@@ -694,7 +708,7 @@ export default function App() {
     if (!refinePrompt.trim() || isRefining) return;
     setIsRefining(true);
     try {
-      const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+      const logCb = (log) => appendLog(log);
       const moveProfile = activeMoves.find((m) => m.id === move);
       // Pass refine prompt as extra preference context to generateItinerary.
       // MVP: append to the transport name string so LLM sees it in the user message.
@@ -823,7 +837,7 @@ export default function App() {
     if (destLoading) return;
     setDiceRolling(true);
     setDestLoading(true);
-    const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+    const logCb = (log) => appendLog(log);
     const prevNames = destSuggestions.map((d) => d.trav_loc).join(", ");
     const prevThemes = prevLuckyThemes.current.join(", ");
     const excludeClause = (prevNames || prevThemes)
@@ -855,7 +869,7 @@ export default function App() {
     if (!text || destLoading) return;
     setDestLoading(true);
     setDataLoading(true);
-    const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+    const logCb = (log) => appendLog(log);
     try {
       // 1. Get destinations from user input
       const destResult = await callDestinationLLM(text, [], logCb, 4);
@@ -928,10 +942,10 @@ export default function App() {
     }
     const reqEntry = { provider: "…", model: "…", userMessage: text, timestamp: new Date().toISOString(), pending: true };
     let logIdx;
-    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, reqEntry]; });
+    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, sanitizeLogEntry(reqEntry)]; });
     let succeeded = false;
     try {
-      const result = await callDestinationLLM(llmMessage, destChatHistory, (log) => setLlmLogs((prev) => prev.map((entry, i) => i === logIdx ? { ...log, pending: false } : entry)), maxDestCount);
+      const result = await callDestinationLLM(llmMessage, destChatHistory, (log) => resolveLogAt(logIdx, log), maxDestCount);
       let dests = result.destinations ?? [];
       // Refine coordinates + fetch photos
       if (dests.length > 0) {
@@ -971,9 +985,9 @@ export default function App() {
     const msg = `다음 질문들과 중복되지 않는 완전히 새로운 follow-up 질문 2-3개만 생성해줘. 여행지 추천은 하지 마. 기존 질문: [${existingQs}]. 반드시 JSON으로 {"follow_up_questions":["질문1","질문2"]} 형태로만 응답해.`;
     const reqEntry = { provider: "…", model: "…", userMessage: "질문 갱신 요청", timestamp: new Date().toISOString(), pending: true };
     let logIdx;
-    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, reqEntry]; });
+    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, sanitizeLogEntry(reqEntry)]; });
     try {
-      const result = await callDestinationLLM(msg, destChatHistory, (log) => setLlmLogs((prev) => prev.map((entry, i) => i === logIdx ? { ...log, pending: false } : entry)));
+      const result = await callDestinationLLM(msg, destChatHistory, (log) => resolveLogAt(logIdx, log));
       if ((result.follow_up_questions ?? []).length > 0) {
         setDestFollowUps(result.follow_up_questions);
         setDestFlowHistory((prev) => [...prev, { role: "user", content: "질문 갱신 요청", _type: "refresh" }, { role: "assistant", content: JSON.stringify({ follow_up_questions: result.follow_up_questions }), _type: "refresh" }]);
@@ -992,9 +1006,9 @@ export default function App() {
     const moreMsg = `같은 테마에서 다른 여행지를 더 추천해줘. 다음 여행지는 이미 추천했으니 반드시 제외해줘: [${existingNames}]. 이 나라/지역들과 다른 새로운 곳을 추천해줘. 내가 처음 요청한 여행 스타일 범위 안에서 추천해줘.`;
     const reqEntry = { provider: "…", model: "…", userMessage: moreMsg, timestamp: new Date().toISOString(), pending: true };
     let logIdx;
-    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, reqEntry]; });
+    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, sanitizeLogEntry(reqEntry)]; });
     try {
-      const result = await callDestinationLLM(moreMsg, destChatHistory, (log) => setLlmLogs((prev) => prev.map((entry, i) => i === logIdx ? { ...log, pending: false } : entry)), maxDestCount);
+      const result = await callDestinationLLM(moreMsg, destChatHistory, (log) => resolveLogAt(logIdx, log), maxDestCount);
       let moreDests = result.destinations ?? [];
       if (moreDests.length > 0) {
         // Refine coordinates + fetch photos
@@ -1075,7 +1089,7 @@ export default function App() {
     // Push REQ log immediately
     const reqEntry = { provider: "…", model: "…", userMessage: text, timestamp: new Date().toISOString(), pending: true };
     let logIdx;
-    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, reqEntry]; });
+    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, sanitizeLogEntry(reqEntry)]; });
     try {
       const result = await callLLM({
         userMessage: text,
@@ -1086,7 +1100,7 @@ export default function App() {
         progress: planProgress,
         history: chatHistory,
         directions: scheduleDirections,
-        onLog: (log) => setLlmLogs((prev) => prev.map((entry, i) => i === logIdx ? { ...log, pending: false } : entry)),
+        onLog: (log) => resolveLogAt(logIdx, log),
       });
       setChatHistory((h) => [...h, { role: "assistant", content: result.text, modifiedSchedule: result.modifiedSchedule }]);
       if (result.modifiedSchedule && result.modifiedSchedule.length > 0) {
@@ -1144,7 +1158,7 @@ export default function App() {
                     {step === 0 && (
                       <>
                         {globeActive && (
-                          <GlobeDart active={globeActive} onResult={handleGlobeResult} onClose={() => { setGlobeActive(false); setDestLoading(false); }} onLog={(log) => setLlmLogs((prev) => [...prev, log])} />
+                          <GlobeDart active={globeActive} onResult={handleGlobeResult} onClose={() => { setGlobeActive(false); setDestLoading(false); }} onLog={(log) => appendLog(log)} />
                         )}
                         {!globeActive && destLoading && !destRefreshing && (
                           <div className="step0-a__status">
@@ -1500,7 +1514,7 @@ export default function App() {
                                   setDays(`${p.nights}박 ${p.days}일`);
                                 }
                               }}
-                              onLog={(log) => setLlmLogs((prev) => [...prev, log])}
+                              onLog={(log) => appendLog(log)}
                               context={{ country, region, tripDateMode }}
                             />
                           </div>
@@ -2013,7 +2027,7 @@ export default function App() {
           setCustomLodging(hotel);
           setSelectedLodgingId(hotel.id);
         }}
-        onLog={(log) => setLlmLogs((prev) => [...prev, log])}
+        onLog={(log) => appendLog(log)}
       />
     </div>
   );
@@ -2185,4 +2199,3 @@ function renderMovePopup(segment, moveProfile, dirInfo) {
     </>
   );
 }
-
