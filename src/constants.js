@@ -6,7 +6,18 @@ export const LAST_WIZARD_STEP = 2;
 export const STAY_LOAD_TARGET = 36;
 export const TRAVEL_TAGS = ["역사유적", "쇼핑", "미식", "야경", "자연", "카페투어", "전시체험", "로컬시장"];
 
-export const DAY_PIN_COLORS = { 1: "#2563eb", 2: "#059669", 3: "#7c3aed" };
+export const DAY_PIN_COLORS = {
+  1: "#2563eb",
+  2: "#059669",
+  3: "#7c3aed",
+  4: "#eab308",
+  5: "#ef4444",
+  6: "#14b8a6",
+  7: "#0ea5e9",
+  8: "#f97316",
+  9: "#8b5cf6",
+  10: "#6b7280",
+};
 
 export const PLACE_TYPES = [
   { id: "tourist_attraction", label: "관광지", icon: "🏛️" },

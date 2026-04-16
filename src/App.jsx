@@ -20,7 +20,7 @@ import { CSS } from "@dnd-kit/utilities";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import { calcProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil } from "./utils.js";
-import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callLLM, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
+import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callLLM, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto, sanitizeLogEntry, LLM_LOG_DEBUG } from "./api.js";
 import { addRevision, createPlan, getPlan, normalizeRevisionSnapshot } from "./store/plans.js";
 import {
   STEP_LABELS, RESULT_STEP, LAST_WIZARD_STEP, STAY_LOAD_TARGET, TRAVEL_TAGS,
@@ -220,6 +220,33 @@ export default function App() {
   // selectedSpotIds is derived (flat unique list) for backward compat.
   // Shape: { 1: [id, id], 2: [id], 3: [], ... }
   const [dayAssignments, setDayAssignments] = useState({ 1: [], 2: [], 3: [] });
+
+  const deriveDayCount = useCallback(() => {
+    const m = String(days ?? "").match(/(\d+)\s*일/);
+    const n = m ? parseInt(m[1], 10) : 3;
+    return Math.max(1, Math.min(10, n));
+  }, [days]);
+
+  const buildEmptyAssignments = useCallback((count) => {
+    const safeCount = Math.max(1, count ?? 0);
+    const obj = {};
+    for (let d = 1; d <= safeCount; d++) obj[d] = [];
+    return obj;
+  }, []);
+
+  const normalizeDayAssignments = useCallback((assignments, count = deriveDayCount(), clamp = false) => {
+    const entries = Object.entries(assignments ?? {});
+    const maxAssigned = entries.reduce((max, [day]) => Math.max(max, Number(day) || 0), 0);
+    const targetCount = clamp ? count : Math.max(count, maxAssigned);
+    const base = buildEmptyAssignments(targetCount);
+    for (const [day, ids] of entries) {
+      const dayNum = Number(day);
+      if (clamp && dayNum > targetCount) continue;
+      base[dayNum] = ids ?? [];
+    }
+    return base;
+  }, [buildEmptyAssignments, deriveDayCount]);
+
   const [refinePrompt, setRefinePrompt] = useState("");
   const [isRefining, setIsRefining] = useState(false);
   const [optimizedDayPicks, setOptimizedDayPicks] = useState(null);
@@ -294,6 +321,15 @@ export default function App() {
   const [modifiedSchedule, setModifiedSchedule] = useState(null);
   const [llmLogs, setLlmLogs] = useState([]);
   const [llmLogOpen, setLlmLogOpen] = useState(false);
+  const redactLogEntry = useCallback((log) => sanitizeLogEntry(log), []);
+  const appendLog = useCallback((log) => {
+    if (!log) return;
+    setLlmLogs((prev) => [...prev, redactLogEntry(log)]);
+  }, [redactLogEntry]);
+  const replaceLog = useCallback((idx, log) => {
+    setLlmLogs((prev) => prev.map((entry, i) => (i === idx ? redactLogEntry(log) : entry)));
+  }, [redactLogEntry]);
+  const llmLogDebugEnabled = LLM_LOG_DEBUG;
   const [iphoneMode, setIphoneMode] = useState(false);
   const [iphoneCollapsed, setIphoneCollapsed] = useState(false);
   const [iphonePos, setIphonePos] = useState(null); // { x, y } top-left; null = centered
@@ -323,11 +359,11 @@ export default function App() {
   // hotel cards and activity cards are already loaded.
   useEffect(() => {
     if (step === 1 && country && region && !dynLodgings && !lodgingPromiseRef.current) {
-      const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+      const logCb = appendLog;
       lodgingPromiseRef.current = generateLodgings(country, region, logCb);
     }
     if (step === 1 && country && region && !dynItinerary && !itineraryPromiseRef.current) {
-      const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+      const logCb = appendLog;
       const moveProfile = activeMoves.find((m) => m.id === move);
       itineraryPromiseRef.current = generateItinerary(country, region, tags, days, moveProfile?.name ?? "혼합", logCb);
     }
@@ -338,7 +374,7 @@ export default function App() {
   useEffect(() => {
     if (step !== 2) return;
     (async () => {
-      const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+      const logCb = appendLog;
       if (lodgingPromiseRef.current && !dynLodgings) {
         const lodgings = await lodgingPromiseRef.current;
         lodgingPromiseRef.current = null;
@@ -370,7 +406,8 @@ export default function App() {
           setDynContents(refined);
           setRecommended(refined);
           setDynItinerary(itinerary);
-          setDayAssignments(newAssignments);
+          const maxDay = Math.max(deriveDayCount(), ...(itinerary.days ?? []).map((d) => Number(d.day) || 0));
+          setDayAssignments(normalizeDayAssignments(newAssignments, maxDay));
         }
       }
     })();
@@ -448,11 +485,20 @@ export default function App() {
   }, [dayAssignments, selectedSpotIds.length]);
 
   // ── Step 2 Edit View derivations ────────────────────────────────────────
-  const dayCount = useMemo(() => {
-    const m = String(days ?? "").match(/(\d+)\s*일/);
-    const n = m ? parseInt(m[1]) : 3;
-    return Math.max(1, Math.min(10, n));
-  }, [days]);
+  const dayCount = useMemo(() => deriveDayCount(), [deriveDayCount]);
+
+  useEffect(() => {
+    setDayAssignments((prev) => {
+      const next = normalizeDayAssignments(prev, dayCount, true);
+      const sameKeys = Object.keys(prev).length === Object.keys(next).length
+        && Object.keys(next).every((key) => {
+          const prevIds = prev[key] ?? [];
+          const nextIds = next[key] ?? [];
+          return prevIds.length === nextIds.length && prevIds.every((id, idx) => id === nextIds[idx]);
+        });
+      return sameKeys ? prev : next;
+    });
+  }, [dayCount, normalizeDayAssignments]);
 
   // Clamp activeDay when dayCount changes
   useEffect(() => {
@@ -615,55 +661,66 @@ export default function App() {
 
   const pickedContents = useMemo(() => {
     if (!optimizedDayPicks) return [];
+    const days = Object.keys(optimizedDayPicks)
+      .map((d) => Number(d))
+      .filter((d) => !Number.isNaN(d))
+      .sort((a, b) => a - b);
     const out = [];
-    [1, 2, 3].forEach((d) => {
-      optimizedDayPicks[d].forEach((id) => {
+    days.forEach((d) => {
+      (optimizedDayPicks[d] ?? []).forEach((id, idx) => {
         const c = activeContents.find((item) => item.id === id);
-        if (c) out.push({ ...c, assignedDay: d });
+        if (c) out.push({ ...c, assignedDay: d, seq: idx + 1 });
       });
     });
     return out;
-  }, [optimizedDayPicks]);
+  }, [optimizedDayPicks, activeContents]);
+
+  const activeSchedule = useMemo(() => modifiedSchedule ?? pickedContents, [modifiedSchedule, pickedContents]);
+
+  const sortedActiveSchedule = useMemo(() => {
+    const list = [...(activeSchedule ?? [])];
+    list.sort((a, b) => {
+      const dayA = Number(a.assignedDay ?? a.day ?? 0);
+      const dayB = Number(b.assignedDay ?? b.day ?? 0);
+      if (dayA !== dayB) return dayA - dayB;
+      const timeA = a.time ?? "";
+      const timeB = b.time ?? "";
+      if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB);
+      const seqA = a.seq ?? 0;
+      const seqB = b.seq ?? 0;
+      if (seqA !== seqB) return seqA - seqB;
+      return (a.name ?? "").localeCompare(b.name ?? "");
+    });
+    return list;
+  }, [activeSchedule]);
+
+  const scheduleDayRange = useMemo(() => {
+    const assignedDays = sortedActiveSchedule.map((item) => Number(item.assignedDay ?? item.day ?? 0)).filter((d) => d > 0);
+    const maxAssigned = assignedDays.length ? Math.max(...assignedDays) : 0;
+    const maxDay = Math.max(dayCount, maxAssigned);
+    return Array.from({ length: Math.max(1, maxDay) }, (_, i) => i + 1);
+  }, [sortedActiveSchedule, dayCount]);
+
+  const scheduleByDay = useMemo(() => {
+    return scheduleDayRange
+      .map((d) => ({
+        day: d,
+        items: sortedActiveSchedule.filter((item) => (item.assignedDay ?? item.day) === d),
+      }))
+      .filter((g) => g.items.length > 0);
+  }, [scheduleDayRange, sortedActiveSchedule]);
 
   const spotNumberById = useMemo(() => {
-    if (!optimizedDayPicks) return new Map();
     const map = new Map();
-    let n = 0;
-    [1, 2, 3].forEach((d) => {
-      optimizedDayPicks[d].forEach((id) => {
-        n += 1;
-        map.set(id, n);
+    scheduleByDay.forEach((group) => {
+      group.items.forEach((item, idx) => {
+        map.set(item.id, idx + 1);
       });
     });
     return map;
-  }, [optimizedDayPicks]);
+  }, [scheduleByDay]);
 
-  const segmentDefs = useMemo(() => buildMoveSegmentDefs(pickedContents, move), [pickedContents, move]);
-
-  const scheduleByDay = useMemo(() => {
-    // When modifiedSchedule is active, use it (it's a flat array with assignedDay)
-    if (modifiedSchedule) {
-      const days = [1, 2, 3];
-      return days
-        .map((d) => ({
-          day: d,
-          items: modifiedSchedule
-            .filter((item) => item.assignedDay === d)
-            .sort((a, b) => a.time.localeCompare(b.time)),
-        }))
-        .filter((g) => g.items.length > 0);
-    }
-    if (!optimizedDayPicks) return [];
-    return [1, 2, 3]
-      .map((d) => ({
-        day: d,
-        items: optimizedDayPicks[d].map((id) => {
-          const c = activeContents.find((item) => item.id === id);
-          return c ? { ...c, assignedDay: d } : null;
-        }).filter(Boolean),
-      }))
-      .filter((g) => g.items.length > 0);
-  }, [optimizedDayPicks, modifiedSchedule]);
+  const segmentDefs = useMemo(() => buildMoveSegmentDefs(sortedActiveSchedule, move), [sortedActiveSchedule, move]);
 
   const groupedPickContents = useMemo(() => {
     const base = recommended.length ? recommended : activeContents;
@@ -755,7 +812,7 @@ export default function App() {
     if (!refinePrompt.trim() || isRefining) return;
     setIsRefining(true);
     try {
-      const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+      const logCb = appendLog;
       const moveProfile = activeMoves.find((m) => m.id === move);
       // Pass refine prompt as extra preference context to generateItinerary.
       // MVP: append to the transport name string so LLM sees it in the user message.
@@ -777,7 +834,8 @@ export default function App() {
         setDynContents(refined);
         setRecommended(refined);
         setDynItinerary(itinerary);
-        setDayAssignments(newAssignments);
+        const maxDay = Math.max(deriveDayCount(), ...(itinerary.days ?? []).map((d) => Number(d.day) || 0));
+        setDayAssignments(normalizeDayAssignments(newAssignments, maxDay));
         setRefinePrompt("");
       }
     } catch (err) {
@@ -785,7 +843,7 @@ export default function App() {
     } finally {
       setIsRefining(false);
     }
-  }, [refinePrompt, isRefining, country, region, days, move, activeMoves, tags]);
+  }, [refinePrompt, isRefining, country, region, days, move, activeMoves, tags, appendLog, deriveDayCount, normalizeDayAssignments]);
 
   // ── DnD setup ─────────────────────────────────────────────────────────
   const dndSensors = useSensors(
@@ -884,7 +942,7 @@ export default function App() {
     if (destLoading) return;
     setDiceRolling(true);
     setDestLoading(true);
-    const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+    const logCb = appendLog;
     const prevNames = destSuggestions.map((d) => d.trav_loc).join(", ");
     const prevThemes = prevLuckyThemes.current.join(", ");
     const excludeClause = (prevNames || prevThemes)
@@ -908,7 +966,7 @@ export default function App() {
       setDestLoading(false);
       setDiceRolling(false);
     }
-  }, [destLoading, destSuggestions]);
+  }, [destLoading, destSuggestions, appendLog]);
 
   // "FSD Auto-pilot" — user input → AI decides everything → final plan
   const handleAutopilot = useCallback(async () => {
@@ -916,7 +974,7 @@ export default function App() {
     if (!text || destLoading) return;
     setDestLoading(true);
     setDataLoading(true);
-    const logCb = (log) => setLlmLogs((prev) => [...prev, log]);
+    const logCb = appendLog;
     try {
       // 1. Get destinations from user input
       const destResult = await callDestinationLLM(text, [], logCb, 4);
@@ -962,8 +1020,10 @@ export default function App() {
         for (const d of itinerary.days) {
           autoAssignments[d.day] = (d.spots ?? []).map((s) => s.id);
         }
-        setDayAssignments(autoAssignments);
-        setOptimizedDayPicks(autoAssignments);
+        const maxDay = Math.max(deriveDayCount(), ...(itinerary.days ?? []).map((d) => Number(d.day) || 0));
+        const normalized = normalizeDayAssignments(autoAssignments, maxDay);
+        setDayAssignments(normalized);
+        setOptimizedDayPicks(normalized);
         setStep(RESULT_STEP);
       }
     } finally {
@@ -989,10 +1049,10 @@ export default function App() {
     }
     const reqEntry = { provider: "…", model: "…", userMessage: text, timestamp: new Date().toISOString(), pending: true };
     let logIdx;
-    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, reqEntry]; });
+    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, redactLogEntry(reqEntry)]; });
     let succeeded = false;
     try {
-      const result = await callDestinationLLM(llmMessage, destChatHistory, (log) => setLlmLogs((prev) => prev.map((entry, i) => i === logIdx ? { ...log, pending: false } : entry)), maxDestCount);
+      const result = await callDestinationLLM(llmMessage, destChatHistory, (log) => replaceLog(logIdx, { ...log, pending: false }), maxDestCount);
       let dests = result.destinations ?? [];
       // Refine coordinates + fetch photos
       if (dests.length > 0) {
@@ -1032,9 +1092,9 @@ export default function App() {
     const msg = `다음 질문들과 중복되지 않는 완전히 새로운 follow-up 질문 2-3개만 생성해줘. 여행지 추천은 하지 마. 기존 질문: [${existingQs}]. 반드시 JSON으로 {"follow_up_questions":["질문1","질문2"]} 형태로만 응답해.`;
     const reqEntry = { provider: "…", model: "…", userMessage: "질문 갱신 요청", timestamp: new Date().toISOString(), pending: true };
     let logIdx;
-    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, reqEntry]; });
+    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, redactLogEntry(reqEntry)]; });
     try {
-      const result = await callDestinationLLM(msg, destChatHistory, (log) => setLlmLogs((prev) => prev.map((entry, i) => i === logIdx ? { ...log, pending: false } : entry)));
+      const result = await callDestinationLLM(msg, destChatHistory, (log) => replaceLog(logIdx, { ...log, pending: false }));
       if ((result.follow_up_questions ?? []).length > 0) {
         setDestFollowUps(result.follow_up_questions);
         setDestFlowHistory((prev) => [...prev, { role: "user", content: "질문 갱신 요청", _type: "refresh" }, { role: "assistant", content: JSON.stringify({ follow_up_questions: result.follow_up_questions }), _type: "refresh" }]);
@@ -1043,7 +1103,7 @@ export default function App() {
     } finally {
       setDestRefreshing(false);
     }
-  }, [destRefreshing, destQueriedText, destFollowUps, destChatHistory]);
+  }, [destRefreshing, destQueriedText, destFollowUps, destChatHistory, redactLogEntry, replaceLog]);
 
   const [destMoreLoading, setDestMoreLoading] = useState(false);
   const handleDestMore = useCallback(async () => {
@@ -1053,9 +1113,9 @@ export default function App() {
     const moreMsg = `같은 테마에서 다른 여행지를 더 추천해줘. 다음 여행지는 이미 추천했으니 반드시 제외해줘: [${existingNames}]. 이 나라/지역들과 다른 새로운 곳을 추천해줘. 내가 처음 요청한 여행 스타일 범위 안에서 추천해줘.`;
     const reqEntry = { provider: "…", model: "…", userMessage: moreMsg, timestamp: new Date().toISOString(), pending: true };
     let logIdx;
-    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, reqEntry]; });
+    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, redactLogEntry(reqEntry)]; });
     try {
-      const result = await callDestinationLLM(moreMsg, destChatHistory, (log) => setLlmLogs((prev) => prev.map((entry, i) => i === logIdx ? { ...log, pending: false } : entry)), maxDestCount);
+      const result = await callDestinationLLM(moreMsg, destChatHistory, (log) => replaceLog(logIdx, { ...log, pending: false }), maxDestCount);
       let moreDests = result.destinations ?? [];
       if (moreDests.length > 0) {
         // Refine coordinates + fetch photos
@@ -1083,11 +1143,11 @@ export default function App() {
     } finally {
       setDestMoreLoading(false);
     }
-  }, [destLoading, destQueriedText, destChatHistory]);
+  }, [destLoading, destQueriedText, destChatHistory, maxDestCount, destSuggestions, redactLogEntry, replaceLog]);
 
   const restartScenario = () => {
     setStep(0);
-    setDayAssignments({ 1: [], 2: [], 3: [] });
+    setDayAssignments(normalizeDayAssignments({}, deriveDayCount(), true));
     setSelectedLodgingId(activeLodgings[0]?.id ?? "");
     setOptimizedDayPicks(null);
     setHighlightIds([]);
@@ -1117,10 +1177,9 @@ export default function App() {
 
 
   // ── LLM send handler ────────────────────────────────────────────────────────
-  const activeSchedule = modifiedSchedule ?? pickedContents;
   const planProgress = useMemo(
-    () => calcProgress(activeSchedule, currentTimeStr),
-    [activeSchedule, currentTimeStr]
+    () => calcProgress(sortedActiveSchedule, currentTimeStr),
+    [sortedActiveSchedule, currentTimeStr]
   );
 
   // ── Schedule Directions (Google Maps Directions API) ──────────────────────
@@ -1135,12 +1194,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!gmapsReady || activeSchedule.length < 2) {
+    if (!gmapsReady || sortedActiveSchedule.length < 2) {
       setScheduleDirections([]);
       return;
     }
-    fetchScheduleDirections(activeSchedule, move).then(setScheduleDirections);
-  }, [gmapsReady, activeSchedule, move]);
+    fetchScheduleDirections(sortedActiveSchedule, move).then(setScheduleDirections);
+  }, [gmapsReady, sortedActiveSchedule, move]);
 
   const handleSendToLLM = useCallback(async () => {
     const text = chatInput.trim();
@@ -1152,18 +1211,18 @@ export default function App() {
     // Push REQ log immediately
     const reqEntry = { provider: "…", model: "…", userMessage: text, timestamp: new Date().toISOString(), pending: true };
     let logIdx;
-    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, reqEntry]; });
+    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, redactLogEntry(reqEntry)]; });
     try {
       const result = await callLLM({
         userMessage: text,
-        plan: activeSchedule,
+        plan: sortedActiveSchedule,
         currentTime: currentTimeStr,
         location: locationName ?? (userLocation ? `${userLocation.lat.toFixed(4)},${userLocation.lng.toFixed(4)}` : null),
         weather,
         progress: planProgress,
         history: chatHistory,
         directions: scheduleDirections,
-        onLog: (log) => setLlmLogs((prev) => prev.map((entry, i) => i === logIdx ? { ...log, pending: false } : entry)),
+        onLog: (log) => replaceLog(logIdx, { ...log, pending: false }),
       });
       setChatHistory((h) => [...h, { role: "assistant", content: result.text, modifiedSchedule: result.modifiedSchedule }]);
       if (result.modifiedSchedule && result.modifiedSchedule.length > 0) {
@@ -1180,7 +1239,7 @@ export default function App() {
     } finally {
       setIsLLMLoading(false);
     }
-  }, [chatInput, isLLMLoading, activeSchedule, currentTimeStr, locationName, userLocation, weather, planProgress, chatHistory, scheduleDirections, activeContents, persistRevision]);
+  }, [chatInput, isLLMLoading, activeSchedule, sortedActiveSchedule, currentTimeStr, locationName, userLocation, weather, planProgress, chatHistory, scheduleDirections, activeContents, persistRevision, replaceLog, redactLogEntry]);
 
   const progressActiveIndex = step >= RESULT_STEP ? STEP_LABELS.length - 1 : step;
 
@@ -1222,7 +1281,7 @@ export default function App() {
                     {step === 0 && (
                       <>
                         {globeActive && (
-                          <GlobeDart active={globeActive} onResult={handleGlobeResult} onClose={() => { setGlobeActive(false); setDestLoading(false); }} onLog={(log) => setLlmLogs((prev) => [...prev, log])} />
+                          <GlobeDart active={globeActive} onResult={handleGlobeResult} onClose={() => { setGlobeActive(false); setDestLoading(false); }} onLog={appendLog} />
                         )}
                         {!globeActive && destLoading && !destRefreshing && (
                           <div className="step0-a__status">
@@ -1578,7 +1637,7 @@ export default function App() {
                                   setDays(`${p.nights}박 ${p.days}일`);
                                 }
                               }}
-                              onLog={(log) => setLlmLogs((prev) => [...prev, log])}
+                              onLog={appendLog}
                               context={{ country, region, tripDateMode }}
                             />
                           </div>
@@ -1933,17 +1992,18 @@ export default function App() {
                       <Popup>{selectedLodging.name}</Popup>
                     </Marker>
 
-                    {pickedContents.map((p) => {
+                    {sortedActiveSchedule.map((p) => {
                       const num = spotNumberById.get(p.id) ?? 0;
+                      const day = p.assignedDay ?? p.day;
                       return (
                         <Marker
                           key={p.id}
                           position={p.latlng}
-                          icon={dayNumberIcon(p.assignedDay, num)}
+                          icon={dayNumberIcon(day, num)}
                           zIndexOffset={400}
                           eventHandlers={{
                             click: () => {
-                              setMapInfo(`DAY${p.assignedDay} · ${num}. ${p.name} — ${p.summary}`);
+                              setMapInfo(`DAY${day} · ${num}. ${p.name} — ${p.summary}`);
                               setHighlightIds([p.id]);
                             },
                           }}
@@ -2080,6 +2140,7 @@ export default function App() {
           destChatHistory={destFlowHistory}
           destSuggestions={destSuggestions}
           destFollowUps={destFollowUps}
+          debugEnabled={llmLogDebugEnabled}
         />
       )}
       <HotelBrowseModal
@@ -2091,7 +2152,7 @@ export default function App() {
           setCustomLodging(hotel);
           setSelectedLodgingId(hotel.id);
         }}
-        onLog={(log) => setLlmLogs((prev) => [...prev, log])}
+        onLog={appendLog}
       />
     </div>
   );

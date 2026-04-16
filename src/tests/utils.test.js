@@ -17,6 +17,7 @@ import {
   sumVisitScores,
   assignOptimalDays,
   simulateLLMResponse,
+  parseDayCount,
 } from "../utils.js";
 
 // ─── timeToMinutes ────────────────────────────────────────────────────────────
@@ -78,6 +79,35 @@ describe("minutesToTime", () => {
     times.forEach((t) => {
       expect(minutesToTime(timeToMinutes(t))).toBe(t);
     });
+  });
+});
+
+// ─── parseDayCount ───────────────────────────────────────────────────────────
+
+describe("parseDayCount", () => {
+  it("extracts nights and days from 박/일 format", () => {
+    expect(parseDayCount("2박 3일")).toEqual({ days: 3, nights: 2 });
+    expect(parseDayCount("1박2일")).toEqual({ days: 2, nights: 1 });
+  });
+
+  it("derives nights when only days are present", () => {
+    expect(parseDayCount("3일")).toEqual({ days: 3, nights: 2 });
+  });
+
+  it("adds a day when only nights are present", () => {
+    expect(parseDayCount("2박")).toEqual({ days: 3, nights: 2 });
+  });
+
+  it("corrects nights greater than days by extending days", () => {
+    expect(parseDayCount("5박3일")).toEqual({ days: 6, nights: 5 });
+  });
+
+  it("falls back to defaults when unparseable", () => {
+    expect(parseDayCount("무계획", { fallbackDays: 4 })).toEqual({ days: 4, nights: 3 });
+  });
+
+  it("enforces minimum day count for zero/negative input", () => {
+    expect(parseDayCount("0일", { minDays: 2 })).toEqual({ days: 2, nights: 1 });
   });
 });
 

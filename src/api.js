@@ -1,4 +1,4 @@
-import { escapeHtml, simulateLLMResponse } from "./utils.js";
+import { escapeHtml, simulateLLMResponse, parseDayCount } from "./utils.js";
 import {
   DEST_SYSTEM_PROMPT,
   TRANSPORT_PROMPT,
@@ -223,6 +223,73 @@ const LLM_SETTINGS = {
   ollama: { provider: "ollama", label: "Ollama (local)", key: "ollama", model: (import.meta.env.VITE_OLLAMA_MODEL || "bjoernb/gemma4-31b-think").trim(), keyEnv: "VITE_OLLAMA_MODEL" },
 };
 export const ACTIVE_LLM = LLM_SETTINGS[LLM_PROVIDER] ?? LLM_SETTINGS.openai;
+export const LLM_LOG_DEBUG = String(import.meta.env.VITE_LLM_LOG_DEBUG || "").toLowerCase() === "true";
+
+const TOKEN_REGEX = /\b(?:sk|rk|pk)_[A-Za-z0-9]{12,}\b/g;
+const GOOGLE_KEY_REGEX = /\bAIza[0-9A-Za-z\-_]{20,}\b/g;
+const JWT_REGEX = /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}\b/g;
+const LONG_SECRET_REGEX = /\b[A-Za-z0-9]{40,}\b/g;
+const SENSITIVE_KV_REGEX = /(["']?(?:api[_-]?key|authorization|token|secret|password)["']?\s*[:=]\s*)(["']?)([^"'\s]{6,})(\2)/gi;
+const COORD_PAIR_REGEX = /-?\d{1,3}\.\d{4,}\s*,\s*-?\d{1,3}\.\d{4,}/g;
+const COORD_SINGLE_REGEX = /\b-?\d{1,3}\.\d{5,}\b/g;
+const EMAIL_REGEX = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+const PHONE_REGEX = /\b(?:\+?\d[\d\-\s]{8,}\d)\b/g;
+const COORD_KEY_REGEX = /^(lat|lng|lon|long|latitude|longitude|latlng|coordinates?)$/i;
+
+function looksLikeCoordNumber(val) {
+  return typeof val === "number" && Number.isFinite(val) && Math.abs(val) <= 180 && String(val).includes(".");
+}
+
+function redactString(str) {
+  let out = String(str);
+  out = out.replace(COORD_PAIR_REGEX, "[coord]");
+  out = out.replace(COORD_SINGLE_REGEX, "[coord]");
+  out = out.replace(SENSITIVE_KV_REGEX, "$1$2[redacted]$2");
+  out = out.replace(TOKEN_REGEX, "[secret]");
+  out = out.replace(GOOGLE_KEY_REGEX, "[secret]");
+  out = out.replace(JWT_REGEX, "[secret]");
+  out = out.replace(LONG_SECRET_REGEX, "[secret]");
+  out = out.replace(EMAIL_REGEX, "[email]");
+  out = out.replace(PHONE_REGEX, "[phone]");
+  return out;
+}
+
+function redactValue(value, keyHint = "") {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string") return redactString(value);
+  if (typeof value === "number") {
+    if (COORD_KEY_REGEX.test(keyHint) && looksLikeCoordNumber(value)) return "[coord]";
+    return value;
+  }
+  if (typeof value === "boolean") return value;
+  if (Array.isArray(value)) {
+    const isCoordPair = value.length === 2 && looksLikeCoordNumber(value[0]) && looksLikeCoordNumber(value[1]);
+    if (isCoordPair) return ["[coord]", "[coord]"];
+    return value.map((v) => redactValue(v));
+  }
+  if (typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (k === "requestBody" || k === "responseData") continue;
+      out[k] = redactValue(v, k);
+    }
+    return out;
+  }
+  return value;
+}
+
+export function sanitizeLogEntry(log, opts = {}) {
+  const allowRaw = opts.allowRaw ?? LLM_LOG_DEBUG;
+  if (!log || typeof log !== "object") return log;
+  if (allowRaw) return { ...log, redacted: false };
+  const { requestBody: _req, responseData: _res, ...rest } = log;
+  return { ...redactValue(rest), redacted: true };
+}
+
+function emitLog(onLog, payload) {
+  if (!onLog || !payload) return;
+  onLog(sanitizeLogEntry(payload));
+}
 
 /**
  * Per-function LLM routing.
@@ -263,13 +330,75 @@ function sanitizeGeminiResponse(data) {
   return { ...data, candidates: data.candidates.map((c) => ({ ...c, content: c.content ? { ...c.content, parts: (c.content.parts ?? []).map(({ thoughtSignature, ...rest }) => rest) } : c.content })) };
 }
 
+function normalizeFollowUpQuestions(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((q) => (typeof q === "string" ? q.trim() : ""))
+    .filter(Boolean)
+    .slice(0, 2);
+}
+
+function coerceModifiedSchedule(value) {
+  if (value === null) return null;
+  if (!Array.isArray(value)) return null;
+  return value.filter((item) => item && typeof item === "object");
+}
+
+function parseRealtimeLLMResponse(raw) {
+  const safeRaw = typeof raw === "string" ? raw : "";
+  const candidates = [];
+  for (const match of safeRaw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+    if (match[1]) candidates.push(match[1]);
+  }
+  const braceMatch = safeRaw.match(/\{[\s\S]*\}/);
+  if (braceMatch) candidates.push(braceMatch[0]);
+  candidates.push(safeRaw.trim());
+
+  let parsed = null;
+  let usedSnippet = "";
+  for (const snippet of candidates) {
+    const trimmed = (snippet || "").trim();
+    if (!trimmed) continue;
+    try { parsed = JSON.parse(trimmed); usedSnippet = snippet; break; } catch {}
+    try { parsed = JSON.parse(tryRepairJSON(trimmed)); usedSnippet = snippet; break; } catch {}
+  }
+
+  const baseText = safeRaw.replace(/```[\s\S]*?```/g, "").trim();
+  const cleanedText = usedSnippet ? baseText.replace(usedSnippet, "").trim() || baseText : baseText;
+  const normalized = { schemaVersion: null, responseType: null, followUpQuestions: [], modifiedSchedule: null, text: cleanedText || safeRaw.trim() };
+  if (!parsed) return normalized;
+
+  if (Array.isArray(parsed)) {
+    normalized.modifiedSchedule = coerceModifiedSchedule(parsed);
+    return normalized;
+  }
+  if (typeof parsed !== "object" || parsed === null) return normalized;
+
+  const schemaRaw = typeof parsed.schemaVersion === "string"
+    ? parsed.schemaVersion.trim()
+    : typeof parsed.schemaVersion === "number"
+      ? parsed.schemaVersion.toString()
+      : null;
+  normalized.schemaVersion = schemaRaw && schemaRaw.length > 0 ? schemaRaw : null;
+
+  const rtRaw = typeof parsed.responseType === "string" ? parsed.responseType.trim().toLowerCase() : null;
+  if (rtRaw && ["modified", "no_change", "clarification"].includes(rtRaw)) normalized.responseType = rtRaw;
+  normalized.followUpQuestions = normalizeFollowUpQuestions(parsed.followUpQuestions);
+
+  if ("modifiedSchedule" in parsed) {
+    normalized.modifiedSchedule = parsed.modifiedSchedule === null ? null : coerceModifiedSchedule(parsed.modifiedSchedule);
+  } else if (Array.isArray(parsed.schedule)) {
+    normalized.modifiedSchedule = coerceModifiedSchedule(parsed.schedule);
+  }
+  return normalized;
+}
 
 export async function callLLM({ userMessage, plan, currentTime, location, weather, progress, history, directions, onLog }) {
   if (!ACTIVE_LLM.key) {
     const reqLog = { provider: "simulation", model: "rule-based", userMessage, timestamp: new Date().toISOString() };
     await new Promise((r) => setTimeout(r, 700));
-    const result = simulateLLMResponse(userMessage, plan, currentTime);
-    if (onLog) onLog({ ...reqLog, responseText: result.text, modifiedSchedule: result.modifiedSchedule });
+    const result = { ...simulateLLMResponse(userMessage, plan, currentTime), schemaVersion: null, responseType: null, followUpQuestions: [] };
+    emitLog(onLog, { ...reqLog, responseText: result.text, modifiedSchedule: result.modifiedSchedule, schemaVersion: result.schemaVersion, responseType: result.responseType, followUpQuestions: result.followUpQuestions });
     return result;
   }
   const systemContent = buildRealtimeSystemPrompt({ plan, currentTime, location, weather, progress, directions });
@@ -303,16 +432,44 @@ export async function callLLM({ userMessage, plan, currentTime, location, weathe
       resData = await res.json();
       raw = (resData.content ?? []).map((item) => item.text).filter(Boolean).join("\n");
     }
-    const jsonMatch = raw.match(/```json\s*([\s\S]*?)```/);
-    let modifiedSchedule = null;
-    if (jsonMatch) { try { modifiedSchedule = JSON.parse(jsonMatch[1]).modifiedSchedule ?? null; } catch (e) { console.error("[LLM] JSON parse error:", e); } }
-    const result = { text: raw.replace(/```json[\s\S]*?```/g, "").trim(), modifiedSchedule };
+    const parsed = parseRealtimeLLMResponse(raw);
+    const result = {
+      text: parsed.text,
+      modifiedSchedule: parsed.modifiedSchedule,
+      schemaVersion: parsed.schemaVersion,
+      responseType: parsed.responseType,
+      followUpQuestions: parsed.followUpQuestions,
+    };
     const logResData = ACTIVE_LLM.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
-    if (onLog) onLog({ provider: ACTIVE_LLM.provider, model: ACTIVE_LLM.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: result.text, modifiedSchedule, timestamp: new Date().toISOString() });
+    emitLog(onLog, {
+      provider: ACTIVE_LLM.provider,
+      model: ACTIVE_LLM.model,
+      userMessage,
+      requestBody: reqBody,
+      responseData: logResData,
+      responseText: result.text,
+      modifiedSchedule: result.modifiedSchedule,
+      schemaVersion: result.schemaVersion,
+      responseType: result.responseType,
+      followUpQuestions: result.followUpQuestions,
+      timestamp: new Date().toISOString(),
+    });
     return result;
   } catch {
-    const fallback = simulateLLMResponse(userMessage, plan, currentTime);
-    if (onLog) onLog({ provider: ACTIVE_LLM.provider + " (fallback)", model: "rule-based", userMessage, requestBody: reqBody, responseText: fallback.text, modifiedSchedule: fallback.modifiedSchedule, error: true, timestamp: new Date().toISOString() });
+    const fallback = { ...simulateLLMResponse(userMessage, plan, currentTime), schemaVersion: null, responseType: null, followUpQuestions: [] };
+    emitLog(onLog, {
+      provider: ACTIVE_LLM.provider + " (fallback)",
+      model: "rule-based",
+      userMessage,
+      requestBody: reqBody,
+      responseText: fallback.text,
+      modifiedSchedule: fallback.modifiedSchedule,
+      schemaVersion: fallback.schemaVersion,
+      responseType: fallback.responseType,
+      followUpQuestions: fallback.followUpQuestions,
+      error: true,
+      timestamp: new Date().toISOString(),
+    });
     return fallback;
   }
 }
@@ -378,7 +535,7 @@ export async function callDestinationLLM(userMessage, chatHistory, onLog, count 
       ],
       follow_up_questions: ["여행 기간은 며칠 정도 생각하고 계신가요?", "혼자 여행인가요, 동행이 있나요?", "예산 범위가 어느 정도인가요?"],
     };
-    if (onLog) onLog({ provider: "simulation", model: "rule-based", userMessage, requestBody: { messages }, responseText: JSON.stringify(fallback), timestamp });
+    emitLog(onLog, { provider: "simulation", model: "rule-based", userMessage, requestBody: { messages }, responseText: JSON.stringify(fallback), timestamp });
     return fallback;
   }
   let reqBody = null; let resData = null; let raw = "";
@@ -432,13 +589,13 @@ export async function callDestinationLLM(userMessage, chatHistory, onLog, count 
     let parsed;
     try { parsed = JSON.parse(cleaned); } catch (_) { parsed = JSON.parse(tryRepairJSON(cleaned)); }
     const logResData = ACTIVE_LLM.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
-    if (onLog) onLog({ provider: ACTIVE_LLM.provider, model: ACTIVE_LLM.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: raw, timestamp });
+    emitLog(onLog, { provider: ACTIVE_LLM.provider, model: ACTIVE_LLM.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: raw, timestamp });
     if (Array.isArray(parsed)) return { destinations: parsed, follow_up_questions: [], raw };
     return { destinations: parsed.destinations ?? [], follow_up_questions: parsed.follow_up_questions ?? [], raw };
   } catch (e) {
     console.error("[Destination LLM] error:", e);
     const logResData = ACTIVE_LLM.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
-    if (onLog) onLog({ provider: ACTIVE_LLM.provider + " (error)", model: ACTIVE_LLM.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: raw || e.message, error: true, timestamp });
+    emitLog(onLog, { provider: ACTIVE_LLM.provider + " (error)", model: ACTIVE_LLM.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: raw || e.message, error: true, timestamp });
     return { destinations: [], follow_up_questions: [] };
   }
 }
@@ -456,7 +613,7 @@ export async function callGenericLLM(systemPrompt, userMessage, onLog, fnName) {
   const cfg = resolveFnConfig(fnName);
   const timestamp = new Date().toISOString();
   if (!cfg.key) {
-    if (onLog) onLog({ provider: "simulation", model: "rule-based", userMessage, timestamp, error: true, responseText: "No API key" });
+    emitLog(onLog, { provider: "simulation", model: "rule-based", userMessage, timestamp, error: true, responseText: "No API key" });
     return null;
   }
   let reqBody = null; let resData = null; let raw = "";
@@ -490,11 +647,11 @@ export async function callGenericLLM(systemPrompt, userMessage, onLog, fnName) {
     let parsed;
     try { parsed = JSON.parse(cleaned); } catch (_) { parsed = JSON.parse(tryRepairJSON(cleaned)); }
     const logResData = cfg.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
-    if (onLog) onLog({ provider: cfg.provider, model: cfg.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: raw, timestamp, fn: fnName ?? "default" });
+    emitLog(onLog, { provider: cfg.provider, model: cfg.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: raw, timestamp, fn: fnName ?? "default" });
     return parsed;
   } catch (e) {
     console.error(`[GenericLLM:${fnName ?? "default"}] error:`, e);
-    if (onLog) onLog({ provider: cfg.provider + " (error)", model: cfg.model, userMessage, requestBody: reqBody, responseText: raw || e.message, error: true, timestamp, fn: fnName ?? "default" });
+    emitLog(onLog, { provider: cfg.provider + " (error)", model: cfg.model, userMessage, requestBody: reqBody, responseText: raw || e.message, error: true, timestamp, fn: fnName ?? "default" });
     return null;
   }
 }
@@ -568,9 +725,9 @@ Strict rules:
 
 // ─── Generate complete itinerary (spots pre-assigned to days) ────────────────
 export async function generateItinerary(country, city, tags, days, transportName, onLog) {
-  const dayCount = parseInt(days) || 3;
+  const { days: dayCount, nights } = parseDayCount(days, { fallbackDays: 3, minDays: 1 });
   const tagStr = tags.length > 0 ? tags.join(", ") : "전체";
-  const msg = `${country} ${city} ${dayCount - 1}박${dayCount}일 여행 일정 생성.\n선호 성향: ${tagStr}\n이동수단: ${transportName}\n${dayCount}일간의 완벽한 일정을 만들어줘.`;
+  const msg = `${country} ${city} ${nights}박${dayCount}일 여행 일정 생성.\n선호 성향: ${tagStr}\n이동수단: ${transportName}\n${dayCount}일간의 완벽한 일정을 만들어줘.`;
   const result = await callGenericLLM(ITINERARY_PROMPT, msg, onLog, "itinerary");
   if (result?.days && result.days.length > 0) return result;
   return null;
