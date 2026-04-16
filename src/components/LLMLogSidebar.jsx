@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import DestFlowDiagram from "./DestFlowDiagram.jsx";
 
-export default function LLMLogSidebar({ logs, open, onToggle, onClear, view, onViewChange, destChatHistory, destSuggestions, destFollowUps }) {
+export default function LLMLogSidebar({ logs, open, onToggle, onClear, view, onViewChange, destChatHistory, destSuggestions, destFollowUps, debugEnabled = false }) {
   const endRef = useRef(null);
   const [expandedIdx, setExpandedIdx] = useState(null);
 
@@ -33,6 +33,12 @@ export default function LLMLogSidebar({ logs, open, onToggle, onClear, view, onV
             </div>
           ) : (
           <div className="llm-log-sidebar__body">
+            <p className="llm-log-sidebar__warning" role="alert">
+              <strong>⚠️ 민감정보 보호</strong>{" "}
+              {debugEnabled
+                ? "디버그 모드가 켜져 있어 원문 로그가 노출됩니다. 실제 키·좌표가 포함될 수 있으니 주의하세요."
+                : "요청/응답 본문은 기본으로 숨겨지고 좌표·키·연락처는 마스킹됩니다. 원문은 VITE_LLM_LOG_DEBUG=true에서만 확인할 수 있습니다."}
+            </p>
             {logs.length === 0 && (<p className="llm-log-sidebar__empty">아직 LLM 통신 내역이 없습니다.<br />AI 변수 조치 패널에서 메시지를 보내면 여기에 표시됩니다.</p>)}
             {logs.map((log, i) => (
               <div key={i} className={`llm-log-entry${log.error ? " llm-log-entry--error" : ""}${log.pending ? " llm-log-entry--pending" : ""}`}>
@@ -45,6 +51,7 @@ export default function LLMLogSidebar({ logs, open, onToggle, onClear, view, onV
                   <span className="llm-log-msg__label">REQ</span>
                   <div className="llm-log-msg__content">
                     <p className="llm-log-msg__user">{log.userMessage}</p>
+                    {log.redacted && !debugEnabled && <p className="llm-log-msg__hint">민감정보 보호 모드로 요청 본문이 숨겨졌습니다.</p>}
                     {log.requestBody && (
                       <button type="button" className="llm-log-msg__expand" onClick={() => setExpandedIdx(expandedIdx === `req-${i}` ? null : `req-${i}`)}>
                         {expandedIdx === `req-${i}` ? "▾ Request Body 접기" : "▸ Request Body 펼치기"}
@@ -65,6 +72,7 @@ export default function LLMLogSidebar({ logs, open, onToggle, onClear, view, onV
                   <span className="llm-log-msg__label">RES</span>
                   <div className="llm-log-msg__content">
                     <p className="llm-log-msg__text">{log.responseText}</p>
+                    {log.redacted && !debugEnabled && <p className="llm-log-msg__hint">민감정보 보호 모드로 응답 본문이 숨겨졌습니다.</p>}
                     {log.modifiedSchedule && log.modifiedSchedule.length > 0 && (
                       <div className="llm-log-msg__schedule">
                         <strong>modifiedSchedule ({log.modifiedSchedule.length})</strong>
