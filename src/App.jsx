@@ -55,7 +55,7 @@ L.Icon.Default.mergeOptions({
   const key = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
   if (!key || window.__googleMapsLoaded) return;
   const s = document.createElement("script");
-  s.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=places,geometry&loading=async&callback=__gmapsReady`;
+  s.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=places,geometry,marker&loading=async&callback=__gmapsReady`;
   s.async = true;
   s.defer = true;
   window.__gmapsReady = () => {
