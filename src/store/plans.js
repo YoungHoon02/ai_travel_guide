@@ -53,6 +53,7 @@
  */
 
 const STORAGE_KEY = "ai_travel_guide:plans:v1";
+const TIME_REGEX = /^\d{1,2}:\d{2}/;
 
 function uid() {
   return "p_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -60,6 +61,24 @@ function uid() {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+export function normalizeRevisionSnapshot(items) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .map((item) => {
+      const time = typeof item.time === "string" && TIME_REGEX.test(item.time) ? item.time : null;
+      const assignedDay = Number.isFinite(item.assignedDay) ? item.assignedDay : null;
+      const id = typeof item.id === "string" && item.id ? item.id : null;
+      if (!id || assignedDay === null || !time) return null;
+      const name = typeof item.name === "string" && item.name.trim() ? item.name.trim() : "이름 없음";
+      const area = typeof item.area === "string" ? item.area : typeof item.summary === "string" ? item.summary : "";
+      const type = typeof item.type === "string" ? item.type : "";
+      const seq = Number.isFinite(item.seq) ? item.seq : null;
+      const latlng = Array.isArray(item.latlng) && item.latlng.length === 2 ? item.latlng : null;
+      return { id, name, time, assignedDay, area, type, seq, latlng };
+    })
+    .filter(Boolean);
 }
 
 function readRaw() {
@@ -199,17 +218,31 @@ export function addItem(planId, dayId, itemInit) {
 }
 
 export function addRevision(planId, revisionInit) {
+  if (typeof window === "undefined") return null;
   const plan = getPlan(planId);
   if (!plan) return null;
+  const beforeSnapshot = normalizeRevisionSnapshot(revisionInit.beforeSnapshot);
+  const afterSnapshot = normalizeRevisionSnapshot(revisionInit.afterSnapshot);
+  if (beforeSnapshot.length === 0 || afterSnapshot.length === 0) {
+    console.warn("[plans store] skip revision: invalid snapshots", {
+      beforeLen: beforeSnapshot.length,
+      afterLen: afterSnapshot.length,
+    });
+    return null;
+  }
+  const triggerInput = typeof revisionInit.triggerInput === "string" ? revisionInit.triggerInput : "";
+  const diffSummary = typeof revisionInit.diffSummary === "string" && revisionInit.diffSummary.trim()
+    ? revisionInit.diffSummary.trim()
+    : "변경 내역 없음";
   const revision = {
     id: "r_" + uid(),
     planId,
     triggeredAt: nowIso(),
     triggerType: revisionInit.triggerType ?? "user_input",
-    triggerInput: revisionInit.triggerInput ?? "",
-    beforeSnapshot: revisionInit.beforeSnapshot ?? [],
-    afterSnapshot: revisionInit.afterSnapshot ?? [],
-    diffSummary: revisionInit.diffSummary ?? "",
+    triggerInput,
+    beforeSnapshot,
+    afterSnapshot,
+    diffSummary,
   };
   const revisions = [...(plan.revisions ?? []), revision];
   updatePlan(planId, { revisions });

@@ -21,6 +21,7 @@ import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import { calcProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil } from "./utils.js";
 import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callLLM, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
+import { addRevision, createPlan, getPlan, normalizeRevisionSnapshot } from "./store/plans.js";
 import {
   STEP_LABELS, RESULT_STEP, LAST_WIZARD_STEP, STAY_LOAD_TARGET, TRAVEL_TAGS,
   LODGINGS, SAVED_PLANS, CONTENTS, METRO_LINES, MOVES,
@@ -63,6 +64,28 @@ L.Icon.Default.mergeOptions({
   };
   document.head.appendChild(s);
 })();
+
+function summarizeScheduleDiff(before, after) {
+  const beforeMap = new Map(before.map((item) => [item.id, item]));
+  const afterMap = new Map(after.map((item) => [item.id, item]));
+  let added = 0;
+  let removed = 0;
+  let timeChanges = 0;
+  let dayChanges = 0;
+  afterMap.forEach((item, id) => {
+    const prev = beforeMap.get(id);
+    if (!prev) {
+      added += 1;
+      return;
+    }
+    if (prev.time !== item.time) timeChanges += 1;
+    if (prev.assignedDay !== item.assignedDay) dayChanges += 1;
+  });
+  beforeMap.forEach((_, id) => {
+    if (!afterMap.has(id)) removed += 1;
+  });
+  return `추가 ${added} · 제거 ${removed} · 시간 변경 ${timeChanges} · 일자 이동 ${dayChanges}`;
+}
 
 export default function App() {
   const [step, setStep] = useState(0);
@@ -129,6 +152,25 @@ export default function App() {
   const [days, setDays] = useState("2박 3일");
   const [planInputRaw, setPlanInputRaw] = useState("");
   const [planInputParsed, setPlanInputParsed] = useState(null);
+  const ensurePlanForRevisions = useCallback(() => {
+    try {
+      const existing = getPlan(selectedPlanId);
+      if (existing) return existing;
+      const saved = savedPlans.find((p) => p.id === selectedPlanId);
+      return createPlan({
+        id: selectedPlanId,
+        name: saved?.name ?? "로컬 플랜",
+        destination: { country: saved?.country ?? country ?? "", city: saved?.region ?? region ?? "", latlng: null },
+        rawInput: planInputRaw ?? "",
+        status: "active",
+        revisions: [],
+      });
+    } catch (err) {
+      console.warn("[revision] ensure plan failed", err);
+      return null;
+    }
+  }, [selectedPlanId, savedPlans, country, region, planInputRaw]);
+  useEffect(() => { ensurePlanForRevisions(); }, [ensurePlanForRevisions]);
   // Step 2 여행 구성 Edit View — currently active day tab (1-indexed)
   const [activeDay, setActiveDay] = useState(1);
   // Edit view — highlighted item (for map ↔ timeline sync)
@@ -653,6 +695,25 @@ export default function App() {
     return groupedPickContents.find((g) => g.tag === activeCategory)?.items ?? [];
   }, [groupedPickContents, activeCategory]);
 
+  const persistRevision = useCallback((beforeItems, afterItems, triggerInput) => {
+    const beforeSnapshot = normalizeRevisionSnapshot(beforeItems);
+    const afterSnapshot = normalizeRevisionSnapshot(afterItems);
+    if (beforeSnapshot.length === 0 || afterSnapshot.length === 0) {
+      console.warn("[revision] skip persist — invalid snapshot", { beforeLen: beforeSnapshot.length, afterLen: afterSnapshot.length });
+      return;
+    }
+    const plan = ensurePlanForRevisions();
+    if (!plan) return;
+    const diffSummary = summarizeScheduleDiff(beforeSnapshot, afterSnapshot);
+    addRevision(plan.id, {
+      triggerType: "user_input",
+      triggerInput: triggerInput ?? "",
+      beforeSnapshot,
+      afterSnapshot,
+      diffSummary,
+    });
+  }, [ensurePlanForRevisions]);
+
   // ── Day assignment helpers ─────────────────────────────────────────────
 
   /** Toggle a spot on the current active day.
@@ -1038,6 +1099,22 @@ export default function App() {
     setScheduleDirections([]);
   };
 
+  const handleApplyOriginalFromRevision = useCallback(() => {
+    try {
+      const plan = getPlan(selectedPlanId);
+      const lastRevision = plan?.revisions?.[plan.revisions.length - 1];
+      const fallback = normalizeRevisionSnapshot(lastRevision?.beforeSnapshot ?? []);
+      if (fallback.length > 0) {
+        setModifiedSchedule(fallback);
+      } else {
+        setModifiedSchedule(null);
+      }
+    } catch (err) {
+      console.warn("[revision] restore failed", err);
+      setModifiedSchedule(null);
+    }
+  }, [selectedPlanId]);
+
 
   // ── LLM send handler ────────────────────────────────────────────────────────
   const activeSchedule = modifiedSchedule ?? pickedContents;
@@ -1097,12 +1174,13 @@ export default function App() {
             ? { ...original, time: item.time, assignedDay: item.assignedDay }
             : item;
         });
+        persistRevision(activeSchedule, enriched, text);
         setModifiedSchedule(enriched);
       }
     } finally {
       setIsLLMLoading(false);
     }
-  }, [chatInput, isLLMLoading, activeSchedule, currentTimeStr, locationName, userLocation, weather, planProgress, chatHistory, scheduleDirections]);
+  }, [chatInput, isLLMLoading, activeSchedule, currentTimeStr, locationName, userLocation, weather, planProgress, chatHistory, scheduleDirections, activeContents, persistRevision]);
 
   const progressActiveIndex = step >= RESULT_STEP ? STEP_LABELS.length - 1 : step;
 
@@ -1921,7 +1999,7 @@ export default function App() {
               weather={weather}
               progress={planProgress}
               modifiedSchedule={modifiedSchedule}
-              onApplyOriginal={() => setModifiedSchedule(null)}
+              onApplyOriginal={handleApplyOriginalFromRevision}
               nearbyPlaces={nearbyPlaces}
               nearbyPlaceType={nearbyPlaceType}
               onNearbyTypeChange={handleNearbyTypeChange}
@@ -2185,4 +2263,3 @@ function renderMovePopup(segment, moveProfile, dirInfo) {
     </>
   );
 }
-
