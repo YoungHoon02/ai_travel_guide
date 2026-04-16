@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import CopilotDemo from "./components/CopilotDemo.jsx";
 import { AnimatePresence, motion } from "framer-motion";
 import { MapContainer, Marker, Popup, TileLayer, Polyline } from "react-leaflet";
 import {
@@ -1125,6 +1126,9 @@ export default function App() {
   const showStarfieldInA = (
     step === 0 && !globeActive && destSuggestions.length === 0
   );
+
+  const isCopilotDemo = useMemo(() => new URLSearchParams(window.location.search).get("demo") === "copilot", []);
+  if (isCopilotDemo) return <CopilotDemo />;
 
   return (
     <div className="app">
