@@ -3,6 +3,7 @@ import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { RoundedBox, Html, OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import { motion } from "framer-motion";
+import { softenContextLoss } from "../utils.js";
 
 // ─── Single 3D card ──────────────────────────────────────────────────────────
 function DestCard3DObj({ dest, index, col, row, isSelected, isHovered, onHover, onClick, hoverPoint }) {
@@ -207,7 +208,7 @@ export default function DestCardGrid({ destinations, selectedIdx, onSelect, onPr
       </div>
 
       <div className="dest-grid__canvas">
-        <Canvas camera={{ position: [0, 0, 8], fov: 50 }}>
+        <Canvas camera={{ position: [0, 0, 8], fov: 50 }} onCreated={({ gl }) => softenContextLoss(gl)}>
           <Suspense fallback={null}>
             <Scene
               destinations={destinations}

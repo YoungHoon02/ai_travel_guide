@@ -45,6 +45,31 @@ export function escapeHtml(str) {
     .replace(/'/g, "&#x27;");
 }
 
+// ─── Env / rendering helpers ────────────────────────────────────────────────
+
+const TRUTHY_ENV_VALUES = new Set(["true", "1", "yes", "on"]);
+const FALSY_ENV_VALUES = new Set(["false", "0", "no", "off", ""]);
+
+/** Parse common truthy/falsey environment strings to boolean. */
+export function parseBooleanEnv(value, defaultValue = false) {
+  if (typeof value === "boolean") return value;
+  if (value === null || value === undefined) return defaultValue;
+  const normalized = String(value).trim().toLowerCase();
+  if (TRUTHY_ENV_VALUES.has(normalized)) return true;
+  if (FALSY_ENV_VALUES.has(normalized)) return false;
+  return defaultValue;
+}
+
+/**
+ * Replace WebGLRenderer.forceContextLoss with a quiet disposer so unmounts
+ * don't spam "Context Lost" logs in dev/StrictMode while still releasing GL.
+ */
+export function softenContextLoss(gl) {
+  if (!gl || typeof gl.forceContextLoss !== "function") return;
+  const dispose = typeof gl.dispose === "function" ? gl.dispose.bind(gl) : null;
+  gl.forceContextLoss = () => { if (dispose) dispose(); };
+}
+
 // ─── Geometry helpers ─────────────────────────────────────────────────────────
 
 /** Squared Euclidean distance between two [lat, lng] pairs. */

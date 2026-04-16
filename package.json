@@ -28,7 +28,7 @@
     "react-dom": "^19.2.4",
     "react-leaflet": "^5.0.0",
     "reactflow": "^11.11.4",
-    "three": "^0.183.2"
+    "three": "0.182.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",

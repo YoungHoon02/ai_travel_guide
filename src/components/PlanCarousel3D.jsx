@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { RoundedBox, Html } from "@react-three/drei";
 import * as THREE from "three";
+import { softenContextLoss } from "../utils.js";
 
 function PlanCard({ plan, index, total, hoveredIdx, onClick, isSelected }) {
   const ref = useRef();
@@ -90,7 +91,7 @@ export default function PlanCarousel3D({ plans, selectedId, onSelect }) {
   if (!plans || plans.length === 0) return null;
   return (
     <div className="plan-carousel-3d">
-      <Canvas camera={{ position: [0, 0.5, 10], fov: 55 }}>
+      <Canvas camera={{ position: [0, 0.5, 10], fov: 55 }} onCreated={({ gl }) => softenContextLoss(gl)}>
         <Scene plans={plans} selectedId={selectedId} onSelect={onSelect} />
       </Canvas>
     </div>

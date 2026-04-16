@@ -1,6 +1,7 @@
 import { useRef, useMemo } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
+import { softenContextLoss } from "../utils.js";
 
 /**
  * Night sky with occasional shooting stars. Most particles sit almost still
@@ -116,6 +117,7 @@ export default function StarfieldBackground({ className = "" }) {
         camera={{ position: [0, 0, 40], fov: 70 }}
         gl={{ alpha: true, antialias: true }}
         dpr={[1, 2]}
+        onCreated={({ gl }) => softenContextLoss(gl)}
       >
         <PouringStars />
       </Canvas>

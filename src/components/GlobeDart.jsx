@@ -4,6 +4,7 @@ import { OrbitControls, Sphere, Line, useTexture, Stars } from "@react-three/dre
 import * as THREE from "three";
 import { callGenericLLM } from "../api.js";
 import { GLOBE_GEOGRAPHY_PROMPT } from "../prompts/index.js";
+import { softenContextLoss } from "../utils.js";
 
 // ─── Coordinate conversions ──────────────────────────────────────────────────
 function latLngToVec3(lat, lng, radius = 1.01) {
@@ -350,7 +351,7 @@ export default function GlobeDart({ onResult, onClose, active, onLog }) {
 
   return (
     <div className="globe-dart">
-      <Canvas camera={{ fov: 45 }}>
+      <Canvas camera={{ fov: 45 }} onCreated={({ gl }) => softenContextLoss(gl)}>
         <Scene phase={phase} onClickGlobe={handleClickGlobe} dartTarget={dartTarget} onDartLanded={handleDartLanded} landedPos={landedPos} speedMultiplier={spinSpeed} flagMode={flagMode} />
       </Canvas>
 
