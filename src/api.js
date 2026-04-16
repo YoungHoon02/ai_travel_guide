@@ -63,46 +63,89 @@ export async function fetchNearbyPlaces(lat, lng, type = "tourist_attraction", r
   } catch { return []; }
 }
 
-// ─── Google Maps Directions API ──────────────────────────────────────────────
+// ─── Google Maps Directions → Routes API ─────────────────────────────────────
 export const GMAPS_TRAVEL_MODE_MAP = {
   public: "TRANSIT", taxi: "DRIVING", car: "DRIVING", walking: "WALKING", bicycle: "BICYCLING",
 };
 
-export function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING") {
-  return new Promise((resolve) => {
-    if (!window.google?.maps?.DirectionsService) { resolve(null); return; }
-    const svc = new window.google.maps.DirectionsService();
-    svc.route(
-      {
-        origin: { lat: originLatLng[0], lng: originLatLng[1] },
-        destination: { lat: destLatLng[0], lng: destLatLng[1] },
-        travelMode: window.google.maps.TravelMode[travelMode],
-        language: "ko",
+const ROUTES_API_URL = "https://routes.googleapis.com/directions/v2:computeRoutes";
+const ROUTES_TRAVEL_MODE_MAP = {
+  DRIVING: "DRIVE", WALKING: "WALK", BICYCLING: "BICYCLE", TRANSIT: "TRANSIT",
+};
+
+function formatRouteDuration(secs) {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (h > 0) return `${h}시간 ${m}분`;
+  return `${m || 1}분`;
+}
+
+function formatRouteDistance(meters) {
+  if (meters >= 1000) return `${(meters / 1000).toFixed(1)} km`;
+  return `${meters} m`;
+}
+
+export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING") {
+  const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const res = await fetch(ROUTES_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": apiKey,
+        "X-Goog-FieldMask": [
+          "routes.duration",
+          "routes.distanceMeters",
+          "routes.polyline.encodedPolyline",
+          "routes.legs.steps.navigationInstruction",
+          "routes.legs.steps.staticDuration",
+          "routes.legs.steps.distanceMeters",
+          "routes.legs.steps.travelMode",
+        ].join(","),
       },
-      (result, status) => {
-        if (status === window.google.maps.DirectionsStatus.OK) {
-          const leg = result.routes?.[0]?.legs?.[0];
-          resolve({
-            duration: leg?.duration?.text ?? null,
-            durationSecs: leg?.duration?.value ?? null,
-            distance: leg?.distance?.text ?? null,
-            steps: (leg?.steps ?? []).slice(0, 5).map((s) => ({
-              instruction: escapeHtml((s.instructions ?? "").replace(/<[^>]*>/g, "").slice(0, 80)),
-              duration: s.duration?.text ?? "",
-              distance: s.distance?.text ?? "",
-              travelMode: s.travel_mode ?? travelMode,
-            })),
-            polylinePath: result.routes?.[0]?.overview_path?.map((p) => [p.lat(), p.lng()]) ?? null,
-          });
-        } else { resolve(null); }
-      }
-    );
-  });
+      body: JSON.stringify({
+        origin: { location: { latLng: { latitude: originLatLng[0], longitude: originLatLng[1] } } },
+        destination: { location: { latLng: { latitude: destLatLng[0], longitude: destLatLng[1] } } },
+        travelMode: ROUTES_TRAVEL_MODE_MAP[travelMode] ?? "DRIVE",
+        languageCode: "ko",
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const route = data?.routes?.[0];
+    if (!route) return null;
+
+    const durationSecs = route.duration ? parseInt(route.duration) : null;
+    const distanceMeters = route.distanceMeters ?? null;
+
+    const polylinePath =
+      route.polyline?.encodedPolyline && window.google?.maps?.geometry
+        ? window.google.maps.geometry.encoding
+            .decodePath(route.polyline.encodedPolyline)
+            .map((p) => [p.lat(), p.lng()])
+        : null;
+
+    const steps = (route.legs?.[0]?.steps ?? []).slice(0, 5).map((s) => ({
+      instruction: escapeHtml((s.navigationInstruction?.instructions ?? "").slice(0, 80)),
+      duration: s.staticDuration ? formatRouteDuration(parseInt(s.staticDuration)) : "",
+      distance: s.distanceMeters ? formatRouteDistance(s.distanceMeters) : "",
+      travelMode: s.travelMode ?? travelMode,
+    }));
+
+    return {
+      duration: durationSecs ? formatRouteDuration(durationSecs) : null,
+      durationSecs,
+      distance: distanceMeters ? formatRouteDistance(distanceMeters) : null,
+      steps,
+      polylinePath,
+    };
+  } catch { return null; }
 }
 
 export async function fetchScheduleDirections(schedule, moveId) {
   const travelMode = GMAPS_TRAVEL_MODE_MAP[moveId] ?? "DRIVING";
-  if (!window.google?.maps?.DirectionsService || schedule.length < 2) return [];
+  if (!import.meta.env.VITE_GOOGLE_MAPS_API_KEY || schedule.length < 2) return [];
   const results = await Promise.all(
     schedule.slice(0, -1).map((from, idx) => {
       const to = schedule[idx + 1];
@@ -274,11 +317,55 @@ export async function callLLM({ userMessage, plan, currentTime, location, weathe
   }
 }
 
+// ─── JSON repair helper ───────────────────────────────────────────────────────
+// Stack-based repair: inserts missing } before ] when an object is still open,
+// then appends any remaining unclosed structures at the end.
+// Handles the common LLM pattern where the last array item is missing its closing }.
+function tryRepairJSON(str) {
+  const stack = [];
+  let result = '';
+  let inStr = false, escape = false;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) { escape = false; result += ch; continue; }
+    if (ch === '\\' && inStr) { escape = true; result += ch; continue; }
+    if (ch === '"') { inStr = !inStr; result += ch; continue; }
+    if (inStr) { result += ch; continue; }
+    if (ch === '{') { stack.push('}'); result += ch; }
+    else if (ch === '[') { stack.push(']'); result += ch; }
+    else if (ch === '}' || ch === ']') {
+      // Insert missing closers until we match
+      while (stack.length > 0 && stack[stack.length - 1] !== ch) result += stack.pop();
+      if (stack.length > 0) stack.pop();
+      result += ch;
+    } else { result += ch; }
+  }
+  result = result.trimEnd().replace(/,\s*$/, '');
+  while (stack.length > 0) result += stack.pop();
+  return result;
+}
+
 // ─── Destination LLM ─────────────────────────────────────────────────────────
+// Strip app-enriched fields (_photo, trav_loc_latlng) from assistant messages
+// before sending history back to the LLM — these are not LLM-generated and
+// can inflate prompt tokens by thousands when Google Photos URLs accumulate.
+function stripEnrichedFields(history) {
+  return history.map((msg) => {
+    if (msg.role !== "assistant") return msg;
+    try {
+      const parsed = JSON.parse(msg.content);
+      if (Array.isArray(parsed.destinations)) {
+        parsed.destinations = parsed.destinations.map(({ _photo, trav_loc_latlng, ...rest }) => rest);
+      }
+      return { ...msg, content: JSON.stringify(parsed) };
+    } catch { return msg; }
+  });
+}
+
 // chatHistory: [{role: "user"|"assistant", content: string}, ...]
 export async function callDestinationLLM(userMessage, chatHistory, onLog, count = 4) {
   const prefixed = `[${count}개 추천해줘] ${userMessage}`;
-  const messages = [...chatHistory, { role: "user", content: prefixed }];
+  const messages = [...stripEnrichedFields(chatHistory), { role: "user", content: prefixed }];
   const timestamp = new Date().toISOString();
   if (!ACTIVE_LLM.key) {
     await new Promise((r) => setTimeout(r, 500));
@@ -342,7 +429,8 @@ export async function callDestinationLLM(userMessage, chatHistory, onLog, count 
     let cleaned = raw.trim();
     const codeBlock = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (codeBlock) cleaned = codeBlock[1].trim();
-    const parsed = JSON.parse(cleaned);
+    let parsed;
+    try { parsed = JSON.parse(cleaned); } catch (_) { parsed = JSON.parse(tryRepairJSON(cleaned)); }
     const logResData = ACTIVE_LLM.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
     if (onLog) onLog({ provider: ACTIVE_LLM.provider, model: ACTIVE_LLM.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: raw, timestamp });
     if (Array.isArray(parsed)) return { destinations: parsed, follow_up_questions: [], raw };
@@ -399,7 +487,8 @@ export async function callGenericLLM(systemPrompt, userMessage, onLog, fnName) {
     let cleaned = raw.trim();
     const codeBlock = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (codeBlock) cleaned = codeBlock[1].trim();
-    const parsed = JSON.parse(cleaned);
+    let parsed;
+    try { parsed = JSON.parse(cleaned); } catch (_) { parsed = JSON.parse(tryRepairJSON(cleaned)); }
     const logResData = cfg.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
     if (onLog) onLog({ provider: cfg.provider, model: cfg.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: raw, timestamp, fn: fnName ?? "default" });
     return parsed;
