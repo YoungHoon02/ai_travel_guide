@@ -5,7 +5,7 @@
  *         distSq, orderNearestNeighborFrom, buildTransitLikeRoute,
  *         sumVisitScores, assignOptimalDays, simulateLLMResponse
  */
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   timeToMinutes,
   minutesToTime,
@@ -18,6 +18,7 @@ import {
   assignOptimalDays,
   simulateLLMResponse,
 } from "../utils.js";
+import { parseHeuristic, parseLLMResponse } from "../store/planInputParser.js";
 
 // ─── timeToMinutes ────────────────────────────────────────────────────────────
 
@@ -322,6 +323,41 @@ const FULL_PLAN = [
   { id: "e", name: "신주쿠 골든가이", time: "20:00", indoor: false },
 ];
 
+const REALTIME_PLAN = FULL_PLAN.map((item) => ({
+  ...item,
+  assignedDay: 1,
+  area: "도쿄",
+  type: "spot",
+  visitScore: 5,
+}));
+
+function buildRealtimeCtx() {
+  return {
+    plan: REALTIME_PLAN,
+    currentTime: "09:00",
+    location: "도쿄역",
+    weather: { description: "맑음", temp: "20°C", icon: "☀️", humidity: "50%", wind: "2m/s" },
+    progress: calcProgress(REALTIME_PLAN, "09:00"),
+    history: [],
+    directions: [],
+  };
+}
+
+async function loadCallLLMWithKey() {
+  vi.resetModules();
+  process.env.VITE_LLM_PROVIDER = "openai";
+  process.env.VITE_OPENAI_API_KEY = "test-key";
+  const mod = await import("../api.js");
+  return mod.callLLM;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  if (vi.unstubAllGlobals) vi.unstubAllGlobals();
+  delete process.env.VITE_LLM_PROVIDER;
+  delete process.env.VITE_OPENAI_API_KEY;
+});
+
 describe("simulateLLMResponse — delay scenario", () => {
   it("filters out spots before the mentioned hour", () => {
     const res = simulateLLMResponse("늦잠 자서 13시에 출발해요", FULL_PLAN);
@@ -395,5 +431,93 @@ describe("simulateLLMResponse — unknown scenario (fallback)", () => {
   it("response text contains plan length", () => {
     const res = simulateLLMResponse("무엇을 추천하세요?", FULL_PLAN);
     expect(res.text).toContain(`${FULL_PLAN.length}`);
+  });
+});
+
+// ─── Plan input parsing ──────────────────────────────────────────────────────
+
+describe("parseHeuristic — day-count focused scenarios", () => {
+  it("treats natural language 'N일' as days with derived nights", () => {
+    const parsed = parseHeuristic("도쿄 5일 자유여행");
+    expect(parsed.days).toBe(5);
+    expect(parsed.nights).toBe(4);
+    expect(parsed.mode).toBe("natural");
+    expect(parsed.interpretation).toContain("5일");
+  });
+
+  it("derives nights/days from an explicit date range", () => {
+    const parsed = parseHeuristic("2026/04/02 ~ 2026/04/06 4일 일정");
+    expect(parsed.startDate).toBe("2026-04-02");
+    expect(parsed.endDate).toBe("2026-04-06");
+    expect(parsed.nights).toBe(4);
+    expect(parsed.days).toBe(5);
+    expect(parsed.interpretation).toContain("4박 5일");
+  });
+});
+
+describe("parseLLMResponse — resilient day parsing", () => {
+  it("keeps days when nights are omitted in the payload", () => {
+    const parsed = parseLLMResponse('{"days":7,"interpretation":"7일 일정"}');
+    expect(parsed).not.toBeNull();
+    expect(parsed.days).toBe(7);
+    expect(parsed.nights).toBeNull();
+    expect(parsed.interpretation).toContain("7일");
+  });
+});
+
+// ─── Realtime response parsing ───────────────────────────────────────────────
+
+describe("callLLM — realtime parsing and fallbacks", () => {
+  it("extracts modifiedSchedule from a well-formed JSON block", async () => {
+    const callLLM = await loadCallLLMWithKey();
+    const rawContent = [
+      "수정된 일정입니다.",
+      "```json",
+      '{"modifiedSchedule":[{"id":"a","name":"오모테산도","time":"10:30","assignedDay":1,"area":"도쿄","type":"spot"}]}',
+      "```",
+    ].join("\n");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: rawContent } }] }),
+    }));
+
+    const ctx = buildRealtimeCtx();
+    const result = await callLLM({ userMessage: "지연으로 일정 조정", ...ctx });
+    expect(result.modifiedSchedule).toEqual([
+      { id: "a", name: "오모테산도", time: "10:30", assignedDay: 1, area: "도쿄", type: "spot" },
+    ]);
+    expect(result.text).toBe("수정된 일정입니다.");
+  });
+
+  it("returns null modifiedSchedule when the JSON block is malformed", async () => {
+    const callLLM = await loadCallLLMWithKey();
+    const rawContent = [
+      "형식이 깨진 응답입니다.",
+      "```json",
+      '{"modifiedSchedule":[{"id":"a","time":"10:30"}',
+      "```",
+      "추가 텍스트",
+    ].join("\n");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: rawContent } }] }),
+    }));
+
+    const ctx = buildRealtimeCtx();
+    const result = await callLLM({ userMessage: "응답 형식 확인", ...ctx });
+    expect(result.modifiedSchedule).toBeNull();
+    expect(result.text).toContain("형식이 깨진 응답입니다.");
+  });
+
+  it("falls back to the simulator when the request fails", async () => {
+    const callLLM = await loadCallLLMWithKey();
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
+
+    const ctx = buildRealtimeCtx();
+    const result = await callLLM({ userMessage: "아키하바라 취소됐어요", ...ctx });
+    expect(result.modifiedSchedule).not.toBeNull();
+    expect(result.modifiedSchedule?.length).toBe(FULL_PLAN.length - 1);
+    expect(result.modifiedSchedule?.every((item) => typeof item.id === "string" && typeof item.time === "string")).toBe(true);
   });
 });
