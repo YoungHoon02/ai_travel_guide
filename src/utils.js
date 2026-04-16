@@ -19,6 +19,49 @@ export function minutesToTime(mins) {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
+// ─── Trip duration parsing ───────────────────────────────────────────────────
+
+/**
+ * Extract a safe day/night count from free-form text like "2박 3일" or "3일".
+ * Returns a minimum of `minDays` and falls back to `fallbackDays` when parsing fails.
+ */
+export function parseDayCount(raw, { fallbackDays = 3, minDays = 1 } = {}) {
+  const fallback = Math.max(minDays, fallbackDays || minDays);
+  const normalized = typeof raw === "string" ? raw.replace(/\s+/g, "") : String(raw ?? "");
+
+  let nights;
+  let days;
+
+  const nightsDaysMatch = normalized.match(/(\d+)\s*박\s*(\d+)\s*일/);
+  if (nightsDaysMatch) {
+    nights = Number(nightsDaysMatch[1]);
+    days = Number(nightsDaysMatch[2]);
+  } else {
+    const dayMatch = normalized.match(/(\d+)\s*일/);
+    const nightMatch = normalized.match(/(\d+)\s*박/);
+    if (dayMatch) days = Number(dayMatch[1]);
+    if (nightMatch && days == null) {
+      nights = Number(nightMatch[1]);
+      days = nights + 1;
+    }
+  }
+
+  if (days == null) {
+    const digits = normalized.match(/(\d+)/g);
+    if (digits?.length) days = Number(digits[digits.length - 1]);
+  }
+
+  const hasParsedDays = Number.isFinite(days);
+  let finalDays = hasParsedDays ? Math.max(days, minDays) : fallback;
+
+  const hasValidNights = Number.isFinite(nights) && nights >= 0;
+  if (hasValidNights) finalDays = Math.max(finalDays, nights + 1);
+
+  const finalNights = hasValidNights ? nights : Math.max(0, finalDays - 1);
+
+  return { days: finalDays, nights: finalNights };
+}
+
 // ─── Schedule progress ────────────────────────────────────────────────────────
 
 /**

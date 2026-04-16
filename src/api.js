@@ -1,4 +1,4 @@
-import { escapeHtml, simulateLLMResponse } from "./utils.js";
+import { escapeHtml, simulateLLMResponse, parseDayCount } from "./utils.js";
 import {
   DEST_SYSTEM_PROMPT,
   TRANSPORT_PROMPT,
@@ -330,13 +330,75 @@ function sanitizeGeminiResponse(data) {
   return { ...data, candidates: data.candidates.map((c) => ({ ...c, content: c.content ? { ...c.content, parts: (c.content.parts ?? []).map(({ thoughtSignature, ...rest }) => rest) } : c.content })) };
 }
 
+function normalizeFollowUpQuestions(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((q) => (typeof q === "string" ? q.trim() : ""))
+    .filter(Boolean)
+    .slice(0, 2);
+}
+
+function coerceModifiedSchedule(value) {
+  if (value === null) return null;
+  if (!Array.isArray(value)) return null;
+  return value.filter((item) => item && typeof item === "object");
+}
+
+function parseRealtimeLLMResponse(raw) {
+  const safeRaw = typeof raw === "string" ? raw : "";
+  const candidates = [];
+  for (const match of safeRaw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+    if (match[1]) candidates.push(match[1]);
+  }
+  const braceMatch = safeRaw.match(/\{[\s\S]*\}/);
+  if (braceMatch) candidates.push(braceMatch[0]);
+  candidates.push(safeRaw.trim());
+
+  let parsed = null;
+  let usedSnippet = "";
+  for (const snippet of candidates) {
+    const trimmed = (snippet || "").trim();
+    if (!trimmed) continue;
+    try { parsed = JSON.parse(trimmed); usedSnippet = snippet; break; } catch {}
+    try { parsed = JSON.parse(tryRepairJSON(trimmed)); usedSnippet = snippet; break; } catch {}
+  }
+
+  const baseText = safeRaw.replace(/```[\s\S]*?```/g, "").trim();
+  const cleanedText = usedSnippet ? baseText.replace(usedSnippet, "").trim() || baseText : baseText;
+  const normalized = { schemaVersion: null, responseType: null, followUpQuestions: [], modifiedSchedule: null, text: cleanedText || safeRaw.trim() };
+  if (!parsed) return normalized;
+
+  if (Array.isArray(parsed)) {
+    normalized.modifiedSchedule = coerceModifiedSchedule(parsed);
+    return normalized;
+  }
+  if (typeof parsed !== "object" || parsed === null) return normalized;
+
+  const schemaRaw = typeof parsed.schemaVersion === "string"
+    ? parsed.schemaVersion.trim()
+    : typeof parsed.schemaVersion === "number"
+      ? parsed.schemaVersion.toString()
+      : null;
+  normalized.schemaVersion = schemaRaw && schemaRaw.length > 0 ? schemaRaw : null;
+
+  const rtRaw = typeof parsed.responseType === "string" ? parsed.responseType.trim().toLowerCase() : null;
+  if (rtRaw && ["modified", "no_change", "clarification"].includes(rtRaw)) normalized.responseType = rtRaw;
+  normalized.followUpQuestions = normalizeFollowUpQuestions(parsed.followUpQuestions);
+
+  if ("modifiedSchedule" in parsed) {
+    normalized.modifiedSchedule = parsed.modifiedSchedule === null ? null : coerceModifiedSchedule(parsed.modifiedSchedule);
+  } else if (Array.isArray(parsed.schedule)) {
+    normalized.modifiedSchedule = coerceModifiedSchedule(parsed.schedule);
+  }
+  return normalized;
+}
 
 export async function callLLM({ userMessage, plan, currentTime, location, weather, progress, history, directions, onLog }) {
   if (!ACTIVE_LLM.key) {
     const reqLog = { provider: "simulation", model: "rule-based", userMessage, timestamp: new Date().toISOString() };
     await new Promise((r) => setTimeout(r, 700));
-    const result = simulateLLMResponse(userMessage, plan, currentTime);
-    emitLog(onLog, { ...reqLog, responseText: result.text, modifiedSchedule: result.modifiedSchedule });
+    const result = { ...simulateLLMResponse(userMessage, plan, currentTime), schemaVersion: null, responseType: null, followUpQuestions: [] };
+    emitLog(onLog, { ...reqLog, responseText: result.text, modifiedSchedule: result.modifiedSchedule, schemaVersion: result.schemaVersion, responseType: result.responseType, followUpQuestions: result.followUpQuestions });
     return result;
   }
   const systemContent = buildRealtimeSystemPrompt({ plan, currentTime, location, weather, progress, directions });
@@ -370,16 +432,44 @@ export async function callLLM({ userMessage, plan, currentTime, location, weathe
       resData = await res.json();
       raw = (resData.content ?? []).map((item) => item.text).filter(Boolean).join("\n");
     }
-    const jsonMatch = raw.match(/```json\s*([\s\S]*?)```/);
-    let modifiedSchedule = null;
-    if (jsonMatch) { try { modifiedSchedule = JSON.parse(jsonMatch[1]).modifiedSchedule ?? null; } catch (e) { console.error("[LLM] JSON parse error:", e); } }
-    const result = { text: raw.replace(/```json[\s\S]*?```/g, "").trim(), modifiedSchedule };
+    const parsed = parseRealtimeLLMResponse(raw);
+    const result = {
+      text: parsed.text,
+      modifiedSchedule: parsed.modifiedSchedule,
+      schemaVersion: parsed.schemaVersion,
+      responseType: parsed.responseType,
+      followUpQuestions: parsed.followUpQuestions,
+    };
     const logResData = ACTIVE_LLM.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
-    emitLog(onLog, { provider: ACTIVE_LLM.provider, model: ACTIVE_LLM.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: result.text, modifiedSchedule, timestamp: new Date().toISOString() });
+    emitLog(onLog, {
+      provider: ACTIVE_LLM.provider,
+      model: ACTIVE_LLM.model,
+      userMessage,
+      requestBody: reqBody,
+      responseData: logResData,
+      responseText: result.text,
+      modifiedSchedule: result.modifiedSchedule,
+      schemaVersion: result.schemaVersion,
+      responseType: result.responseType,
+      followUpQuestions: result.followUpQuestions,
+      timestamp: new Date().toISOString(),
+    });
     return result;
   } catch {
-    const fallback = simulateLLMResponse(userMessage, plan, currentTime);
-    emitLog(onLog, { provider: ACTIVE_LLM.provider + " (fallback)", model: "rule-based", userMessage, requestBody: reqBody, responseText: fallback.text, modifiedSchedule: fallback.modifiedSchedule, error: true, timestamp: new Date().toISOString() });
+    const fallback = { ...simulateLLMResponse(userMessage, plan, currentTime), schemaVersion: null, responseType: null, followUpQuestions: [] };
+    emitLog(onLog, {
+      provider: ACTIVE_LLM.provider + " (fallback)",
+      model: "rule-based",
+      userMessage,
+      requestBody: reqBody,
+      responseText: fallback.text,
+      modifiedSchedule: fallback.modifiedSchedule,
+      schemaVersion: fallback.schemaVersion,
+      responseType: fallback.responseType,
+      followUpQuestions: fallback.followUpQuestions,
+      error: true,
+      timestamp: new Date().toISOString(),
+    });
     return fallback;
   }
 }
@@ -635,9 +725,9 @@ Strict rules:
 
 // ─── Generate complete itinerary (spots pre-assigned to days) ────────────────
 export async function generateItinerary(country, city, tags, days, transportName, onLog) {
-  const dayCount = parseInt(days) || 3;
+  const { days: dayCount, nights } = parseDayCount(days, { fallbackDays: 3, minDays: 1 });
   const tagStr = tags.length > 0 ? tags.join(", ") : "전체";
-  const msg = `${country} ${city} ${dayCount - 1}박${dayCount}일 여행 일정 생성.\n선호 성향: ${tagStr}\n이동수단: ${transportName}\n${dayCount}일간의 완벽한 일정을 만들어줘.`;
+  const msg = `${country} ${city} ${nights}박${dayCount}일 여행 일정 생성.\n선호 성향: ${tagStr}\n이동수단: ${transportName}\n${dayCount}일간의 완벽한 일정을 만들어줘.`;
   const result = await callGenericLLM(ITINERARY_PROMPT, msg, onLog, "itinerary");
   if (result?.days && result.days.length > 0) return result;
   return null;
