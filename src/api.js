@@ -1,4 +1,4 @@
-import { escapeHtml, simulateLLMResponse } from "./utils.js";
+import { escapeHtml, simulateLLMResponse, parseDayCount } from "./utils.js";
 import {
   DEST_SYSTEM_PROMPT,
   TRANSPORT_PROMPT,
@@ -568,9 +568,9 @@ Strict rules:
 
 // ─── Generate complete itinerary (spots pre-assigned to days) ────────────────
 export async function generateItinerary(country, city, tags, days, transportName, onLog) {
-  const dayCount = parseInt(days) || 3;
+  const { days: dayCount, nights } = parseDayCount(days, { fallbackDays: 3, minDays: 1 });
   const tagStr = tags.length > 0 ? tags.join(", ") : "전체";
-  const msg = `${country} ${city} ${dayCount - 1}박${dayCount}일 여행 일정 생성.\n선호 성향: ${tagStr}\n이동수단: ${transportName}\n${dayCount}일간의 완벽한 일정을 만들어줘.`;
+  const msg = `${country} ${city} ${nights}박${dayCount}일 여행 일정 생성.\n선호 성향: ${tagStr}\n이동수단: ${transportName}\n${dayCount}일간의 완벽한 일정을 만들어줘.`;
   const result = await callGenericLLM(ITINERARY_PROMPT, msg, onLog, "itinerary");
   if (result?.days && result.days.length > 0) return result;
   return null;
