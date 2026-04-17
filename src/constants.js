@@ -6,6 +6,22 @@ export const LAST_WIZARD_STEP = 2;
 export const STAY_LOAD_TARGET = 36;
 export const TRAVEL_TAGS = ["역사유적", "쇼핑", "미식", "야경", "자연", "카페투어", "전시체험", "로컬시장"];
 
+/**
+ * Step 0 theme chips — quick-start seeds for the hero input. Clicking fills
+ * the input with `seed` text; user can then append region/constraints
+ * ("일본 힐링 여행") before submitting. No auto-submit.
+ */
+export const THEME_CHIPS = [
+  { icon: "🌿", label: "힐링", seed: "힐링 여행, 온천과 자연" },
+  { icon: "🍜", label: "맛집", seed: "현지 맛집 투어 여행" },
+  { icon: "🏛", label: "문화·역사", seed: "문화 유적과 역사 탐방 여행" },
+  { icon: "🏔", label: "자연·액티비티", seed: "자연 풍경과 액티비티 여행" },
+  { icon: "🛍", label: "쇼핑·도시", seed: "쇼핑과 도시 탐방 여행" },
+  { icon: "💰", label: "가성비", seed: "가성비 좋은 여행지" },
+  { icon: "🥂", label: "럭셔리", seed: "럭셔리 프리미엄 여행" },
+  { icon: "📸", label: "감성·인생샷", seed: "감성적이고 사진 찍기 좋은 여행지" },
+];
+
 export const DAY_PIN_COLORS = { 1: "#2563eb", 2: "#059669", 3: "#7c3aed" };
 
 export const PLACE_TYPES = [

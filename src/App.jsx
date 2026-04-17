@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CopilotDemo from "./components/CopilotDemo.jsx";
+import CopilotPanel from "./components/CopilotPanel.jsx";
+import ErrorBoundary from "./components/ErrorBoundary.jsx";
 import { AnimatePresence, motion } from "framer-motion";
 import { MapContainer, Marker, Popup, TileLayer, Polyline } from "react-leaflet";
 import {
@@ -24,7 +26,7 @@ import { calcProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays a
 import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callLLM, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
 import {
   STEP_LABELS, RESULT_STEP, LAST_WIZARD_STEP, STAY_LOAD_TARGET, TRAVEL_TAGS,
-  LODGINGS, SAVED_PLANS, CONTENTS, METRO_LINES, MOVES,
+  LODGINGS, SAVED_PLANS, CONTENTS, METRO_LINES, MOVES, THEME_CHIPS,
   dayNumberIcon, lodgingMapIcon, findDayInBuckets, categoriesForContent,
   normalizeSelectionForDemo, buildMoveSegmentDefs, fadeSlide, transitionSpring,
 } from "./constants.js";
@@ -42,6 +44,20 @@ import { buildLuckyThemePrompt } from "./prompts/index.js";
 import DestPreviewMap from "./components/DestPreviewMap.jsx";
 import GlobeDart from "./components/GlobeDart.jsx";
 import DestCardGrid from "./components/DestCardGrid.jsx";
+import {
+  scheduleFromItineraryLLM,
+  scheduleFromLegacy,
+  getActivitySlots,
+  getPrimaryLodging,
+  swapPrimaryLodging,
+  reorderActivitiesInDay,
+  removeSlot as removeSlotFromSchedule,
+  replaceSlot as replaceSlotInSchedule,
+  recalculateDayTimes,
+  getDayCount as getScheduleDayCount,
+  createActivitySlot,
+  findSlotById,
+} from "./store/schedule.js";
 
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -144,6 +160,8 @@ export default function App() {
   const [highlightItemId, setHighlightItemId] = useState(null);
   // Hotel browse modal (full-screen picker with Google Places search)
   const [hotelModalOpen, setHotelModalOpen] = useState(false);
+  // Co-Pilot floating panel — open/close toggle inside Edit View (step 2)
+  const [copilotOpen, setCopilotOpen] = useState(false);
   // User-picked or custom-entered hotel. Overrides activeLodgings when set.
   const [customLodging, setCustomLodging] = useState(null);
   // Real Google Directions segments for the Edit View active day.
@@ -157,6 +175,22 @@ export default function App() {
     try { localStorage.setItem("tripDateMode", tripDateMode); } catch {}
   }, [tripDateMode]);
   const [destQuery, setDestQuery] = useState("");
+  const destInputRef = useRef(null);
+  // Theme chips act as quick-start seed text for the free-text input.
+  // Click → fills input, focuses it. User can append region/constraints
+  // ("일본 힐링 여행") before hitting Enter. No auto-submit — single unified
+  // input-driven LLM path, chips are just shortcuts.
+  const handleThemeChip = useCallback((seedText) => {
+    setDestQuery(seedText);
+    setTimeout(() => {
+      const el = destInputRef.current;
+      if (el) {
+        el.focus();
+        const len = el.value.length;
+        try { el.setSelectionRange(len, len); } catch {}
+      }
+    }, 0);
+  }, []);
   const [destSuggestions, setDestSuggestions] = useState([]);
   const [destLoading, setDestLoading] = useState(false);
   const [selectedDest, setSelectedDest] = useState(null);
@@ -183,10 +217,39 @@ export default function App() {
   const itineraryPromiseRef = useRef(null);
   const [loadingElapsed, setLoadingElapsed] = useState(0);
   const [recommended, setRecommended] = useState([]);
-  // dayAssignments is the source of truth for which spot belongs to which day.
-  // selectedSpotIds is derived (flat unique list) for backward compat.
-  // Shape: { 1: [id, id], 2: [id], 3: [], ... }
-  const [dayAssignments, setDayAssignments] = useState({ 1: [], 2: [], 3: [] });
+  // ── Schedule store — TimeSlot[] is the new single source of truth ─────
+  // Replaces legacy dayAssignments. See src/store/schedule.js for Slot shape.
+  // dayAssignments stays available as a derived compatibility value for
+  // downstream code that hasn't been migrated yet (pickedContents, diff views…).
+  const [schedule, setSchedule] = useState([]);
+  const dayAssignments = useMemo(() => {
+    const out = {};
+    const maxDay = Math.max(1, getScheduleDayCount(schedule));
+    for (let d = 1; d <= maxDay; d += 1) {
+      out[d] = getActivitySlots(schedule, d).map((s) => s.id);
+    }
+    return out;
+  }, [schedule]);
+  /** Legacy setter shim — rebuilds schedule from id assignments via adapter. */
+  const setDayAssignments = useCallback((updater) => {
+    setSchedule((prevSchedule) => {
+      const prevAssignments = {};
+      const maxDay = Math.max(1, getScheduleDayCount(prevSchedule));
+      for (let d = 1; d <= maxDay; d += 1) {
+        prevAssignments[d] = getActivitySlots(prevSchedule, d).map((s) => s.id);
+      }
+      const nextAssignments = typeof updater === "function" ? updater(prevAssignments) : updater;
+      const contents = dynContents ?? CONTENTS;
+      const lodging = getPrimaryLodging(prevSchedule);
+      return scheduleFromLegacy({
+        dayAssignments: nextAssignments,
+        activeContents: contents,
+        selectedLodging: lodging,
+        dayCount: maxDay,
+      });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dynContents]);
   const [refinePrompt, setRefinePrompt] = useState("");
   const [isRefining, setIsRefining] = useState(false);
   const [optimizedDayPicks, setOptimizedDayPicks] = useState(null);
@@ -308,10 +371,26 @@ export default function App() {
   }, [step, country, region, dynLodgings, dynItinerary]);
 
   // When step 2 is entered, consume the pre-gen promises if not already done.
+  // Builds the Schedule directly from LLM itinerary + resolved lodging.
   useEffect(() => {
     if (step !== 2) return;
     (async () => {
-      const logCb = (log) => appendLog(log);
+      // Wait for Google Maps to be ready before any forwardGeocode calls,
+      // otherwise they silently return null and every slot ends up without
+      // latlng → no map markers, no polyline.
+      if (!window.google?.maps?.Geocoder) {
+        await new Promise((resolve) => {
+          if (window.__googleMapsLoaded) { resolve(); return; }
+          const t = setTimeout(resolve, 8000); // hard timeout fallback
+          window.addEventListener(
+            "googlemapsloaded",
+            () => { clearTimeout(t); resolve(); },
+            { once: true }
+          );
+        });
+      }
+      // Resolve lodging first so schedule has anchors from the start.
+      let resolvedLodgings = dynLodgings;
       if (lodgingPromiseRef.current && !dynLodgings) {
         const lodgings = await lodgingPromiseRef.current;
         lodgingPromiseRef.current = null;
@@ -320,6 +399,7 @@ export default function App() {
             const coords = await forwardGeocode(`${l.area ?? l.name} ${region} ${country}`);
             return coords ? { ...l, latlng: coords } : l;
           }));
+          resolvedLodgings = refined;
           setDynLodgings(refined);
           setSelectedLodgingId((prev) => prev || refined[0]?.id || "");
         }
@@ -329,9 +409,7 @@ export default function App() {
         itineraryPromiseRef.current = null;
         if (itinerary?.days) {
           const allSpots = [];
-          const newAssignments = {};
           for (const d of itinerary.days) {
-            newAssignments[d.day] = (d.spots ?? []).map((s) => s.id);
             for (const s of (d.spots ?? [])) {
               allSpots.push({ ...s, day: d.day, assignedDay: d.day });
             }
@@ -343,12 +421,67 @@ export default function App() {
           setDynContents(refined);
           setRecommended(refined);
           setDynItinerary(itinerary);
-          setDayAssignments(newAssignments);
+
+          // Build schedule directly. Pair each LLM spot with its enriched latlng.
+          const enrichedItinerary = {
+            ...itinerary,
+            days: itinerary.days.map((d) => ({
+              ...d,
+              spots: (d.spots ?? []).map((s) => {
+                const found = refined.find((r) => r.id === s.id);
+                return found ? { ...s, latlng: found.latlng, img: found.img } : s;
+              }),
+            })),
+          };
+          const lodgingInfo = customLodging ?? resolvedLodgings?.[0] ?? null;
+          const newDayCount = itinerary.days.length || 3;
+          setSchedule(scheduleFromItineraryLLM(enrichedItinerary, lodgingInfo, newDayCount));
         }
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step]);
+
+  // Re-geocode any slots that don't have latlng yet (e.g., because Google
+  // Maps hadn't loaded when the schedule was first built). Runs whenever
+  // schedule changes, only hitting the Geocoder for slots that need it.
+  useEffect(() => {
+    if (step !== 2) return;
+    if (!schedule.length) return;
+    if (!window.google?.maps?.Geocoder) return;
+    const missing = schedule.filter((s) => s.kind === "activity" && !s.latlng);
+    if (missing.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      const fixes = await Promise.all(
+        missing.map(async (s) => {
+          const coords = await forwardGeocode(`${s.area ?? s.name} ${region} ${country}`);
+          return coords ? { id: s.id, latlng: coords } : null;
+        })
+      );
+      if (cancelled) return;
+      const fixMap = new Map(fixes.filter(Boolean).map((f) => [f.id, f.latlng]));
+      if (fixMap.size === 0) return;
+      setSchedule((prev) =>
+        prev.map((s) => (fixMap.has(s.id) ? { ...s, latlng: fixMap.get(s.id) } : s))
+      );
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schedule, step, country, region]);
+
+  // Keep lodging anchors in the schedule in sync with selectedLodging.
+  // When the user changes hotel in Showbox B, every lodging-start / lodging-end
+  // anchor across all days is rewritten in place by swapPrimaryLodging.
+  useEffect(() => {
+    if (!schedule.length) return;
+    const currentLodging = getPrimaryLodging(schedule);
+    const target = customLodging ?? (dynLodgings ?? []).find((l) => l.id === selectedLodgingId);
+    if (!target) return;
+    if (currentLodging && currentLodging.name === target.name && currentLodging.latlng?.[0] === target.latlng?.[0]) return;
+    setSchedule((prev) => swapPrimaryLodging(prev, target));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [customLodging, selectedLodgingId, dynLodgings]);
 
   // ── Loading elapsed timer ─────────────────────────────────────────────────
   useEffect(() => {
@@ -432,10 +565,28 @@ export default function App() {
     if (activeDay > dayCount) setActiveDay(1);
   }, [dayCount, activeDay]);
 
+  // Read activities directly from schedule (Slot[]). Falls back to legacy
+  // dayAssignments+activeContents path only when schedule is empty.
   const dayActivities = useMemo(() => {
+    const slots = getActivitySlots(schedule, activeDay);
+    if (slots.length > 0) {
+      return slots.map((s) => ({
+        id: s.id,
+        name: s.name,
+        area: s.area,
+        type: s.category,
+        latlng: s.latlng,
+        indoor: s.indoor,
+        visitScore: s.visitScore,
+        img: s.img,
+        llmStayNote: s.llmStayNote,
+        assignedDay: s.day,
+        time: s.startTime,
+      }));
+    }
     const ids = liveRoutePreview?.[activeDay] ?? [];
     return ids.map((id) => activeContents.find((c) => c.id === id)).filter(Boolean);
-  }, [liveRoutePreview, activeDay, activeContents]);
+  }, [schedule, activeDay, liveRoutePreview, activeContents]);
 
   // Build stop sequence for the active day: [lodging → activities → lodging].
   // Uses stable ids so Google Directions segments can be looked up per pair.
@@ -589,25 +740,31 @@ export default function App() {
   const pickedContents = useMemo(() => {
     if (!optimizedDayPicks) return [];
     const out = [];
-    [1, 2, 3].forEach((d) => {
-      optimizedDayPicks[d].forEach((id) => {
+    const days = Object.keys(optimizedDayPicks).map(Number).sort((a, b) => a - b);
+    for (const d of days) {
+      const ids = optimizedDayPicks[d];
+      if (!Array.isArray(ids)) continue;
+      for (const id of ids) {
         const c = activeContents.find((item) => item.id === id);
         if (c) out.push({ ...c, assignedDay: d });
-      });
-    });
+      }
+    }
     return out;
-  }, [optimizedDayPicks]);
+  }, [optimizedDayPicks, activeContents]);
 
   const spotNumberById = useMemo(() => {
     if (!optimizedDayPicks) return new Map();
     const map = new Map();
     let n = 0;
-    [1, 2, 3].forEach((d) => {
-      optimizedDayPicks[d].forEach((id) => {
+    const days = Object.keys(optimizedDayPicks).map(Number).sort((a, b) => a - b);
+    for (const d of days) {
+      const ids = optimizedDayPicks[d];
+      if (!Array.isArray(ids)) continue;
+      for (const id of ids) {
         n += 1;
         map.set(id, n);
-      });
-    });
+      }
+    }
     return map;
   }, [optimizedDayPicks]);
 
@@ -616,27 +773,28 @@ export default function App() {
   const scheduleByDay = useMemo(() => {
     // When modifiedSchedule is active, use it (it's a flat array with assignedDay)
     if (modifiedSchedule) {
-      const days = [1, 2, 3];
+      const days = [...new Set(modifiedSchedule.map((item) => item.assignedDay))].sort();
       return days
         .map((d) => ({
           day: d,
           items: modifiedSchedule
             .filter((item) => item.assignedDay === d)
-            .sort((a, b) => a.time.localeCompare(b.time)),
+            .sort((a, b) => (a.time ?? "").localeCompare(b.time ?? "")),
         }))
         .filter((g) => g.items.length > 0);
     }
     if (!optimizedDayPicks) return [];
-    return [1, 2, 3]
+    const days = Object.keys(optimizedDayPicks).map(Number).sort((a, b) => a - b);
+    return days
       .map((d) => ({
         day: d,
-        items: optimizedDayPicks[d].map((id) => {
+        items: (optimizedDayPicks[d] ?? []).map((id) => {
           const c = activeContents.find((item) => item.id === id);
           return c ? { ...c, assignedDay: d } : null;
         }).filter(Boolean),
       }))
       .filter((g) => g.items.length > 0);
-  }, [optimizedDayPicks, modifiedSchedule]);
+  }, [optimizedDayPicks, modifiedSchedule, activeContents]);
 
   const groupedPickContents = useMemo(() => {
     const base = recommended.length ? recommended : activeContents;
@@ -1426,6 +1584,30 @@ export default function App() {
                             />
                           </div>
                         </div>
+                        {/* Floating Co-Pilot FAB — toggles the real-time
+                            chat panel that reads/writes the live schedule */}
+                        <button
+                          type="button"
+                          className={`copilot-fab${copilotOpen ? " copilot-fab--active" : ""}`}
+                          onClick={() => setCopilotOpen((v) => !v)}
+                          title={copilotOpen ? "Co-Pilot 닫기" : "AI Co-Pilot 열기"}
+                        >
+                          {copilotOpen ? "✕" : "🤖"}
+                        </button>
+                        {copilotOpen && (
+                          <div className="copilot-panel-wrap">
+                            <ErrorBoundary label="Co-Pilot 패널">
+                              <CopilotPanel
+                                schedule={schedule}
+                                onScheduleChange={setSchedule}
+                                currentTime={currentTimeStr}
+                                weather={weather ? `${weather.description} ${weather.temp}` : "맑음"}
+                                location={`${region} ${country}`}
+                                onLog={appendLog}
+                              />
+                            </ErrorBoundary>
+                          </div>
+                        )}
                       </div>
                     )}
                     {/* Shared bottom action bar — rendered for all steps that need
@@ -1470,11 +1652,32 @@ export default function App() {
                             <span className="step0-hero__fsd-beta">BETA</span>
                           </label>
                         </div>
+                        {!destActiveQuestion && destSuggestions.length === 0 && (
+                          <div className="step0-theme-chips">
+                            <span className="step0-theme-chips__hint">빠른 시작 — 원하는 vibe 를 고르거나 직접 입력하세요</span>
+                            <div className="step0-theme-chips__grid">
+                              {THEME_CHIPS.map((t) => (
+                                <button
+                                  key={t.label}
+                                  type="button"
+                                  className="step0-theme-chip"
+                                  onClick={() => handleThemeChip(t.seed)}
+                                  title={`"${t.seed}" 로 입력창 채우기`}
+                                  disabled={destLoading}
+                                >
+                                  <span className="step0-theme-chip__icon">{t.icon}</span>
+                                  <span className="step0-theme-chip__label">{t.label}</span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                         <div className="step0-hero__input-wrap">
                           <input
+                            ref={destInputRef}
                             type="text"
                             className="step0-hero__input"
-                            placeholder={destActiveQuestion === "__custom__" ? "예: 가족여행이라 아이가 즐길 수 있는 곳, 예산 100만원 이내…" : destActiveQuestion ? "답변을 입력하세요…" : "따뜻한 곳에서 맛집 투어, 유럽 미술관 여행, 일본 온천 여행…"}
+                            placeholder={destActiveQuestion === "__custom__" ? "예: 가족여행이라 아이가 즐길 수 있는 곳, 예산 100만원 이내…" : destActiveQuestion ? "답변을 입력하세요…" : "예: 일본 힐링 여행, 가성비 유럽, 따뜻한 곳 맛집 투어…"}
                             value={destQuery}
                             onChange={(e) => setDestQuery(e.target.value)}
                             onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); fsdMode ? handleAutopilot() : handleDestQuery(); } }}
