@@ -17,13 +17,18 @@ import { useEffect, useMemo, useRef, useState } from "react";
  *   className:          extra CSS class
  */
 
+// ─── Map ID (optional) — enables AdvancedMarkerElement over deprecated Marker ─
+// Set VITE_GOOGLE_MAPS_MAP_ID in .env to use AdvancedMarkerElement.
+// Without a Map ID, inline DARK_MAP_STYLES apply and legacy google.maps.Marker is used.
+const GOOGLE_MAPS_MAP_ID = import.meta.env.VITE_GOOGLE_MAPS_MAP_ID || null;
+
 // ─── Custom SVG pin factories ────────────────────────────────────────────
 // Markers carry an optional `pin: { kind, color, number }` spec which this
 // component turns into a Google Maps icon. Keeps generation inside the view
 // so parent code doesn't have to touch window.google.maps primitives.
-function buildNumberedPinIcon(number, color = "#ffd23f") {
-  if (!window.google?.maps) return null;
-  const svg =
+
+function buildNumberedPinSvg(number, color = "#ffd23f") {
+  return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="40" height="50" viewBox="0 0 40 50">` +
     `<defs><filter id="sh" x="-30%" y="-30%" width="160%" height="160%">` +
     `<feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#000" flood-opacity="0.55"/>` +
@@ -33,17 +38,12 @@ function buildNumberedPinIcon(number, color = "#ffd23f") {
     `<circle cx="20" cy="19" r="13" fill="#0f0f12"/>` +
     `<text x="20" y="25" text-anchor="middle" fill="${color}" ` +
     `font-family="-apple-system,system-ui,sans-serif" font-size="16" font-weight="900">${number}</text>` +
-    `</svg>`;
-  return {
-    url: "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(svg),
-    scaledSize: new window.google.maps.Size(40, 50),
-    anchor: new window.google.maps.Point(20, 50),
-  };
+    `</svg>`
+  );
 }
 
-function buildHotelPinIcon(color = "#ffa33a") {
-  if (!window.google?.maps) return null;
-  const svg =
+function buildHotelPinSvg(color = "#ffa33a") {
+  return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="44" height="54" viewBox="0 0 44 54">` +
     `<defs><filter id="sh2" x="-30%" y="-30%" width="160%" height="160%">` +
     `<feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#000" flood-opacity="0.6"/>` +
@@ -52,9 +52,24 @@ function buildHotelPinIcon(color = "#ffa33a") {
     `fill="${color}" stroke="#0f0f12" stroke-width="3" filter="url(#sh2)"/>` +
     `<circle cx="22" cy="21" r="14" fill="#0f0f12"/>` +
     `<text x="22" y="28" text-anchor="middle" font-size="18">🏨</text>` +
-    `</svg>`;
+    `</svg>`
+  );
+}
+
+// Legacy icon object for google.maps.Marker (used when GOOGLE_MAPS_MAP_ID is not set)
+function buildNumberedPinIcon(number, color = "#ffd23f") {
+  if (!window.google?.maps) return null;
   return {
-    url: "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(svg),
+    url: "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(buildNumberedPinSvg(number, color)),
+    scaledSize: new window.google.maps.Size(40, 50),
+    anchor: new window.google.maps.Point(20, 50),
+  };
+}
+
+function buildHotelPinIcon(color = "#ffa33a") {
+  if (!window.google?.maps) return null;
+  return {
+    url: "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(buildHotelPinSvg(color)),
     scaledSize: new window.google.maps.Size(44, 54),
     anchor: new window.google.maps.Point(22, 54),
   };
@@ -69,6 +84,39 @@ function resolvePinIcon(pin) {
     return buildHotelPinIcon(pin.color);
   }
   return null;
+}
+
+// DOM element content for AdvancedMarkerElement (used when GOOGLE_MAPS_MAP_ID is set)
+function buildSvgImgElement(svgString, width, height) {
+  const img = document.createElement("img");
+  img.src = "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(svgString);
+  img.style.width = width + "px";
+  img.style.height = height + "px";
+  img.style.display = "block";
+  return img;
+}
+
+function resolveAdvancedMarkerContent(pin, label) {
+  if (pin?.kind === "number" && pin?.number != null) {
+    return buildSvgImgElement(buildNumberedPinSvg(pin.number, pin.color), 40, 50);
+  }
+  if (pin?.kind === "hotel") {
+    return buildSvgImgElement(buildHotelPinSvg(pin.color), 44, 54);
+  }
+  // No custom icon — use PinElement with an optional label glyph
+  if (label != null && window.google?.maps?.marker?.PinElement) {
+    const labelText = typeof label === "object" ? label?.text ?? "" : String(label ?? "");
+    if (labelText) {
+      const pinEl = new window.google.maps.marker.PinElement({
+        glyph: labelText,
+        background: "#ffd23f",
+        borderColor: "#0f0f12",
+        glyphColor: "#0f0f12",
+      });
+      return pinEl.element;
+    }
+  }
+  return null; // default Google pin
 }
 
 // Dark-mode styles matching the MGS cyber theme of the rest of the app
@@ -140,7 +188,10 @@ export default function GoogleMapView({
       fullscreenControl: false,
       zoomControl: true,
       clickableIcons: false,
-      styles: DARK_MAP_STYLES,
+      // mapId enables AdvancedMarkerElement; when set, inline styles are replaced
+      // by cloud-based styling configured for that Map ID in the Google Cloud Console.
+      // Without a mapId the inline DARK_MAP_STYLES apply and legacy Marker is used.
+      ...(GOOGLE_MAPS_MAP_ID ? { mapId: GOOGLE_MAPS_MAP_ID } : { styles: DARK_MAP_STYLES }),
       backgroundColor: "#0f0f12",
       gestureHandling: "greedy",
     });
@@ -176,19 +227,35 @@ export default function GoogleMapView({
     markerRefs.current = [];
     if (markers.length === 0) return;
     const bounds = new window.google.maps.LatLngBounds();
+    const useAdvanced = Boolean(GOOGLE_MAPS_MAP_ID && window.google?.maps?.marker?.AdvancedMarkerElement);
     markers.forEach((m) => {
-      const icon = resolvePinIcon(m.pin);
-      const marker = new window.google.maps.Marker({
-        position: { lat: m.lat, lng: m.lng },
-        map: mapRef.current,
-        title: m.title,
-        label: icon ? undefined : m.label,
-        icon: icon ?? undefined,
-        zIndex: m.pin?.kind === "hotel" ? 1000 : undefined,
-      });
-      marker.addListener("click", () => {
-        onMarkerClickRef.current?.(m.id);
-      });
+      let marker;
+      if (useAdvanced) {
+        const content = resolveAdvancedMarkerContent(m.pin, m.label);
+        marker = new window.google.maps.marker.AdvancedMarkerElement({
+          position: { lat: m.lat, lng: m.lng },
+          map: mapRef.current,
+          title: m.title,
+          ...(content ? { content } : {}),
+          zIndex: m.pin?.kind === "hotel" ? 1000 : undefined,
+        });
+        marker.addListener("gmp-click", () => {
+          onMarkerClickRef.current?.(m.id);
+        });
+      } else {
+        const icon = resolvePinIcon(m.pin);
+        marker = new window.google.maps.Marker({
+          position: { lat: m.lat, lng: m.lng },
+          map: mapRef.current,
+          title: m.title,
+          label: icon ? undefined : m.label,
+          icon: icon ?? undefined,
+          zIndex: m.pin?.kind === "hotel" ? 1000 : undefined,
+        });
+        marker.addListener("click", () => {
+          onMarkerClickRef.current?.(m.id);
+        });
+      }
       markerRefs.current.push(marker);
       bounds.extend({ lat: m.lat, lng: m.lng });
     });
