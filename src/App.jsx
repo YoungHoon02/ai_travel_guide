@@ -875,9 +875,7 @@ export default function App() {
       const itinerary = await generateItinerary(country, region, tags, days, transportCtx, logCb);
       if (itinerary?.days) {
         const allSpots = [];
-        const newAssignments = {};
         for (const d of itinerary.days) {
-          newAssignments[d.day] = (d.spots ?? []).map((s) => s.id);
           for (const s of (d.spots ?? [])) {
             allSpots.push({ ...s, day: d.day, assignedDay: d.day });
           }
@@ -889,7 +887,22 @@ export default function App() {
         setDynContents(refined);
         setRecommended(refined);
         setDynItinerary(itinerary);
-        setDayAssignments(newAssignments);
+        // Build schedule directly from enriched itinerary so the Edit View reflects
+        // the new spots immediately — avoids reading stale dynContents via the
+        // setDayAssignments shim before React applies the setDynContents update.
+        const lodgingInfo = customLodging ?? (dynLodgings ?? [])[0] ?? null;
+        const newDayCount = itinerary.days.length || 3;
+        const enrichedItinerary = {
+          ...itinerary,
+          days: itinerary.days.map((d) => ({
+            ...d,
+            spots: (d.spots ?? []).map((s) => {
+              const found = refined.find((r) => r.id === s.id);
+              return found ? { ...s, latlng: found.latlng } : s;
+            }),
+          })),
+        };
+        setSchedule(scheduleFromItineraryLLM(enrichedItinerary, lodgingInfo, newDayCount));
         setRefinePrompt("");
       }
     } catch (err) {
@@ -897,7 +910,7 @@ export default function App() {
     } finally {
       setIsRefining(false);
     }
-  }, [refinePrompt, isRefining, country, region, days, move, activeMoves, tags]);
+  }, [refinePrompt, isRefining, country, region, days, move, activeMoves, tags, customLodging, dynLodgings]);
 
   // ── DnD setup ─────────────────────────────────────────────────────────
   const dndSensors = useSensors(
@@ -1195,13 +1208,23 @@ export default function App() {
     } finally {
       setDestMoreLoading(false);
     }
-  }, [destLoading, destQueriedText, destChatHistory]);
+  }, [destMoreLoading, destQueriedText, destSuggestions, destChatHistory, maxDestCount]);
 
   const restartScenario = () => {
     setStep(0);
-    setDayAssignments({ 1: [], 2: [], 3: [] });
-    setSelectedLodgingId(activeLodgings[0]?.id ?? "");
+    // Reset schedule and all LLM-generated dynamic data so the new trip
+    // starts fresh and doesn't re-use the previous destination's hotels/spots.
+    setSchedule([]);
+    setDynLodgings(null);
+    setDynContents(null);
+    setDynItinerary(null);
+    setCustomLodging(null);
+    setRecommended([]);
+    lodgingPromiseRef.current = null;
+    itineraryPromiseRef.current = null;
+    setSelectedLodgingId(LODGINGS[0]?.id ?? "");
     setOptimizedDayPicks(null);
+    setEditDaySegments([]);
     setHighlightIds([]);
     setTransitPopup(null);
     setMapInfo("핀 또는 이동 경로를 클릭하면 해당 일정이 강조됩니다.");
@@ -1209,6 +1232,15 @@ export default function App() {
     setChatHistory([]);
     setModifiedSchedule(null);
     setScheduleDirections([]);
+    // Reset destination search state
+    setDestQuery("");
+    setDestSuggestions([]);
+    setSelectedDest(null);
+    setDestFollowUps([]);
+    setDestChatHistory([]);
+    setDestFlowHistory([]);
+    setDestQueriedText("");
+    setDestActiveQuestion(null);
   };
 
 

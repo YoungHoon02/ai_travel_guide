@@ -297,7 +297,7 @@ export async function callLLM({ userMessage, plan, currentTime, location, weathe
       raw = (resData.candidates?.[0]?.content?.parts ?? []).map((p) => p.text).filter(Boolean).join("\n");
     } else if (ACTIVE_LLM.provider === "claude") {
       const claudeMessages = chatMessages.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
-      reqBody = { model: ACTIVE_LLM.model, system: systemContent, max_tokens: 1200, temperature: 0.7, messages: claudeMessages };
+      reqBody = { model: ACTIVE_LLM.model, system: systemContent, max_tokens: 4096, temperature: 0.7, messages: claudeMessages };
       const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json", "x-api-key": ACTIVE_LLM.key, "anthropic-version": "2023-06-01" }, body: JSON.stringify(reqBody) });
       if (!res.ok) throw new Error("claude");
       resData = await res.json();
@@ -568,7 +568,9 @@ Strict rules:
 
 // ─── Generate complete itinerary (spots pre-assigned to days) ────────────────
 export async function generateItinerary(country, city, tags, days, transportName, onLog) {
-  const dayCount = parseInt(days) || 3;
+  // Extract day count from formats like "2박 3일" (parseInt alone would return 2).
+  const daysMatch = String(days ?? "").match(/(\d+)\s*일/);
+  const dayCount = daysMatch ? parseInt(daysMatch[1], 10) : (parseInt(days, 10) || 3);
   const tagStr = tags.length > 0 ? tags.join(", ") : "전체";
   const msg = `${country} ${city} ${dayCount - 1}박${dayCount}일 여행 일정 생성.\n선호 성향: ${tagStr}\n이동수단: ${transportName}\n${dayCount}일간의 완벽한 일정을 만들어줘.`;
   const result = await callGenericLLM(ITINERARY_PROMPT, msg, onLog, "itinerary");

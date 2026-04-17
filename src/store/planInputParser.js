@@ -299,6 +299,7 @@ export function parseLLMResponse(responseText) {
       requiresLLM: false,
       interpretation: obj.interpretation ?? "",
       tip: obj.tip ?? null,
+      enrichment: obj.enrichment ?? null,
       source: "llm",
     };
   } catch {
