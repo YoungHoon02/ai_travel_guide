@@ -266,6 +266,12 @@ describe("buildActivityNumberMap", () => {
     expect(map.get("b")).toBe(2);
     expect(map.get("c")).toBe(3);
   });
+
+  it("skips items without id and keeps numbering compact", () => {
+    const map = buildActivityNumberMap([{ id: "a" }, {}, { id: "b" }]);
+    expect(map.get("a")).toBe(1);
+    expect(map.get("b")).toBe(2);
+  });
 });
 
 describe("hasCompleteDirectionCoverage", () => {

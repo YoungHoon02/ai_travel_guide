@@ -153,8 +153,9 @@ export function buildActivityNumberMap(activities) {
   const map = new Map();
   let n = 0;
   for (const a of activities ?? []) {
+    if (a?.id === null || a?.id === undefined) continue;
     n += 1;
-    if (a?.id != null) map.set(a.id, n);
+    map.set(a.id, n);
   }
   return map;
 }

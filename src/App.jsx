@@ -1583,8 +1583,12 @@ export default function App() {
                               <span className="legend-sep">·</span>
                               <span className="legend-label-dim">{moveProfile?.icon} {moveProfile?.name}</span>
                               <span className="legend-sep">·</span>
-                              <span className="legend-label-dim">
-                                좌표 {mappedActivityCount}/{dayActivities.length} · 경로 {realSegmentCount}/{expectedSegmentCount}
+                              <span
+                                className="legend-label-dim"
+                                title={`API cross-check · Coordinates ${mappedActivityCount}/${dayActivities.length} · Routes ${realSegmentCount}/${expectedSegmentCount}`}
+                                aria-label={`API cross-check: ${mappedActivityCount} of ${dayActivities.length} activities geocoded, ${realSegmentCount} of ${expectedSegmentCount} route segments with real Google path`}
+                              >
+                                좌표(Coordinates) {mappedActivityCount}/{dayActivities.length} · 경로(Routes) {realSegmentCount}/{expectedSegmentCount}
                               </span>
                               {editDaySegmentsLoading && <span className="legend-label-dim">· 계산중…</span>}
                             </div>
@@ -1603,8 +1607,9 @@ export default function App() {
                                   : []),
                                 ...dayActivities
                                   .filter((a) => a.latlng)
+                                  .filter((a) => dayActivityNumberById.has(a.id))
                                   .map((a) => {
-                                    const number = dayActivityNumberById.get(a.id) ?? 0;
+                                    const number = dayActivityNumberById.get(a.id);
                                     return {
                                     id: a.id,
                                     lat: a.latlng[0],
