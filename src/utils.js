@@ -70,6 +70,21 @@ export function softenContextLoss(gl) {
   gl.forceContextLoss = () => { if (dispose) dispose(); };
 }
 
+/**
+ * Detach a Google Maps overlay instance from the map.
+ * Supports both legacy overlays (setMap) and AdvancedMarkerElement (map prop).
+ */
+export function detachGoogleMapOverlay(overlay) {
+  if (!overlay) return;
+  if (typeof overlay.setMap === "function") {
+    overlay.setMap(null);
+    return;
+  }
+  if ("map" in overlay) {
+    overlay.map = null;
+  }
+}
+
 // ─── Geometry helpers ─────────────────────────────────────────────────────────
 
 /** Squared Euclidean distance between two [lat, lng] pairs. */
@@ -131,6 +146,37 @@ export function buildTransitLikeRoute(points, moveId) {
     );
   }
   return route;
+}
+
+/** Build activity numbering by current day order (1-based). */
+export function buildActivityNumberMap(activities) {
+  const map = new Map();
+  let n = 0;
+  for (const a of activities ?? []) {
+    n += 1;
+    if (a?.id != null) map.set(a.id, n);
+  }
+  return map;
+}
+
+/**
+ * Whether every consecutive pair of valid (latlng) stops has a real polyline.
+ * Used to avoid rendering partial "real" routes that can look disconnected.
+ */
+export function hasCompleteDirectionCoverage(stops, segments) {
+  const validStops = (stops ?? []).filter((s) => Array.isArray(s?.latlng));
+  const expected = Math.max(0, validStops.length - 1);
+  if (expected === 0) return false;
+  const segMap = new Map(
+    (segments ?? [])
+      .filter((s) => Array.isArray(s?.polylinePath) && s.polylinePath.length >= 2)
+      .map((s) => [`${s.fromId}→${s.toId}`, s])
+  );
+  for (let i = 1; i < validStops.length; i += 1) {
+    const key = `${validStops[i - 1].id}→${validStops[i].id}`;
+    if (!segMap.has(key)) return false;
+  }
+  return true;
 }
 
 // ─── Score helpers ────────────────────────────────────────────────────────────

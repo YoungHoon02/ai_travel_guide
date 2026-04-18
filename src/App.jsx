@@ -22,7 +22,14 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import { calcProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil, parseBooleanEnv } from "./utils.js";
+import {
+  calcProgress,
+  sumVisitScores as sumVisitScoresUtil,
+  assignOptimalDays as assignOptimalDaysUtil,
+  parseBooleanEnv,
+  buildActivityNumberMap,
+  hasCompleteDirectionCoverage,
+} from "./utils.js";
 import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callLLM, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
 import {
   STEP_LABELS, RESULT_STEP, LAST_WIZARD_STEP, STAY_LOAD_TARGET, TRAVEL_TAGS,
@@ -713,10 +720,22 @@ export default function App() {
   // segment's polylinePath into a single continuous path. Falls back to a
   // straight-line path through stops when real directions are unavailable.
   const mergedRoutePath = useMemo(() => {
-    const realSegs = editDaySegments.filter((s) => Array.isArray(s.polylinePath) && s.polylinePath.length >= 2);
-    if (realSegs.length > 0) {
+    const coverageComplete = hasCompleteDirectionCoverage(editDayStops, editDaySegments);
+    const fallback = editDayStops.filter((s) => s.latlng).map((s) => s.latlng);
+    if (!coverageComplete) {
+      return fallback.length >= 2 ? fallback : [];
+    }
+    const validStops = editDayStops.filter((s) => s.latlng);
+    const segLookup = new Map(editDaySegments.map((s) => [`${s.fromId}→${s.toId}`, s]));
+    if (validStops.length >= 2) {
       const merged = [];
-      for (const seg of realSegs) {
+      for (let i = 1; i < validStops.length; i += 1) {
+        const from = validStops[i - 1];
+        const to = validStops[i];
+        const seg = segLookup.get(`${from.id}→${to.id}`);
+        if (!Array.isArray(seg?.polylinePath) || seg.polylinePath.length < 2) {
+          return fallback.length >= 2 ? fallback : [];
+        }
         for (const pt of seg.polylinePath) {
           const last = merged[merged.length - 1];
           if (!last || last[0] !== pt[0] || last[1] !== pt[1]) merged.push(pt);
@@ -724,11 +743,32 @@ export default function App() {
       }
       if (merged.length >= 2) return merged;
     }
-    const fallback = editDayStops.filter((s) => s.latlng).map((s) => s.latlng);
     return fallback.length >= 2 ? fallback : [];
   }, [editDaySegments, editDayStops]);
 
-  const mergedRouteIsReal = editDaySegments.some((s) => Array.isArray(s.polylinePath) && s.polylinePath.length >= 2);
+  const mergedRouteIsReal = useMemo(
+    () => hasCompleteDirectionCoverage(editDayStops, editDaySegments),
+    [editDayStops, editDaySegments]
+  );
+
+  const dayActivityNumberById = useMemo(
+    () => buildActivityNumberMap(dayActivities),
+    [dayActivities]
+  );
+
+  const mappedActivityCount = useMemo(
+    () => dayActivities.filter((a) => a.latlng).length,
+    [dayActivities]
+  );
+
+  const expectedSegmentCount = useMemo(
+    () => Math.max(0, editDayStops.filter((s) => s.latlng).length - 1),
+    [editDayStops]
+  );
+  const realSegmentCount = useMemo(
+    () => editDaySegments.filter((s) => Array.isArray(s.polylinePath) && s.polylinePath.length >= 2).length,
+    [editDaySegments]
+  );
 
   const canNext = useMemo(() => {
     if (step === 0) return selectedDest !== null || Boolean(selectedPlanId);
@@ -1542,6 +1582,10 @@ export default function App() {
                               </span>
                               <span className="legend-sep">·</span>
                               <span className="legend-label-dim">{moveProfile?.icon} {moveProfile?.name}</span>
+                              <span className="legend-sep">·</span>
+                              <span className="legend-label-dim">
+                                좌표 {mappedActivityCount}/{dayActivities.length} · 경로 {realSegmentCount}/{expectedSegmentCount}
+                              </span>
                               {editDaySegmentsLoading && <span className="legend-label-dim">· 계산중…</span>}
                             </div>
                             <GoogleMapView
@@ -1559,17 +1603,20 @@ export default function App() {
                                   : []),
                                 ...dayActivities
                                   .filter((a) => a.latlng)
-                                  .map((a, i) => ({
+                                  .map((a) => {
+                                    const number = dayActivityNumberById.get(a.id) ?? 0;
+                                    return {
                                     id: a.id,
                                     lat: a.latlng[0],
                                     lng: a.latlng[1],
-                                    title: `${i + 1}. ${a.name}`,
+                                    title: `${number}. ${a.name}`,
                                     pin: {
                                       kind: "number",
-                                      number: i + 1,
+                                      number,
                                       color: highlightItemId === a.id ? "#7fffff" : "#5ecfcf",
                                     },
-                                  })),
+                                  };
+                                  }),
                               ]}
                               polylinePositions={mergedRoutePath}
                               polylineOptions={{

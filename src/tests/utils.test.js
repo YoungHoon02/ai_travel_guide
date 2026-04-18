@@ -17,6 +17,9 @@ import {
   sumVisitScores,
   assignOptimalDays,
   simulateLLMResponse,
+  detachGoogleMapOverlay,
+  buildActivityNumberMap,
+  hasCompleteDirectionCoverage,
 } from "../utils.js";
 
 // ─── timeToMinutes ────────────────────────────────────────────────────────────
@@ -235,6 +238,60 @@ describe("buildTransitLikeRoute", () => {
     // Points should differ between modes
     expect(taxi[1]).not.toEqual(car[1]);
     expect(taxi[1]).not.toEqual(pub[1]);
+  });
+});
+
+// ─── map helpers ───────────────────────────────────────────────────────────────
+
+describe("detachGoogleMapOverlay", () => {
+  it("uses setMap(null) when available", () => {
+    const calls = [];
+    const overlay = { setMap: (v) => calls.push(v), map: { id: "map" } };
+    detachGoogleMapOverlay(overlay);
+    expect(calls).toEqual([null]);
+    expect(overlay.map).toEqual({ id: "map" });
+  });
+
+  it("falls back to map=null when setMap is missing", () => {
+    const overlay = { map: { id: "map" } };
+    detachGoogleMapOverlay(overlay);
+    expect(overlay.map).toBeNull();
+  });
+});
+
+describe("buildActivityNumberMap", () => {
+  it("keeps day order and returns 1-based numbering", () => {
+    const map = buildActivityNumberMap([{ id: "a" }, { id: "b" }, { id: "c" }]);
+    expect(map.get("a")).toBe(1);
+    expect(map.get("b")).toBe(2);
+    expect(map.get("c")).toBe(3);
+  });
+});
+
+describe("hasCompleteDirectionCoverage", () => {
+  it("returns true when every consecutive stop has a real polyline", () => {
+    const stops = [
+      { id: "s0", latlng: [1, 1] },
+      { id: "s1", latlng: [2, 2] },
+      { id: "s2", latlng: [3, 3] },
+    ];
+    const segments = [
+      { fromId: "s0", toId: "s1", polylinePath: [[1, 1], [2, 2]] },
+      { fromId: "s1", toId: "s2", polylinePath: [[2, 2], [3, 3]] },
+    ];
+    expect(hasCompleteDirectionCoverage(stops, segments)).toBe(true);
+  });
+
+  it("returns false when any pair is missing", () => {
+    const stops = [
+      { id: "s0", latlng: [1, 1] },
+      { id: "s1", latlng: [2, 2] },
+      { id: "s2", latlng: [3, 3] },
+    ];
+    const segments = [
+      { fromId: "s0", toId: "s1", polylinePath: [[1, 1], [2, 2]] },
+    ];
+    expect(hasCompleteDirectionCoverage(stops, segments)).toBe(false);
   });
 });
 

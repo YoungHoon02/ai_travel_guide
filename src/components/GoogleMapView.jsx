@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { detachGoogleMapOverlay } from "../utils.js";
 
 /**
  * Declarative Google Maps component.
@@ -223,7 +224,7 @@ export default function GoogleMapView({
   // Update markers
   useEffect(() => {
     if (!mapRef.current) return;
-    markerRefs.current.forEach((m) => m.setMap(null));
+    markerRefs.current.forEach((m) => detachGoogleMapOverlay(m));
     markerRefs.current = [];
     if (markers.length === 0) return;
     const bounds = new window.google.maps.LatLngBounds();
@@ -310,7 +311,7 @@ export default function GoogleMapView({
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      markerRefs.current.forEach((m) => m.setMap(null));
+      markerRefs.current.forEach((m) => detachGoogleMapOverlay(m));
       markerRefs.current = [];
       if (polylineRef.current) polylineRef.current.setMap(null);
     };
