@@ -1,4 +1,4 @@
-import { escapeHtml, simulateLLMResponse } from "./utils.js";
+import { escapeHtml, parseBooleanEnv, simulateLLMResponse } from "./utils.js";
 import {
   DEST_SYSTEM_PROMPT,
   TRANSPORT_PROMPT,
@@ -72,6 +72,152 @@ const ROUTES_API_URL = "https://routes.googleapis.com/directions/v2:computeRoute
 const ROUTES_TRAVEL_MODE_MAP = {
   DRIVING: "DRIVE", WALKING: "WALK", BICYCLING: "BICYCLE", TRANSIT: "TRANSIT",
 };
+const PREFER_ROUTES_API = parseBooleanEnv(import.meta.env.VITE_PREFER_ROUTES_API, false);
+const ENHANCED_TRANSIT = parseBooleanEnv(import.meta.env.VITE_ENHANCED_TRANSIT, true);
+const ENHANCED_TRAFFIC = parseBooleanEnv(import.meta.env.VITE_ROUTE_TRAFFIC_COLORS, true);
+const ALLOW_LEGACY_DIRECTIONS_FALLBACK = parseBooleanEnv(import.meta.env.VITE_ALLOW_LEGACY_DIRECTIONS_FALLBACK, false);
+const ROUTES_BASE_FIELD_MASK = [
+  "routes.duration",
+  "routes.distanceMeters",
+  "routes.polyline",
+  "routes.legs.steps.navigationInstruction",
+  "routes.legs.steps.staticDuration",
+  "routes.legs.steps.distanceMeters",
+  "routes.legs.steps.travelMode",
+  "routes.legs.steps.polyline",
+];
+const ROUTES_TRANSIT_FIELD_MASK = [
+  "routes.legs.steps.transitDetails.transitLine.name",
+  "routes.legs.steps.transitDetails.transitLine.nameShort",
+  "routes.legs.steps.transitDetails.transitLine.vehicle.type",
+  "routes.legs.steps.transitDetails.transitLine.vehicle.name",
+  "routes.legs.steps.transitDetails.headsign",
+  "routes.legs.steps.transitDetails.stopDetails.departureStop.name",
+  "routes.legs.steps.transitDetails.stopDetails.arrivalStop.name",
+  "routes.legs.steps.transitDetails.stopCount",
+];
+const ROUTES_TRAFFIC_FIELD_MASK = [
+  "routes.travelAdvisory",
+  "routes.legs.travelAdvisory",
+];
+const ROUTES_SOFT_DISABLE_WINDOW_MS = 5 * 60 * 1000;
+const DIRECTIONS_CACHE_TTL_MS = 2 * 60 * 1000;
+const DIRECTIONS_FAILURE_CACHE_TTL_MS = 20 * 1000;
+let routesApiDisabledUntil = 0;
+let lastRoutesApiErrorSig = "";
+let legacyDirectionsDisabledUntil = 0;
+let routesTrafficSupportState = "unknown"; // unknown | probing | supported | unsupported
+let routesTrafficUnsupportedUntil = 0;
+let routesTransitDetailsSupportState = "unknown"; // unknown | probing | supported | unsupported
+let routesTransitDetailsUnsupportedUntil = 0;
+const directionsCache = new Map();
+const directionsInFlight = new Map();
+
+function isValidLatLng(latlng) {
+  if (!Array.isArray(latlng) || latlng.length !== 2) return false;
+  const lat = Number(latlng[0]);
+  const lng = Number(latlng[1]);
+  return Number.isFinite(lat) && Number.isFinite(lng);
+}
+
+function parseDurationSeconds(durationText) {
+  if (!durationText) return null;
+  const m = String(durationText).match(/^([\d.]+)s$/i);
+  if (!m) return null;
+  const v = Math.round(Number.parseFloat(m[1]));
+  return Number.isFinite(v) ? v : null;
+}
+
+function normalizeTransitStep(transitDetails) {
+  if (!transitDetails) return null;
+  const line = transitDetails.transitLine ?? {};
+  const vehicle = line.vehicle ?? {};
+  const stopDetails = transitDetails.stopDetails ?? transitDetails;
+  return {
+    lineName: line.name ?? "",
+    lineShort: line.nameShort ?? "",
+    vehicleType: vehicle.type ?? "",
+    vehicleName: vehicle.name ?? "",
+    headsign: transitDetails.headsign ?? "",
+    departureStop: stopDetails.departureStop?.name ?? "",
+    arrivalStop: stopDetails.arrivalStop?.name ?? "",
+    stopCount: Number.isFinite(Number(transitDetails.stopCount)) ? Number(transitDetails.stopCount) : null,
+  };
+}
+
+function normalizeTrafficSpeed(speed) {
+  const normalized = String(speed ?? "").toUpperCase();
+  if (normalized === "NORMAL") return "NORMAL";
+  if (normalized === "SLOW") return "SLOW";
+  if (normalized === "TRAFFIC_JAM") return "TRAFFIC_JAM";
+  return "SPEED_UNSPECIFIED";
+}
+
+function trafficSpeedColor(speed) {
+  const normalized = normalizeTrafficSpeed(speed);
+  if (normalized === "NORMAL") return "#22c55e";
+  if (normalized === "SLOW") return "#f59e0b";
+  if (normalized === "TRAFFIC_JAM") return "#ef4444";
+  return "#64748b";
+}
+
+function extractTrafficIntervals(route) {
+  const routeIntervals = route?.travelAdvisory?.speedReadingIntervals;
+  if (Array.isArray(routeIntervals) && routeIntervals.length > 0) return routeIntervals;
+  const legIntervals = (route?.legs ?? []).flatMap((leg) => leg?.travelAdvisory?.speedReadingIntervals ?? []);
+  return legIntervals;
+}
+
+function clampTrafficIndex(value, fallback, maxIndex) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(maxIndex, Math.round(n)));
+}
+
+function buildTrafficSegments(polylinePath, intervals) {
+  if (!Array.isArray(polylinePath) || polylinePath.length < 2 || !Array.isArray(intervals) || intervals.length === 0) {
+    return [];
+  }
+  const maxIndex = polylinePath.length - 1;
+  const out = [];
+  for (const interval of intervals) {
+    const start = clampTrafficIndex(interval?.startPolylinePointIndex, 0, maxIndex);
+    const end = clampTrafficIndex(interval?.endPolylinePointIndex, maxIndex, maxIndex);
+    if (end <= start) continue;
+    const path = polylinePath.slice(start, end + 1);
+    if (path.length < 2) continue;
+    const speed = normalizeTrafficSpeed(interval?.speed);
+    out.push({
+      speed,
+      color: trafficSpeedColor(speed),
+      path,
+    });
+  }
+  return out;
+}
+
+function normalizeLegacyTransitStep(transit) {
+  if (!transit) return null;
+  const line = transit.line ?? {};
+  const vehicle = line.vehicle ?? {};
+  return {
+    lineName: line.name ?? "",
+    lineShort: line.short_name ?? "",
+    vehicleType: vehicle.type ?? "",
+    vehicleName: vehicle.name ?? "",
+    headsign: transit.headsign ?? "",
+    departureStop: transit.departure_stop?.name ?? "",
+    arrivalStop: transit.arrival_stop?.name ?? "",
+    stopCount: Number.isFinite(Number(transit.num_stops)) ? Number(transit.num_stops) : null,
+  };
+}
+
+function stripHtmlTags(value) {
+  return String(value ?? "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function formatRouteDuration(secs) {
   const h = Math.floor(secs / 3600);
@@ -85,73 +231,470 @@ function formatRouteDistance(meters) {
   return `${meters} m`;
 }
 
-export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING") {
-  const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
-  if (!apiKey) return null;
-  try {
+function buildDirectionCacheKey(originLatLng, destLatLng, travelMode) {
+  const oLat = Number(originLatLng[0]).toFixed(6);
+  const oLng = Number(originLatLng[1]).toFixed(6);
+  const dLat = Number(destLatLng[0]).toFixed(6);
+  const dLng = Number(destLatLng[1]).toFixed(6);
+  return `${travelMode}|${oLat},${oLng}|${dLat},${dLng}`;
+}
+
+function isSameLatLng(a, b) {
+  if (!isValidLatLng(a) || !isValidLatLng(b)) return false;
+  return Math.abs(Number(a[0]) - Number(b[0])) < 1e-6 && Math.abs(Number(a[1]) - Number(b[1])) < 1e-6;
+}
+
+function buildZeroDistanceDirection(latlng, travelMode) {
+  return {
+    duration: "0분",
+    durationSecs: 0,
+    distance: "0 m",
+    steps: [],
+    polylinePath: [latlng, latlng],
+    travelModeUsed: String(travelMode ?? "DRIVING").toUpperCase(),
+    transitSummary: null,
+    trafficSegments: [],
+  };
+}
+
+function fetchLegacyGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING") {
+  return new Promise((resolve) => {
+    if (Date.now() < legacyDirectionsDisabledUntil) {
+      resolve(null);
+      return;
+    }
+    if (!window.google?.maps?.DirectionsService || !window.google?.maps?.TravelMode) {
+      resolve(null);
+      return;
+    }
+    const modeMap = {
+      DRIVING: window.google.maps.TravelMode.DRIVING,
+      WALKING: window.google.maps.TravelMode.WALKING,
+      BICYCLING: window.google.maps.TravelMode.BICYCLING,
+      TRANSIT: window.google.maps.TravelMode.TRANSIT,
+    };
+    const req = {
+      origin: { lat: originLatLng[0], lng: originLatLng[1] },
+      destination: { lat: destLatLng[0], lng: destLatLng[1] },
+      travelMode: modeMap[travelMode] ?? window.google.maps.TravelMode.DRIVING,
+      provideRouteAlternatives: false,
+      region: "kr",
+    };
+    if (travelMode === "TRANSIT") {
+      req.transitOptions = { departureTime: new Date() };
+    }
+    if (travelMode === "DRIVING" && window.google?.maps?.TrafficModel) {
+      req.drivingOptions = {
+        departureTime: new Date(),
+        trafficModel: window.google.maps.TrafficModel.BEST_GUESS,
+      };
+    }
+
+    new window.google.maps.DirectionsService().route(req, (result, status) => {
+      if (status !== "OK" || !result?.routes?.[0]) {
+        if (String(status).toUpperCase() === "REQUEST_DENIED") {
+          // Legacy Directions API가 비활성화된 프로젝트에서는 반복 호출을 즉시 차단한다.
+          legacyDirectionsDisabledUntil = Date.now() + ROUTES_SOFT_DISABLE_WINDOW_MS;
+        }
+        resolve(null);
+        return;
+      }
+      const route = result.routes[0];
+      const leg = route.legs?.[0];
+      const durationSecs = leg?.duration_in_traffic?.value ?? leg?.duration?.value ?? null;
+      const steps = (leg?.steps ?? []).map((s) => ({
+        instruction: escapeHtml(stripHtmlTags(s.instructions).slice(0, 200)),
+        duration: s.duration?.text ?? (Number.isFinite(Number(s.duration?.value)) ? formatRouteDuration(Number(s.duration.value)) : ""),
+        distance: s.distance?.text ?? (Number.isFinite(Number(s.distance?.value)) ? formatRouteDistance(Number(s.distance.value)) : ""),
+        travelMode: String(s.travel_mode ?? travelMode).toUpperCase(),
+        transit: normalizeLegacyTransitStep(s.transit),
+      }));
+      const transitLineLabels = Array.from(
+        new Set(
+          steps
+            .filter((s) => s.travelMode === "TRANSIT" && s.transit)
+            .map((s) => s.transit.lineShort || s.transit.lineName || s.transit.vehicleName)
+            .filter(Boolean)
+        )
+      );
+      const inferredMode =
+        steps.find((s) => s.travelMode === "TRANSIT")?.travelMode ||
+        steps.find((s) => s.travelMode)?.travelMode ||
+        String(travelMode).toUpperCase();
+
+      resolve({
+        duration: leg?.duration_in_traffic?.text ?? leg?.duration?.text ?? (durationSecs ? formatRouteDuration(durationSecs) : null),
+        durationSecs,
+        distance: leg?.distance?.text ?? (Number.isFinite(Number(leg?.distance?.value)) ? formatRouteDistance(Number(leg.distance.value)) : null),
+        steps,
+        polylinePath: (route.overview_path ?? []).map((p) => [p.lat(), p.lng()]),
+        travelModeUsed: inferredMode,
+        transitSummary: transitLineLabels.length > 0 ? transitLineLabels.join(" · ") : null,
+      });
+    });
+  });
+}
+
+async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, apiKey) {
+  const isTransit = travelMode === "TRANSIT";
+  const isDriving = travelMode === "DRIVING";
+
+  if (Date.now() >= routesTrafficUnsupportedUntil && routesTrafficSupportState === "unsupported") {
+    routesTrafficSupportState = "unknown";
+  }
+  if (Date.now() >= routesTransitDetailsUnsupportedUntil && routesTransitDetailsSupportState === "unsupported") {
+    routesTransitDetailsSupportState = "unknown";
+  }
+
+  const canTryTrafficDetails =
+    isDriving &&
+    ENHANCED_TRAFFIC &&
+    Date.now() >= routesTrafficUnsupportedUntil &&
+    routesTrafficSupportState !== "unsupported" &&
+    routesTrafficSupportState !== "probing";
+
+  const canTryTransitDetails =
+    isTransit &&
+    ENHANCED_TRANSIT &&
+    Date.now() >= routesTransitDetailsUnsupportedUntil &&
+    routesTransitDetailsSupportState !== "unsupported" &&
+    routesTransitDetailsSupportState !== "probing";
+
+  const baseBody = {
+    origin: { location: { latLng: { latitude: originLatLng[0], longitude: originLatLng[1] } } },
+    destination: { location: { latLng: { latitude: destLatLng[0], longitude: destLatLng[1] } } },
+    travelMode: ROUTES_TRAVEL_MODE_MAP[travelMode] ?? "DRIVE",
+    languageCode: "ko",
+  };
+
+  if (isTransit) baseBody.departureTime = new Date().toISOString();
+  if (travelMode === "DRIVING") {
+    baseBody.routingPreference = "TRAFFIC_AWARE";
+    baseBody.departureTime = new Date().toISOString();
+  }
+
+  const requestVariants = [];
+
+  if (travelMode === "DRIVING") {
+    if (canTryTrafficDetails) {
+      routesTrafficSupportState = "probing";
+      requestVariants.push({
+        tag: "driving-traffic",
+        body: { ...baseBody, extraComputations: ["TRAFFIC_ON_POLYLINE"] },
+        fieldMask: Array.from(new Set([...ROUTES_BASE_FIELD_MASK, ...ROUTES_TRAFFIC_FIELD_MASK])).join(","),
+      });
+    }
+
+    const noTrafficBody = { ...baseBody };
+    requestVariants.push({
+      tag: "driving-base",
+      body: noTrafficBody,
+      fieldMask: ROUTES_BASE_FIELD_MASK.join(","),
+    });
+
+    const relaxedBody = { ...noTrafficBody };
+    delete relaxedBody.routingPreference;
+    delete relaxedBody.departureTime;
+    requestVariants.push({
+      tag: "driving-relaxed",
+      body: relaxedBody,
+      fieldMask: ROUTES_BASE_FIELD_MASK.join(","),
+    });
+  } else if (isTransit) {
+    if (canTryTransitDetails) {
+      routesTransitDetailsSupportState = "probing";
+      requestVariants.push({
+        tag: "transit-detailed",
+        body: { ...baseBody },
+        fieldMask: Array.from(new Set([...ROUTES_BASE_FIELD_MASK, ...ROUTES_TRANSIT_FIELD_MASK])).join(","),
+      });
+    }
+
+    requestVariants.push({
+      tag: "transit-base",
+      body: { ...baseBody },
+      fieldMask: ROUTES_BASE_FIELD_MASK.join(","),
+    });
+
+    const relaxedTransitBody = { ...baseBody };
+    delete relaxedTransitBody.languageCode;
+    requestVariants.push({
+      tag: "transit-relaxed",
+      body: relaxedTransitBody,
+      fieldMask: ROUTES_BASE_FIELD_MASK.join(","),
+    });
+  } else {
+    requestVariants.push({
+      tag: "base",
+      body: { ...baseBody },
+      fieldMask: ROUTES_BASE_FIELD_MASK.join(","),
+    });
+  }
+
+  let route = null;
+  let lastError = "";
+  let hadBadRequest = false;
+  const finalizeVariantSupport = (variantTag, ok, statusCode) => {
+    if (variantTag === "driving-traffic") {
+      if (ok) {
+        routesTrafficSupportState = "supported";
+      } else if (statusCode === 400) {
+        routesTrafficSupportState = "unsupported";
+        routesTrafficUnsupportedUntil = Date.now() + ROUTES_SOFT_DISABLE_WINDOW_MS;
+      } else if (routesTrafficSupportState === "probing") {
+        routesTrafficSupportState = "unknown";
+      }
+    }
+    if (variantTag === "transit-detailed") {
+      if (ok) {
+        routesTransitDetailsSupportState = "supported";
+      } else if (statusCode === 400) {
+        routesTransitDetailsSupportState = "unsupported";
+        routesTransitDetailsUnsupportedUntil = Date.now() + ROUTES_SOFT_DISABLE_WINDOW_MS;
+      } else if (routesTransitDetailsSupportState === "probing") {
+        routesTransitDetailsSupportState = "unknown";
+      }
+    }
+  };
+
+  for (const variant of requestVariants) {
     const res = await fetch(ROUTES_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": apiKey,
-        "X-Goog-FieldMask": [
-          "routes.duration",
-          "routes.distanceMeters",
-          "routes.polyline.encodedPolyline",
-          "routes.legs.steps.navigationInstruction",
-          "routes.legs.steps.staticDuration",
-          "routes.legs.steps.distanceMeters",
-          "routes.legs.steps.travelMode",
-        ].join(","),
+        "X-Goog-FieldMask": variant.fieldMask,
       },
-      body: JSON.stringify({
-        origin: { location: { latLng: { latitude: originLatLng[0], longitude: originLatLng[1] } } },
-        destination: { location: { latLng: { latitude: destLatLng[0], longitude: destLatLng[1] } } },
-        travelMode: ROUTES_TRAVEL_MODE_MAP[travelMode] ?? "DRIVE",
-        languageCode: "ko",
-      }),
+      body: JSON.stringify(variant.body),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      finalizeVariantSupport(variant.tag, false, res.status);
+      lastError = await res.text().catch(() => "");
+      if (res.status === 400) hadBadRequest = true;
+      continue;
+    }
+    finalizeVariantSupport(variant.tag, true, res.status);
     const data = await res.json();
-    const route = data?.routes?.[0];
-    if (!route) return null;
+    route = data?.routes?.[0] ?? null;
+    if (route) break;
+  }
 
-    const durationSecs = route.duration ? parseInt(route.duration) : null;
-    const distanceMeters = route.distanceMeters ?? null;
+  if (!route) {
+    if (hadBadRequest) routesApiDisabledUntil = Date.now() + ROUTES_SOFT_DISABLE_WINDOW_MS;
+    if (lastError) {
+      const signature = `${travelMode}:${lastError.slice(0, 180)}`;
+      if (signature !== lastRoutesApiErrorSig) {
+        lastRoutesApiErrorSig = signature;
+        console.warn("[Routes API] computeRoutes failed:", lastError.slice(0, 500));
+      }
+    }
+    return null;
+  }
 
-    const polylinePath =
-      route.polyline?.encodedPolyline && window.google?.maps?.geometry
-        ? window.google.maps.geometry.encoding
-            .decodePath(route.polyline.encodedPolyline)
-            .map((p) => [p.lat(), p.lng()])
-        : null;
+  const durationSecs = parseDurationSeconds(route.duration);
+  const distanceMeters = route.distanceMeters ?? null;
 
-    const steps = (route.legs?.[0]?.steps ?? []).slice(0, 5).map((s) => ({
-      instruction: escapeHtml((s.navigationInstruction?.instructions ?? "").slice(0, 80)),
-      duration: s.staticDuration ? formatRouteDuration(parseInt(s.staticDuration)) : "",
-      distance: s.distanceMeters ? formatRouteDistance(s.distanceMeters) : "",
-      travelMode: s.travelMode ?? travelMode,
-    }));
+  const polylinePath =
+    route.polyline?.encodedPolyline && window.google?.maps?.geometry
+      ? window.google.maps.geometry.encoding
+          .decodePath(route.polyline.encodedPolyline)
+          .map((p) => [p.lat(), p.lng()])
+      : null;
+  const trafficSegments =
+    isDriving && polylinePath
+      ? buildTrafficSegments(polylinePath, extractTrafficIntervals(route))
+      : [];
 
+  const steps = (route.legs?.[0]?.steps ?? []).map((s) => {
+    const sec = parseDurationSeconds(s.staticDuration);
+    const travelModeUsed = String(s.travelMode ?? travelMode).toUpperCase();
     return {
-      duration: durationSecs ? formatRouteDuration(durationSecs) : null,
-      durationSecs,
-      distance: distanceMeters ? formatRouteDistance(distanceMeters) : null,
-      steps,
-      polylinePath,
+      instruction: escapeHtml((s.navigationInstruction?.instructions ?? "").slice(0, 200)),
+      duration: sec != null ? formatRouteDuration(sec) : "",
+      distance: s.distanceMeters ? formatRouteDistance(s.distanceMeters) : "",
+      travelMode: travelModeUsed,
+      transit: normalizeTransitStep(s.transitDetails),
     };
-  } catch { return null; }
+  });
+  const transitLineLabels = Array.from(
+    new Set(
+      steps
+        .filter((s) => s.travelMode === "TRANSIT" && s.transit)
+        .map((s) => s.transit.lineShort || s.transit.lineName || s.transit.vehicleName)
+        .filter(Boolean)
+    )
+  );
+  const inferredMode =
+    steps.find((s) => s.travelMode === "TRANSIT")?.travelMode ||
+    steps.find((s) => s.travelMode)?.travelMode ||
+    String(travelMode).toUpperCase();
+
+  return {
+    duration: durationSecs ? formatRouteDuration(durationSecs) : null,
+    durationSecs,
+    distance: distanceMeters ? formatRouteDistance(distanceMeters) : null,
+    steps,
+    polylinePath,
+    travelModeUsed: inferredMode,
+    transitSummary: transitLineLabels.length > 0 ? transitLineLabels.join(" · ") : null,
+    trafficSegments,
+  };
+}
+
+export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING") {
+  if (!isValidLatLng(originLatLng) || !isValidLatLng(destLatLng)) return null;
+  if (isSameLatLng(originLatLng, destLatLng)) {
+    return buildZeroDistanceDirection(originLatLng, travelMode);
+  }
+  const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
+  const cacheKey = buildDirectionCacheKey(originLatLng, destLatLng, travelMode);
+  const now = Date.now();
+  const cached = directionsCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.value;
+  if (directionsInFlight.has(cacheKey)) return directionsInFlight.get(cacheKey);
+
+  const requestPromise = (async () => {
+    const shouldTryRoutesApi = PREFER_ROUTES_API && Boolean(apiKey) && Date.now() >= routesApiDisabledUntil;
+    if (shouldTryRoutesApi) {
+      const routesResult = await fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, apiKey);
+      if (routesResult) return routesResult;
+      // Routes 우선 모드에서는 레거시 DirectionsService를 기본적으로 호출하지 않는다.
+      if (!ALLOW_LEGACY_DIRECTIONS_FALLBACK) return null;
+    }
+    if (!ALLOW_LEGACY_DIRECTIONS_FALLBACK && PREFER_ROUTES_API) return null;
+    return await fetchLegacyGoogleDirections(originLatLng, destLatLng, travelMode);
+  })();
+
+  directionsInFlight.set(cacheKey, requestPromise);
+  try {
+    const result = await requestPromise;
+    directionsCache.set(cacheKey, {
+      value: result,
+      expiresAt: Date.now() + (result ? DIRECTIONS_CACHE_TTL_MS : DIRECTIONS_FAILURE_CACHE_TTL_MS),
+    });
+    return result;
+  } finally {
+    directionsInFlight.delete(cacheKey);
+  }
 }
 
 export async function fetchScheduleDirections(schedule, moveId) {
   const travelMode = GMAPS_TRAVEL_MODE_MAP[moveId] ?? "DRIVING";
   if (!import.meta.env.VITE_GOOGLE_MAPS_API_KEY || schedule.length < 2) return [];
+
+  const hasTransitStep = (dir) =>
+    dir?.travelModeUsed === "TRANSIT" || (dir?.steps ?? []).some((s) => s.travelMode === "TRANSIT");
+
+  const withPolicy = (dir, policy) => {
+    if (!dir) return null;
+    return {
+      ...dir,
+      isApproximate: Boolean(policy?.approximate) || Boolean(dir.isApproximate),
+      fallbackNotice: policy?.notice ?? dir.fallbackNotice ?? null,
+      routePolicy: {
+        requestedMode: policy?.requestedMode ?? String(travelMode).toUpperCase(),
+        resolvedMode: policy?.resolvedMode ?? String(dir.travelModeUsed ?? travelMode).toUpperCase(),
+        retried: Boolean(policy?.retried),
+        fallback: Boolean(policy?.fallback),
+        approximate: Boolean(policy?.approximate),
+      },
+    };
+  };
+
   const results = await Promise.all(
-    schedule.slice(0, -1).map((from, idx) => {
+    schedule.slice(0, -1).map(async (from, idx) => {
       const to = schedule[idx + 1];
-      return fetchGoogleDirections(from.latlng, to.latlng, travelMode).then((dir) =>
-        dir ? { fromId: from.id, toId: to.id, fromName: from.name, toName: to.name, ...dir } : null
-      );
+      if (!isValidLatLng(from.latlng) || !isValidLatLng(to.latlng)) return null;
+
+      let dir = null;
+      if (moveId === "mixed") {
+        const transitDir = await fetchGoogleDirections(from.latlng, to.latlng, "TRANSIT");
+        const transitAvailable = hasTransitStep(transitDir);
+        dir = transitAvailable ? transitDir : await fetchGoogleDirections(from.latlng, to.latlng, "DRIVING");
+        if (!dir) dir = transitDir;
+        dir = withPolicy(dir, {
+          requestedMode: "TRANSIT",
+          resolvedMode: String(dir?.travelModeUsed ?? "DRIVING").toUpperCase(),
+          retried: !transitAvailable,
+          fallback: !transitAvailable,
+          notice: !transitAvailable && dir ? "대중교통 구간을 찾지 못해 도로 경로로 대체했습니다." : null,
+        });
+      } else if (moveId === "public") {
+        const transitDir = await fetchGoogleDirections(from.latlng, to.latlng, "TRANSIT");
+        if (hasTransitStep(transitDir)) {
+          dir = withPolicy(transitDir, {
+            requestedMode: "TRANSIT",
+            resolvedMode: "TRANSIT",
+            retried: false,
+            fallback: false,
+          });
+        } else {
+          const drivingDir = await fetchGoogleDirections(from.latlng, to.latlng, "DRIVING");
+          if (drivingDir) {
+            dir = withPolicy(drivingDir, {
+              requestedMode: "TRANSIT",
+              resolvedMode: String(drivingDir.travelModeUsed ?? "DRIVING").toUpperCase(),
+              retried: true,
+              fallback: true,
+              notice: "대중교통 경로를 찾지 못해 도로 경로로 대체했습니다.",
+            });
+          } else {
+            const walkingDir = await fetchGoogleDirections(from.latlng, to.latlng, "WALKING");
+            if (walkingDir) {
+              dir = withPolicy(walkingDir, {
+                requestedMode: "TRANSIT",
+                resolvedMode: "WALKING",
+                retried: true,
+                fallback: true,
+                notice: "대중교통 경로를 찾지 못해 도보 경로로 대체했습니다.",
+              });
+            } else if (transitDir) {
+              dir = withPolicy(transitDir, {
+                requestedMode: "TRANSIT",
+                resolvedMode: String(transitDir.travelModeUsed ?? "TRANSIT").toUpperCase(),
+                retried: true,
+                fallback: true,
+                notice: "대중교통 상세 구간을 확인하지 못해 대체 경로를 표시합니다.",
+              });
+            } else {
+              dir = withPolicy(
+                {
+                  duration: null,
+                  durationSecs: null,
+                  distance: null,
+                  steps: [],
+                  polylinePath: [from.latlng, to.latlng],
+                  travelModeUsed: "ESTIMATE",
+                  transitSummary: null,
+                  trafficSegments: [],
+                  isApproximate: true,
+                },
+                {
+                  requestedMode: "TRANSIT",
+                  resolvedMode: "ESTIMATE",
+                  retried: true,
+                  fallback: true,
+                  approximate: true,
+                  notice: "대중교통 경로 조회에 실패해 직선 근사 경로로 표시합니다.",
+                }
+              );
+            }
+          }
+        }
+      } else {
+        dir = await fetchGoogleDirections(from.latlng, to.latlng, travelMode);
+      }
+
+      return dir
+        ? {
+            fromId: from.id,
+            toId: to.id,
+            fromName: from.name,
+            toName: to.name,
+            travelModeRequested: moveId === "public" ? "TRANSIT" : String(travelMode).toUpperCase(),
+            ...dir,
+          }
+        : null;
     })
   );
   return results.filter(Boolean);
@@ -216,6 +759,8 @@ export async function fetchOsrmGeometry(fromLatLng, toLatLng, profile) {
 // ─── LLM configuration ──────────────────────────────────────────────────────
 const LLM_PROVIDER = (import.meta.env.VITE_LLM_PROVIDER || "openai").trim().toLowerCase();
 const OLLAMA_URL = (import.meta.env.VITE_OLLAMA_URL || "http://localhost:11434").trim();
+const OLLAMA_TAGS_TTL_MS = 60 * 1000;
+let ollamaTagsCache = { expiresAt: 0, models: null };
 const LLM_SETTINGS = {
   openai: { provider: "openai", label: "OpenAI", key: import.meta.env.VITE_OPENAI_API_KEY, model: (import.meta.env.VITE_OPENAI_MODEL || "gpt-4o-mini").trim(), keyEnv: "VITE_OPENAI_API_KEY" },
   gemini: { provider: "gemini", label: "Gemini", key: import.meta.env.VITE_GEMINI_API_KEY, model: (import.meta.env.VITE_GEMINI_MODEL || "gemini-2.5-flash-lite").trim(), keyEnv: "VITE_GEMINI_API_KEY" },
@@ -223,6 +768,38 @@ const LLM_SETTINGS = {
   ollama: { provider: "ollama", label: "Ollama (local)", key: "ollama", model: (import.meta.env.VITE_OLLAMA_MODEL || "bjoernb/gemma4-31b-think").trim(), keyEnv: "VITE_OLLAMA_MODEL" },
 };
 export const ACTIVE_LLM = LLM_SETTINGS[LLM_PROVIDER] ?? LLM_SETTINGS.openai;
+
+function shouldRetryOllamaModel(errText) {
+  const msg = String(errText ?? "").toLowerCase();
+  return msg.includes("model") && (
+    msg.includes("not found") ||
+    msg.includes("does not exist") ||
+    msg.includes("pull") ||
+    msg.includes("unknown")
+  );
+}
+
+async function listOllamaModels() {
+  if (ollamaTagsCache.models && ollamaTagsCache.expiresAt > Date.now()) return ollamaTagsCache.models;
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/tags`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    const models = (data?.models ?? []).map((m) => String(m?.name ?? "").trim()).filter(Boolean);
+    ollamaTagsCache = { models, expiresAt: Date.now() + OLLAMA_TAGS_TTL_MS };
+    return models;
+  } catch {
+    return [];
+  }
+}
+
+async function pickOllamaRetryModel(preferredModel) {
+  const models = await listOllamaModels();
+  if (!models.length) return null;
+  if (preferredModel && models.includes(preferredModel)) return preferredModel;
+  const preferred = models.find((m) => /qwen|llama|gemma|phi|mistral|deepseek/i.test(m));
+  return preferred ?? models[0];
+}
 
 /**
  * Per-function LLM routing.
@@ -455,32 +1032,72 @@ export async function callDestinationLLM(userMessage, chatHistory, onLog, count 
 export async function callGenericLLM(systemPrompt, userMessage, onLog, fnName) {
   const cfg = resolveFnConfig(fnName);
   const timestamp = new Date().toISOString();
+  let usedModel = cfg.model;
   if (!cfg.key) {
     if (onLog) onLog({ provider: "simulation", model: "rule-based", userMessage, timestamp, error: true, responseText: "No API key" });
     return null;
   }
   let reqBody = null; let resData = null; let raw = "";
   try {
-    if (cfg.provider === "openai" || cfg.provider === "ollama") {
-      const isOllama = cfg.provider === "ollama";
-      const apiUrl = isOllama ? `${OLLAMA_URL}/v1/chat/completions` : "https://api.openai.com/v1/chat/completions";
+    if (cfg.provider === "openai") {
+      const apiUrl = "https://api.openai.com/v1/chat/completions";
       const headers = { "Content-Type": "application/json" };
-      if (!isOllama) headers.Authorization = `Bearer ${cfg.key}`;
+      headers.Authorization = `Bearer ${cfg.key}`;
       reqBody = { model: cfg.model, messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userMessage }], max_tokens: 4096, temperature: 0.7 };
       const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
-      if (!res.ok) throw new Error(cfg.provider);
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`${cfg.provider} ${res.status}: ${errText.slice(0, 300)}`);
+      }
+      resData = await res.json();
+      raw = resData.choices?.[0]?.message?.content ?? "";
+    } else if (cfg.provider === "ollama") {
+      const apiUrl = `${OLLAMA_URL}/v1/chat/completions`;
+      const headers = { "Content-Type": "application/json" };
+      const messages = [{ role: "system", content: systemPrompt }, { role: "user", content: userMessage }];
+      const buildBody = (model) => ({ model, messages, temperature: 0.7 });
+
+      usedModel = cfg.model;
+      reqBody = buildBody(usedModel);
+      let res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        const shouldRetry = res.status === 400 && shouldRetryOllamaModel(errText);
+        if (shouldRetry) {
+          const retryModel = await pickOllamaRetryModel(usedModel);
+          if (retryModel && retryModel !== usedModel) {
+            usedModel = retryModel;
+            reqBody = buildBody(usedModel);
+            res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
+            if (!res.ok) {
+              const retryErrText = await res.text().catch(() => "");
+              throw new Error(`ollama ${res.status}: ${retryErrText.slice(0, 300)}`);
+            }
+          } else {
+            throw new Error(`ollama ${res.status}: ${errText.slice(0, 300)}`);
+          }
+        } else {
+          throw new Error(`ollama ${res.status}: ${errText.slice(0, 300)}`);
+        }
+      }
       resData = await res.json();
       raw = resData.choices?.[0]?.message?.content ?? "";
     } else if (cfg.provider === "gemini") {
       reqBody = { systemInstruction: { parts: [{ text: systemPrompt }] }, contents: [{ role: "user", parts: [{ text: userMessage }] }], generationConfig: { temperature: 0.7, maxOutputTokens: 8192, responseMimeType: "application/json" } };
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cfg.model)}:generateContent?key=${encodeURIComponent(cfg.key)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(reqBody) });
-      if (!res.ok) throw new Error("gemini");
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`gemini ${res.status}: ${errText.slice(0, 300)}`);
+      }
       resData = await res.json();
       raw = (resData.candidates?.[0]?.content?.parts ?? []).map((p) => p.text).filter(Boolean).join("\n");
     } else if (cfg.provider === "claude") {
       reqBody = { model: cfg.model, system: systemPrompt, max_tokens: 4096, temperature: 0.7, messages: [{ role: "user", content: userMessage }] };
       const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json", "x-api-key": cfg.key, "anthropic-version": "2023-06-01" }, body: JSON.stringify(reqBody) });
-      if (!res.ok) throw new Error("claude");
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`claude ${res.status}: ${errText.slice(0, 300)}`);
+      }
       resData = await res.json();
       raw = (resData.content ?? []).map((item) => item.text).filter(Boolean).join("\n");
     }
@@ -490,11 +1107,11 @@ export async function callGenericLLM(systemPrompt, userMessage, onLog, fnName) {
     let parsed;
     try { parsed = JSON.parse(cleaned); } catch (_) { parsed = JSON.parse(tryRepairJSON(cleaned)); }
     const logResData = cfg.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
-    if (onLog) onLog({ provider: cfg.provider, model: cfg.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: raw, timestamp, fn: fnName ?? "default" });
+    if (onLog) onLog({ provider: cfg.provider, model: usedModel, userMessage, requestBody: reqBody, responseData: logResData, responseText: raw, timestamp, fn: fnName ?? "default" });
     return parsed;
   } catch (e) {
     console.error(`[GenericLLM:${fnName ?? "default"}] error:`, e);
-    if (onLog) onLog({ provider: cfg.provider + " (error)", model: cfg.model, userMessage, requestBody: reqBody, responseText: raw || e.message, error: true, timestamp, fn: fnName ?? "default" });
+    if (onLog) onLog({ provider: cfg.provider + " (error)", model: usedModel, userMessage, requestBody: reqBody, responseText: raw || e.message, error: true, timestamp, fn: fnName ?? "default" });
     return null;
   }
 }
@@ -566,12 +1183,97 @@ Strict rules:
   return Array.isArray(list) ? list : null;
 }
 
+function parseTripDayCount(days) {
+  const clamp = (n) => Math.max(1, Math.min(10, n));
+  if (Number.isFinite(Number(days))) return clamp(Number(days));
+  const text = String(days ?? "").trim();
+  if (!text) return 3;
+
+  const nightsDays = text.match(/(\d+)\s*박\s*(\d+)\s*일/);
+  if (nightsDays) return clamp(Number.parseInt(nightsDays[2], 10));
+
+  const dayOnly = text.match(/(\d+)\s*일/);
+  if (dayOnly) return clamp(Number.parseInt(dayOnly[1], 10));
+
+  const nums = text.match(/\d+/g);
+  if (nums?.length) return clamp(Number.parseInt(nums[nums.length - 1], 10));
+  return 3;
+}
+
+function makeUniqueSpotId(baseId, usedIds, day, idx) {
+  const normalizedBase = String(baseId ?? "").trim() || `spot-d${day}-${idx + 1}`;
+  if (!usedIds.has(normalizedBase)) {
+    usedIds.add(normalizedBase);
+    return normalizedBase;
+  }
+  let suffix = 2;
+  while (usedIds.has(`${normalizedBase}-${suffix}`)) suffix += 1;
+  const id = `${normalizedBase}-${suffix}`;
+  usedIds.add(id);
+  return id;
+}
+
+function rebalanceItineraryDays(days) {
+  const out = days.map((d) => ({ ...d, spots: [...(d.spots ?? [])] }));
+  const totalSpots = out.reduce((sum, d) => sum + (d.spots?.length ?? 0), 0);
+  if (totalSpots < out.length) return out;
+
+  for (let targetIdx = 0; targetIdx < out.length; targetIdx += 1) {
+    if ((out[targetIdx].spots?.length ?? 0) > 0) continue;
+    let donorIdx = -1;
+    let donorCount = 1;
+    for (let i = 0; i < out.length; i += 1) {
+      const count = out[i].spots?.length ?? 0;
+      if (count > donorCount) {
+        donorCount = count;
+        donorIdx = i;
+      }
+    }
+    if (donorIdx < 0) break;
+    const moved = out[donorIdx].spots.pop();
+    if (moved) out[targetIdx].spots.push({ ...moved, time: moved.time ?? "10:00" });
+  }
+
+  return out;
+}
+
+function normalizeItineraryResult(result, dayCount) {
+  if (!result || !Array.isArray(result.days)) return null;
+
+  const byDay = new Map();
+  result.days.forEach((d, idx) => {
+    const parsedDay = Number.parseInt(d?.day, 10);
+    const day = Number.isFinite(parsedDay) ? parsedDay : (idx + 1);
+    if (day >= 1 && day <= dayCount && !byDay.has(day)) {
+      byDay.set(day, d);
+    }
+  });
+
+  const usedIds = new Set();
+  const normalizedDays = [];
+
+  for (let day = 1; day <= dayCount; day += 1) {
+    const srcDay = byDay.get(day) ?? { day, theme: `DAY ${day} 추천 일정`, spots: [] };
+    const rawSpots = Array.isArray(srcDay.spots) ? srcDay.spots : [];
+    const spots = rawSpots.map((spot, idx) => {
+      const nameSeed = String(spot?.name ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+      const baseId = spot?.id ?? nameSeed;
+      return { ...spot, id: makeUniqueSpotId(baseId, usedIds, day, idx) };
+    });
+    normalizedDays.push({ ...srcDay, day, spots });
+  }
+
+  const balancedDays = rebalanceItineraryDays(normalizedDays);
+  return { ...result, days: balancedDays };
+}
+
 // ─── Generate complete itinerary (spots pre-assigned to days) ────────────────
 export async function generateItinerary(country, city, tags, days, transportName, onLog) {
-  const dayCount = parseInt(days) || 3;
+  const dayCount = parseTripDayCount(days);
   const tagStr = tags.length > 0 ? tags.join(", ") : "전체";
-  const msg = `${country} ${city} ${dayCount - 1}박${dayCount}일 여행 일정 생성.\n선호 성향: ${tagStr}\n이동수단: ${transportName}\n${dayCount}일간의 완벽한 일정을 만들어줘.`;
+  const msg = `${country} ${city} ${dayCount - 1}박${dayCount}일 여행 일정 생성.\n선호 성향: ${tagStr}\n이동수단: ${transportName}\n${dayCount}일간의 완벽한 일정을 만들어줘.\n중요: days 배열은 DAY 1부터 DAY ${dayCount}까지 정확히 ${dayCount}개를 포함해야 하며, day 값은 누락 없이 연속이어야 한다.`;
   const result = await callGenericLLM(ITINERARY_PROMPT, msg, onLog, "itinerary");
-  if (result?.days && result.days.length > 0) return result;
+  const normalized = normalizeItineraryResult(result, dayCount);
+  if (normalized?.days && normalized.days.length > 0) return normalized;
   return null;
 }

@@ -17,10 +17,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
  *   className:          extra CSS class
  */
 
-// ─── Map ID (optional) — enables AdvancedMarkerElement over deprecated Marker ─
-// Set VITE_GOOGLE_MAPS_MAP_ID in .env to use AdvancedMarkerElement.
-// Without a Map ID, inline DARK_MAP_STYLES apply and legacy google.maps.Marker is used.
-const GOOGLE_MAPS_MAP_ID = import.meta.env.VITE_GOOGLE_MAPS_MAP_ID || null;
+// ─── Map ID (required for AdvancedMarkerElement) ─────────────────────────────
+// If user mapId is not configured, use Google's demo map id so we can still
+// avoid deprecated google.maps.Marker in local/dev environments.
+const GOOGLE_MAPS_MAP_ID = import.meta.env.VITE_GOOGLE_MAPS_MAP_ID || "DEMO_MAP_ID";
 
 // ─── Custom SVG pin factories ────────────────────────────────────────────
 // Markers carry an optional `pin: { kind, color, number }` spec which this
@@ -56,36 +56,6 @@ function buildHotelPinSvg(color = "#ffa33a") {
   );
 }
 
-// Legacy icon object for google.maps.Marker (used when GOOGLE_MAPS_MAP_ID is not set)
-function buildNumberedPinIcon(number, color = "#ffd23f") {
-  if (!window.google?.maps) return null;
-  return {
-    url: "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(buildNumberedPinSvg(number, color)),
-    scaledSize: new window.google.maps.Size(40, 50),
-    anchor: new window.google.maps.Point(20, 50),
-  };
-}
-
-function buildHotelPinIcon(color = "#ffa33a") {
-  if (!window.google?.maps) return null;
-  return {
-    url: "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(buildHotelPinSvg(color)),
-    scaledSize: new window.google.maps.Size(44, 54),
-    anchor: new window.google.maps.Point(22, 54),
-  };
-}
-
-function resolvePinIcon(pin) {
-  if (!pin) return null;
-  if (pin.kind === "number" && pin.number != null) {
-    return buildNumberedPinIcon(pin.number, pin.color);
-  }
-  if (pin.kind === "hotel") {
-    return buildHotelPinIcon(pin.color);
-  }
-  return null;
-}
-
 // DOM element content for AdvancedMarkerElement (used when GOOGLE_MAPS_MAP_ID is set)
 function buildSvgImgElement(svgString, width, height) {
   const img = document.createElement("img");
@@ -119,6 +89,17 @@ function resolveAdvancedMarkerContent(pin, label) {
   return null; // default Google pin
 }
 
+function detachMapOverlay(overlay) {
+  if (!overlay) return;
+  if (typeof overlay.setMap === "function") {
+    overlay.setMap(null);
+    return;
+  }
+  if ("map" in overlay) {
+    overlay.map = null;
+  }
+}
+
 // Dark-mode styles matching the MGS cyber theme of the rest of the app
 const DARK_MAP_STYLES = [
   { elementType: "geometry", stylers: [{ color: "#0f0f12" }] },
@@ -144,6 +125,7 @@ export default function GoogleMapView({
   center = [35.68, 139.77],
   zoom = 13,
   markers = [],
+  polylineSegments = [],
   polylinePositions = [],
   polylineOptions,
   onMarkerClick,
@@ -153,7 +135,7 @@ export default function GoogleMapView({
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const markerRefs = useRef([]);
-  const polylineRef = useRef(null);
+  const polylineRefs = useRef([]);
   // Hold latest click handler in a ref so marker effect doesn't refire when
   // the parent passes a fresh inline callback every render.
   const onMarkerClickRef = useRef(onMarkerClick);
@@ -188,10 +170,10 @@ export default function GoogleMapView({
       fullscreenControl: false,
       zoomControl: true,
       clickableIcons: false,
-      // mapId enables AdvancedMarkerElement; when set, inline styles are replaced
-      // by cloud-based styling configured for that Map ID in the Google Cloud Console.
-      // Without a mapId the inline DARK_MAP_STYLES apply and legacy Marker is used.
-      ...(GOOGLE_MAPS_MAP_ID ? { mapId: GOOGLE_MAPS_MAP_ID } : { styles: DARK_MAP_STYLES }),
+      // Advanced markers require a mapId. Use user-provided mapId when set,
+      // otherwise DEMO_MAP_ID in development.
+      mapId: GOOGLE_MAPS_MAP_ID,
+      ...(GOOGLE_MAPS_MAP_ID ? {} : { styles: DARK_MAP_STYLES }),
       backgroundColor: "#0f0f12",
       gestureHandling: "greedy",
     });
@@ -223,39 +205,24 @@ export default function GoogleMapView({
   // Update markers
   useEffect(() => {
     if (!mapRef.current) return;
-    markerRefs.current.forEach((m) => m.setMap(null));
+    markerRefs.current.forEach((m) => detachMapOverlay(m));
     markerRefs.current = [];
     if (markers.length === 0) return;
     const bounds = new window.google.maps.LatLngBounds();
-    const useAdvanced = Boolean(GOOGLE_MAPS_MAP_ID && window.google?.maps?.marker?.AdvancedMarkerElement);
+    const useAdvanced = Boolean(window.google?.maps?.marker?.AdvancedMarkerElement);
+    if (!useAdvanced) return;
     markers.forEach((m) => {
-      let marker;
-      if (useAdvanced) {
-        const content = resolveAdvancedMarkerContent(m.pin, m.label);
-        marker = new window.google.maps.marker.AdvancedMarkerElement({
-          position: { lat: m.lat, lng: m.lng },
-          map: mapRef.current,
-          title: m.title,
-          ...(content ? { content } : {}),
-          zIndex: m.pin?.kind === "hotel" ? 1000 : undefined,
-        });
-        marker.addListener("gmp-click", () => {
-          onMarkerClickRef.current?.(m.id);
-        });
-      } else {
-        const icon = resolvePinIcon(m.pin);
-        marker = new window.google.maps.Marker({
-          position: { lat: m.lat, lng: m.lng },
-          map: mapRef.current,
-          title: m.title,
-          label: icon ? undefined : m.label,
-          icon: icon ?? undefined,
-          zIndex: m.pin?.kind === "hotel" ? 1000 : undefined,
-        });
-        marker.addListener("click", () => {
-          onMarkerClickRef.current?.(m.id);
-        });
-      }
+      const content = resolveAdvancedMarkerContent(m.pin, m.label);
+      const marker = new window.google.maps.marker.AdvancedMarkerElement({
+        position: { lat: m.lat, lng: m.lng },
+        map: mapRef.current,
+        title: m.title,
+        ...(content ? { content } : {}),
+        zIndex: m.pin?.kind === "hotel" ? 1000 : undefined,
+      });
+      marker.addListener("gmp-click", () => {
+        onMarkerClickRef.current?.(m.id);
+      });
       markerRefs.current.push(marker);
       bounds.extend({ lat: m.lat, lng: m.lng });
     });
@@ -273,46 +240,90 @@ export default function GoogleMapView({
     [polylinePositions, polylineOptions]
   );
 
+  const polylineSegmentsKey = useMemo(
+    () =>
+      polylineSegments
+        .map((seg) => {
+          const pathKey = (seg.positions ?? []).map((p) => `${p[0]},${p[1]}`).join("|");
+          return `${pathKey}#${seg.color ?? ""}/${seg.weight ?? ""}/${seg.opacity ?? ""}/${seg.dashed ?? ""}`;
+        })
+        .join("~"),
+    [polylineSegments]
+  );
+
   // Update polyline
   useEffect(() => {
     if (!mapRef.current) return;
-    if (polylineRef.current) {
-      polylineRef.current.setMap(null);
-      polylineRef.current = null;
+    polylineRefs.current.forEach((line) => line.setMap(null));
+    polylineRefs.current = [];
+
+    if (polylineSegments.length > 0) {
+      polylineRefs.current = polylineSegments
+        .filter((seg) => Array.isArray(seg.positions) && seg.positions.length >= 2)
+        .map((seg) => {
+          const color = seg.color ?? polylineOptions?.color ?? "#5ecfcf";
+          const dashed = Boolean(seg.dashed);
+          return new window.google.maps.Polyline({
+            path: seg.positions.map(([lat, lng]) => ({ lat, lng })),
+            strokeColor: color,
+            strokeOpacity: dashed ? 0 : (seg.opacity ?? 0.9),
+            strokeWeight: seg.weight ?? polylineOptions?.weight ?? 5,
+            icons: dashed
+              ? [
+                  {
+                    icon: {
+                      path: "M 0,-1 0,1",
+                      strokeOpacity: 1,
+                      scale: 3,
+                      strokeColor: color,
+                    },
+                    offset: "0",
+                    repeat: "12px",
+                  },
+                ]
+              : undefined,
+            map: mapRef.current,
+          });
+        });
+      return;
     }
+
     if (polylinePositions.length < 2) return;
     const color = polylineOptions?.color ?? "#5ecfcf";
     const dashed = polylineOptions?.dashed !== false;
-    polylineRef.current = new window.google.maps.Polyline({
-      path: polylinePositions.map(([lat, lng]) => ({ lat, lng })),
-      strokeColor: color,
-      strokeOpacity: dashed ? 0 : 0.85,
-      strokeWeight: polylineOptions?.weight ?? 3,
-      icons: dashed
-        ? [
-            {
-              icon: {
-                path: "M 0,-1 0,1",
-                strokeOpacity: 1,
-                scale: 3,
-                strokeColor: color,
+    polylineRefs.current = [
+      new window.google.maps.Polyline({
+        path: polylinePositions.map(([lat, lng]) => ({ lat, lng })),
+        strokeColor: color,
+        strokeOpacity: dashed ? 0 : 0.85,
+        strokeWeight: polylineOptions?.weight ?? 3,
+        icons: dashed
+          ? [
+              {
+                icon: {
+                  path: "M 0,-1 0,1",
+                  strokeOpacity: 1,
+                  scale: 3,
+                  strokeColor: color,
+                },
+                offset: "0",
+                repeat: "12px",
               },
-              offset: "0",
-              repeat: "12px",
-            },
-          ]
-        : undefined,
-      map: mapRef.current,
-    });
+            ]
+          : undefined,
+        map: mapRef.current,
+      }),
+    ];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [polylineKey]);
+  }, [polylineKey, polylineSegmentsKey]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      markerRefs.current.forEach((m) => m.setMap(null));
+      markerRefs.current.forEach((m) => detachMapOverlay(m));
       markerRefs.current = [];
-      if (polylineRef.current) polylineRef.current.setMap(null);
+      polylineRefs.current.forEach((line) => detachMapOverlay(line));
+      polylineRefs.current = [];
     };
   }, []);
 

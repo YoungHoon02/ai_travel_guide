@@ -168,6 +168,13 @@ export default function App() {
   // Shape: [{ fromId, toId, polylinePath, duration, durationSecs, distance }]
   const [editDaySegments, setEditDaySegments] = useState([]);
   const [editDaySegmentsLoading, setEditDaySegmentsLoading] = useState(false);
+  const [gmapsReady, setGmapsReady] = useState(Boolean(window.__googleMapsLoaded));
+  useEffect(() => {
+    if (window.__googleMapsLoaded) return;
+    const handler = () => setGmapsReady(true);
+    window.addEventListener("googlemapsloaded", handler, { once: true });
+    return () => window.removeEventListener("googlemapsloaded", handler);
+  }, []);
   const [tripDateMode, setTripDateMode] = useState(() => {
     try { return localStorage.getItem("tripDateMode") || "destination"; } catch { return "destination"; }
   });
@@ -215,6 +222,24 @@ export default function App() {
   // (transportPromiseRef removed — 이동 스타일은 LLM 호출 없이 static 선택)
   const lodgingPromiseRef = useRef(null);
   const itineraryPromiseRef = useRef(null);
+  const resetGeneratedPlanState = useCallback(() => {
+    lodgingPromiseRef.current = null;
+    itineraryPromiseRef.current = null;
+    setDynLodgings(null);
+    setDynContents(null);
+    setDynItinerary(null);
+    setRecommended([]);
+    setCustomLodging(null);
+    setSelectedLodgingId("");
+    setSchedule([]);
+    setOptimizedDayPicks(null);
+    setEditDaySegments([]);
+    setEditDaySegmentsLoading(false);
+    setHighlightItemId(null);
+    setHighlightIds([]);
+    setTransitPopup(null);
+  }, []);
+
   const [loadingElapsed, setLoadingElapsed] = useState(0);
   const [recommended, setRecommended] = useState([]);
   // ── Schedule store — TimeSlot[] is the new single source of truth ─────
@@ -374,6 +399,12 @@ export default function App() {
   // Builds the Schedule directly from LLM itinerary + resolved lodging.
   useEffect(() => {
     if (step !== 2) return;
+    const needsHydration =
+      (!dynLodgings && Boolean(lodgingPromiseRef.current)) ||
+      (!dynItinerary && Boolean(itineraryPromiseRef.current));
+    if (!needsHydration) return;
+    let cancelled = false;
+    setDataLoading(true);
     (async () => {
       // Wait for Google Maps to be ready before any forwardGeocode calls,
       // otherwise they silently return null and every slot ends up without
@@ -390,14 +421,22 @@ export default function App() {
         });
       }
       // Resolve lodging first so schedule has anchors from the start.
+      const cityCenterLatLng = asValidLatLng(await forwardGeocode(`${region} ${country}`));
       let resolvedLodgings = dynLodgings;
       if (lodgingPromiseRef.current && !dynLodgings) {
         const lodgings = await lodgingPromiseRef.current;
         lodgingPromiseRef.current = null;
         if (lodgings && lodgings.length > 0) {
           const refined = await Promise.all(lodgings.map(async (l) => {
-            const coords = await forwardGeocode(`${l.area ?? l.name} ${region} ${country}`);
-            return coords ? { ...l, latlng: coords } : l;
+            const validCoords = await geocodeBestLatLng({
+              name: l.name,
+              area: l.area,
+              region,
+              country,
+            });
+            if (validCoords) return { ...l, latlng: validCoords };
+            if (cityCenterLatLng) return { ...l, latlng: cityCenterLatLng, approximateLatlng: true };
+            return l;
           }));
           resolvedLodgings = refined;
           setDynLodgings(refined);
@@ -414,9 +453,20 @@ export default function App() {
               allSpots.push({ ...s, day: d.day, assignedDay: d.day });
             }
           }
+          const fallbackLatLng =
+            asValidLatLng(customLodging?.latlng) ??
+            asValidLatLng(resolvedLodgings?.[0]?.latlng) ??
+            cityCenterLatLng;
           const refined = await Promise.all(allSpots.map(async (s) => {
-            const coords = await forwardGeocode(`${s.area ?? s.name} ${region} ${country}`);
-            return coords ? { ...s, latlng: coords } : s;
+            const validCoords = await geocodeBestLatLng({
+              name: s.name,
+              area: s.area,
+              region,
+              country,
+            });
+            if (validCoords) return { ...s, latlng: validCoords };
+            if (fallbackLatLng) return { ...s, latlng: fallbackLatLng, approximateLatlng: true };
+            return s;
           }));
           setDynContents(refined);
           setRecommended(refined);
@@ -438,7 +488,13 @@ export default function App() {
           setSchedule(scheduleFromItineraryLLM(enrichedItinerary, lodgingInfo, newDayCount));
         }
       }
-    })();
+    })().finally(() => {
+      if (!cancelled) setDataLoading(false);
+    });
+    return () => {
+      cancelled = true;
+      setDataLoading(false);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step]);
 
@@ -449,21 +505,31 @@ export default function App() {
     if (step !== 2) return;
     if (!schedule.length) return;
     if (!window.google?.maps?.Geocoder) return;
-    const missing = schedule.filter((s) => s.kind === "activity" && !s.latlng);
+    const missing = schedule.filter(
+      (s) => s.kind === "activity" && (!asValidLatLng(s.latlng) || s.approximateLatlng)
+    );
     if (missing.length === 0) return;
     let cancelled = false;
     (async () => {
       const fixes = await Promise.all(
         missing.map(async (s) => {
-          const coords = await forwardGeocode(`${s.area ?? s.name} ${region} ${country}`);
-          return coords ? { id: s.id, latlng: coords } : null;
+          const validCoords = await geocodeBestLatLng({
+            name: s.name,
+            area: s.area,
+            region,
+            country,
+          });
+          return validCoords ? { id: s.id, latlng: validCoords, approximateLatlng: false } : null;
         })
       );
       if (cancelled) return;
-      const fixMap = new Map(fixes.filter(Boolean).map((f) => [f.id, f.latlng]));
+      const fixMap = new Map(fixes.filter(Boolean).map((f) => [f.id, f]));
       if (fixMap.size === 0) return;
       setSchedule((prev) =>
-        prev.map((s) => (fixMap.has(s.id) ? { ...s, latlng: fixMap.get(s.id) } : s))
+        prev.map((s) => {
+          const fix = fixMap.get(s.id);
+          return fix ? { ...s, latlng: fix.latlng, approximateLatlng: false } : s;
+        })
       );
     })();
     return () => { cancelled = true; };
@@ -531,6 +597,10 @@ export default function App() {
     () => customLodging ?? (activeLodgings.find((l) => l.id === selectedLodgingId) ?? activeLodgings[0]),
     [customLodging, activeLodgings, selectedLodgingId]
   );
+  const selectedLodgingLatLng = useMemo(
+    () => asValidLatLng(selectedLodging?.latlng),
+    [selectedLodging]
+  );
 
   const requiredStayLoad = STAY_LOAD_TARGET;
   // Derived selectedSpotIds — flat unique list of all days' spot ids
@@ -591,7 +661,7 @@ export default function App() {
   // Build stop sequence for the active day: [lodging → activities → lodging].
   // Uses stable ids so Google Directions segments can be looked up per pair.
   const editDayStops = useMemo(() => {
-    const lodgingLat = selectedLodging?.latlng;
+    const lodgingLat = selectedLodgingLatLng;
     const stops = [];
     if (lodgingLat) stops.push({ id: "__lodging-start", latlng: lodgingLat, name: selectedLodging.name, kind: "lodging-start" });
     for (const a of dayActivities) {
@@ -601,14 +671,20 @@ export default function App() {
       stops.push({ id: "__lodging-end", latlng: lodgingLat, name: selectedLodging.name, kind: "lodging-end" });
     }
     return stops;
-  }, [selectedLodging, dayActivities]);
+  }, [selectedLodging, selectedLodgingLatLng, dayActivities]);
 
   // Stable cache key for the active day's stop sequence — avoids refiring the
   // directions fetch effect when memoized identities change but the actual
   // sequence is unchanged (e.g. parent re-renders).
   const editDayStopsKey = useMemo(
-    () => editDayStops.map((s) => `${s.id}@${s.latlng?.[0] ?? "_"},${s.latlng?.[1] ?? "_"}`).join("|"),
-    [editDayStops]
+    () =>
+      editDayStops
+        .map((s) => {
+          const latlng = asValidLatLng(s.latlng) ?? selectedLodgingLatLng;
+          return `${s.id}@${latlng?.[0] ?? "_"},${latlng?.[1] ?? "_"}`;
+        })
+        .join("|"),
+    [editDayStops, selectedLodgingLatLng]
   );
 
   // Fetch real Google Directions for each consecutive pair of stops on the
@@ -617,7 +693,17 @@ export default function App() {
   // haversine straight lines if DirectionsService is unavailable.
   useEffect(() => {
     if (step !== 2) return;
-    const valid = editDayStops.filter((s) => s.latlng);
+    if (!gmapsReady) {
+      setEditDaySegments([]);
+      setEditDaySegmentsLoading(false);
+      return;
+    }
+    const valid = editDayStops
+      .map((s) => {
+        const latlng = asValidLatLng(s.latlng) ?? selectedLodgingLatLng;
+        return latlng ? { ...s, latlng } : null;
+      })
+      .filter(Boolean);
     if (valid.length < 2) {
       setEditDaySegments([]);
       return;
@@ -631,7 +717,7 @@ export default function App() {
     });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, editDayStopsKey, move]);
+  }, [step, editDayStopsKey, move, selectedLodgingLatLng, gmapsReady]);
 
   // Build timeline items for active day — lodging anchors + activities +
   // transport blocks between. Transport blocks use real Google Directions data
@@ -679,12 +765,14 @@ export default function App() {
     for (let i = 1; i < editDayStops.length; i++) {
       const from = editDayStops[i - 1];
       const to = editDayStops[i];
-      if (from.latlng && to.latlng) {
+      const fromLatLng = asValidLatLng(from.latlng) ?? selectedLodgingLatLng;
+      const toLatLng = asValidLatLng(to.latlng) ?? selectedLodgingLatLng;
+      if (fromLatLng && toLatLng) {
         const seg = segLookup.get(`${from.id}→${to.id}`);
         if (seg && seg.durationSecs != null) {
           const realMinutes = Math.max(1, Math.round(seg.durationSecs / 60));
           const realKm = parseDistanceKm(seg.distance);
-          const mode = guessTransportMode(realKm ?? 0, move);
+          const mode = resolveSegmentTransportMode(seg, move, realKm ?? 0);
           items.push({
             type: "transport",
             icon: mode.icon,
@@ -694,12 +782,23 @@ export default function App() {
             real: true,
             distanceText: seg.distance,
             durationText: seg.duration,
+            transitSummary: seg.transitSummary ?? null,
+            policyNotice: seg.fallbackNotice ?? null,
           });
           cursor += realMinutes;
         } else {
-          const km = haversineKm(from.latlng, to.latlng);
+          const km = haversineKm(fromLatLng, toLatLng);
           const mode = guessTransportMode(km, move);
-          items.push({ type: "transport", ...mode, km, real: false });
+          items.push({
+            type: "transport",
+            ...mode,
+            km,
+            real: false,
+            policyNotice:
+              move === "public"
+                ? "실시간 대중교통 경로를 찾지 못해 근사 이동시간을 표시합니다."
+                : null,
+          });
           cursor += mode.minutes;
         }
       }
@@ -707,13 +806,15 @@ export default function App() {
     }
 
     return items;
-  }, [editDayStops, editDaySegments, move]);
+  }, [editDayStops, editDaySegments, move, selectedLodgingLatLng]);
 
   // Merged road-following polyline for the Edit View map. Concatenates each
   // segment's polylinePath into a single continuous path. Falls back to a
   // straight-line path through stops when real directions are unavailable.
   const mergedRoutePath = useMemo(() => {
-    const realSegs = editDaySegments.filter((s) => Array.isArray(s.polylinePath) && s.polylinePath.length >= 2);
+    const realSegs = editDaySegments.filter(
+      (s) => !s.isApproximate && Array.isArray(s.polylinePath) && s.polylinePath.length >= 2
+    );
     if (realSegs.length > 0) {
       const merged = [];
       for (const seg of realSegs) {
@@ -724,11 +825,68 @@ export default function App() {
       }
       if (merged.length >= 2) return merged;
     }
-    const fallback = editDayStops.filter((s) => s.latlng).map((s) => s.latlng);
+    const fallback = editDayStops
+      .map((s) => asValidLatLng(s.latlng) ?? selectedLodgingLatLng)
+      .filter(Boolean);
     return fallback.length >= 2 ? fallback : [];
-  }, [editDaySegments, editDayStops]);
+  }, [editDaySegments, editDayStops, selectedLodgingLatLng]);
 
-  const mergedRouteIsReal = editDaySegments.some((s) => Array.isArray(s.polylinePath) && s.polylinePath.length >= 2);
+  const mergedRouteTrafficSegments = useMemo(() => {
+    const segments = [];
+    for (const seg of editDaySegments) {
+      for (const trafficSeg of seg.trafficSegments ?? []) {
+        if (!Array.isArray(trafficSeg.path) || trafficSeg.path.length < 2) continue;
+        const deduped = [];
+        for (const pt of trafficSeg.path) {
+          const last = deduped[deduped.length - 1];
+          if (!last || last[0] !== pt[0] || last[1] !== pt[1]) deduped.push(pt);
+        }
+        if (deduped.length < 2) continue;
+        segments.push({
+          positions: deduped,
+          color: trafficSeg.color,
+          weight: 6,
+          opacity: 0.95,
+          dashed: false,
+        });
+      }
+    }
+    return segments;
+  }, [editDaySegments]);
+
+  const mergedRouteIsReal = editDaySegments.some(
+    (s) => !s.isApproximate && Array.isArray(s.polylinePath) && s.polylinePath.length >= 2
+  );
+  const mergedRouteHasTraffic = mergedRouteTrafficSegments.length > 0;
+
+  const editMapMarkers = useMemo(() => {
+    const markers = [];
+    if (selectedLodgingLatLng) {
+      markers.push({
+        id: "hotel",
+        lat: selectedLodgingLatLng[0],
+        lng: selectedLodgingLatLng[1],
+        title: `🏨 ${selectedLodging?.name ?? "숙소"}`,
+        pin: { kind: "hotel", color: "#ffa33a" },
+      });
+    }
+    dayActivities.forEach((a, i) => {
+      const latlng = asValidLatLng(a.latlng) ?? selectedLodgingLatLng;
+      if (!latlng) return;
+      markers.push({
+        id: a.id,
+        lat: latlng[0],
+        lng: latlng[1],
+        title: `${i + 1}. ${a.name}`,
+        pin: {
+          kind: "number",
+          number: i + 1,
+          color: highlightItemId === a.id ? "#7fffff" : "#5ecfcf",
+        },
+      });
+    });
+    return spreadOverlappingMapMarkers(markers);
+  }, [selectedLodgingLatLng, selectedLodging, dayActivities, highlightItemId]);
 
   const canNext = useMemo(() => {
     if (step === 0) return selectedDest !== null || Boolean(selectedPlanId);
@@ -752,23 +910,49 @@ export default function App() {
     return out;
   }, [optimizedDayPicks, activeContents]);
 
-  const spotNumberById = useMemo(() => {
-    if (!optimizedDayPicks) return new Map();
-    const map = new Map();
-    let n = 0;
-    const days = Object.keys(optimizedDayPicks).map(Number).sort((a, b) => a - b);
-    for (const d of days) {
-      const ids = optimizedDayPicks[d];
-      if (!Array.isArray(ids)) continue;
-      for (const id of ids) {
-        n += 1;
-        map.set(id, n);
-      }
-    }
-    return map;
-  }, [optimizedDayPicks]);
+  const displayScheduleForResult = useMemo(
+    () => (modifiedSchedule && modifiedSchedule.length > 0 ? modifiedSchedule : pickedContents),
+    [modifiedSchedule, pickedContents]
+  );
 
-  const segmentDefs = useMemo(() => buildMoveSegmentDefs(pickedContents, move), [pickedContents, move]);
+  const segmentDefs = useMemo(() => {
+    const safeContents = displayScheduleForResult
+      .map((p) => {
+        const latlng = asValidLatLng(p.latlng) ?? selectedLodgingLatLng;
+        return latlng ? { ...p, latlng } : null;
+      })
+      .filter(Boolean);
+    return buildMoveSegmentDefs(safeContents, move);
+  }, [displayScheduleForResult, move, selectedLodgingLatLng]);
+
+  const resultMapMarkers = useMemo(() => {
+    const markers = displayScheduleForResult
+      .map((p, idx) => {
+        const markerLatLng = asValidLatLng(p.latlng) ?? selectedLodgingLatLng;
+        if (!markerLatLng) return null;
+        const assignedDay = Number(p.assignedDay) || 1;
+        return {
+          id: p.id,
+          key: `${p.id}-${assignedDay}-${idx}`,
+          latlng: markerLatLng,
+          assignedDay,
+          number: idx + 1,
+          name: p.name,
+          summary: p.summary ?? "",
+        };
+      })
+      .filter(Boolean);
+
+    const spread = spreadOverlappingMapMarkers(
+      markers.map((m) => ({
+        id: m.id,
+        lat: m.latlng[0],
+        lng: m.latlng[1],
+      }))
+    );
+    const spreadById = new Map(spread.map((m, idx) => [idx, [m.lat, m.lng]]));
+    return markers.map((m, idx) => ({ ...m, latlng: spreadById.get(idx) ?? m.latlng }));
+  }, [displayScheduleForResult, selectedLodgingLatLng]);
 
   const scheduleByDay = useMemo(() => {
     // When modifiedSchedule is active, use it (it's a flat array with assignedDay)
@@ -882,9 +1066,22 @@ export default function App() {
             allSpots.push({ ...s, day: d.day, assignedDay: d.day });
           }
         }
+        const cityCenterLatLng = asValidLatLng(await forwardGeocode(`${region} ${country}`));
+        const fallbackLatLng =
+          asValidLatLng(customLodging?.latlng) ??
+          asValidLatLng((dynLodgings ?? [])[0]?.latlng) ??
+          selectedLodgingLatLng ??
+          cityCenterLatLng;
         const refined = await Promise.all(allSpots.map(async (s) => {
-          const coords = await forwardGeocode(`${s.area ?? s.name} ${region} ${country}`);
-          return coords ? { ...s, latlng: coords } : s;
+          const validCoords = await geocodeBestLatLng({
+            name: s.name,
+            area: s.area,
+            region,
+            country,
+          });
+          if (validCoords) return { ...s, latlng: validCoords };
+          if (fallbackLatLng) return { ...s, latlng: fallbackLatLng, approximateLatlng: true };
+          return s;
         }));
         setDynContents(refined);
         setRecommended(refined);
@@ -897,7 +1094,7 @@ export default function App() {
     } finally {
       setIsRefining(false);
     }
-  }, [refinePrompt, isRefining, country, region, days, move, activeMoves, tags]);
+  }, [refinePrompt, isRefining, country, region, days, move, activeMoves, tags, customLodging, dynLodgings, selectedLodgingLatLng]);
 
   // ── DnD setup ─────────────────────────────────────────────────────────
   const dndSensors = useSensors(
@@ -941,6 +1138,7 @@ export default function App() {
     if (step === 0) {
       if (selectedDest !== null && destSuggestions[selectedDest]) {
         const dest = destSuggestions[selectedDest];
+        resetGeneratedPlanState();
         if (dest.trav_loc_depth) {
           setCountry(dest.trav_loc_depth.country || country);
           setRegion(dest.trav_loc_depth.city || dest.trav_loc_depth.region || region);
@@ -1026,6 +1224,7 @@ export default function App() {
   const handleAutopilot = useCallback(async () => {
     const text = destQuery.trim();
     if (!text || destLoading) return;
+    resetGeneratedPlanState();
     setDestLoading(true);
     setDataLoading(true);
     const logCb = (log) => appendLog(log);
@@ -1039,6 +1238,7 @@ export default function App() {
       const dest = dests[0];
       const autoCountry = dest.trav_loc_depth?.country ?? "일본";
       const autoRegion = dest.trav_loc_depth?.city ?? dest.trav_loc_depth?.region ?? "도쿄";
+      const cityCenterLatLng = asValidLatLng(await forwardGeocode(`${autoRegion} ${autoCountry}`));
       setCountry(autoCountry);
       setRegion(autoRegion);
       setDays("2박 3일");
@@ -1051,8 +1251,15 @@ export default function App() {
       const lodgings = await generateLodgings(autoCountry, autoRegion, logCb);
       if (lodgings.length > 0) {
         const refined = await Promise.all(lodgings.map(async (l) => {
-          const coords = await forwardGeocode(`${l.area ?? l.name} ${autoRegion} ${autoCountry}`);
-          return coords ? { ...l, latlng: coords } : l;
+          const validCoords = await geocodeBestLatLng({
+            name: l.name,
+            area: l.area,
+            region: autoRegion,
+            country: autoCountry,
+          });
+          if (validCoords) return { ...l, latlng: validCoords };
+          if (cityCenterLatLng) return { ...l, latlng: cityCenterLatLng, approximateLatlng: true };
+          return l;
         }));
         setDynLodgings(refined);
         setSelectedLodgingId(refined[0]?.id ?? "");
@@ -1064,9 +1271,20 @@ export default function App() {
       if (itinerary?.days) {
         const allSpots = [];
         for (const d of itinerary.days) for (const s of (d.spots ?? [])) allSpots.push({ ...s, day: d.day, assignedDay: d.day });
+        const fallbackLatLng =
+          asValidLatLng((lodgings ?? [])[0]?.latlng) ??
+          asValidLatLng(selectedLodgingLatLng) ??
+          cityCenterLatLng;
         const refined = await Promise.all(allSpots.map(async (s) => {
-          const coords = await forwardGeocode(`${s.area ?? s.name} ${autoRegion} ${autoCountry}`);
-          return coords ? { ...s, latlng: coords } : s;
+          const validCoords = await geocodeBestLatLng({
+            name: s.name,
+            area: s.area,
+            region: autoRegion,
+            country: autoCountry,
+          });
+          if (validCoords) return { ...s, latlng: validCoords };
+          if (fallbackLatLng) return { ...s, latlng: fallbackLatLng, approximateLatlng: true };
+          return s;
         }));
         setDynContents(refined);
         // Build dayAssignments from LLM itinerary
@@ -1082,7 +1300,7 @@ export default function App() {
       setDestLoading(false);
       setDataLoading(false);
     }
-  }, [destLoading, maxDestCount, activeLodgings, dynLodgings, assignOptimalDays]);
+  }, [destLoading, maxDestCount, activeLodgings, dynLodgings, assignOptimalDays, selectedLodgingLatLng, resetGeneratedPlanState]);
 
   const handleDestQuery = useCallback(async () => {
     const text = destQuery.trim();
@@ -1200,10 +1418,7 @@ export default function App() {
   const restartScenario = () => {
     setStep(0);
     setDayAssignments({ 1: [], 2: [], 3: [] });
-    setSelectedLodgingId(activeLodgings[0]?.id ?? "");
-    setOptimizedDayPicks(null);
-    setHighlightIds([]);
-    setTransitPopup(null);
+    resetGeneratedPlanState();
     setMapInfo("핀 또는 이동 경로를 클릭하면 해당 일정이 강조됩니다.");
     setShowVarHandler(false);
     setChatHistory([]);
@@ -1213,7 +1428,7 @@ export default function App() {
 
 
   // ── LLM send handler ────────────────────────────────────────────────────────
-  const activeSchedule = modifiedSchedule ?? pickedContents;
+  const activeSchedule = displayScheduleForResult;
   const planProgress = useMemo(
     () => calcProgress(activeSchedule, currentTimeStr),
     [activeSchedule, currentTimeStr]
@@ -1221,14 +1436,6 @@ export default function App() {
 
   // ── Schedule Directions (Google Maps Directions API) ──────────────────────
   const [scheduleDirections, setScheduleDirections] = useState([]);
-  const [gmapsReady, setGmapsReady] = useState(Boolean(window.__googleMapsLoaded));
-
-  useEffect(() => {
-    if (window.__googleMapsLoaded) return;
-    const handler = () => setGmapsReady(true);
-    window.addEventListener("googlemapsloaded", handler, { once: true });
-    return () => window.removeEventListener("googlemapsloaded", handler);
-  }, []);
 
   useEffect(() => {
     if (!gmapsReady || activeSchedule.length < 2) {
@@ -1459,7 +1666,7 @@ export default function App() {
                         <div className="edit-view__body">
                           <div className="edit-view__timeline">
                             {dataLoading && (
-                              <LoadingCaption text="AI가 일정을 구성하고 있습니다…" elapsed={loadingElapsed} />
+                              <LoadingCaption text="AI가 액티비티를 생성하고 있습니다…" elapsed={loadingElapsed} />
                             )}
                             {!dataLoading && dayActivities.length === 0 && (
                               <div className="edit-view__empty">
@@ -1512,7 +1719,13 @@ export default function App() {
                                               {showKm && (
                                                 <span className="tl-item__transport-km">{kmText}</span>
                                               )}
+                                              {item.transitSummary && (
+                                                <span className="tl-item__transport-km">{item.transitSummary}</span>
+                                              )}
                                             </span>
+                                            {item.policyNotice && (
+                                              <span className="tl-item__transport-km">{item.policyNotice}</span>
+                                            )}
                                           </div>
                                         );
                                       }
@@ -1536,46 +1749,27 @@ export default function App() {
                           </div>
                           <div className="edit-view__map">
                             <div className="edit-view__map-legend">
-                              <span className={`legend-swatch${mergedRouteIsReal ? "" : " legend-swatch--dashed"}`} />
+                              <span className={`legend-swatch${mergedRouteIsReal || mergedRouteHasTraffic ? "" : " legend-swatch--dashed"}`} />
                               <span className="legend-label">
-                                {mergedRouteIsReal ? "Google 실제 도로 경로" : "직선 근사"}
+                                {mergedRouteHasTraffic ? "교통 혼잡 반영 도로 경로" : mergedRouteIsReal ? "Google 실제 도로 경로" : "직선 근사"}
                               </span>
+                              {mergedRouteHasTraffic && (
+                                <span className="legend-label-dim">· 혼잡도 색상(녹/황/적)</span>
+                              )}
                               <span className="legend-sep">·</span>
                               <span className="legend-label-dim">{moveProfile?.icon} {moveProfile?.name}</span>
                               {editDaySegmentsLoading && <span className="legend-label-dim">· 계산중…</span>}
                             </div>
                             <GoogleMapView
-                              center={selectedLodging?.latlng ?? [35.6804, 139.769]}
+                              center={selectedLodgingLatLng ?? [35.6804, 139.769]}
                               zoom={13}
-                              markers={[
-                                ...(selectedLodging?.latlng
-                                  ? [{
-                                      id: "hotel",
-                                      lat: selectedLodging.latlng[0],
-                                      lng: selectedLodging.latlng[1],
-                                      title: `🏨 ${selectedLodging.name}`,
-                                      pin: { kind: "hotel", color: "#ffa33a" },
-                                    }]
-                                  : []),
-                                ...dayActivities
-                                  .filter((a) => a.latlng)
-                                  .map((a, i) => ({
-                                    id: a.id,
-                                    lat: a.latlng[0],
-                                    lng: a.latlng[1],
-                                    title: `${i + 1}. ${a.name}`,
-                                    pin: {
-                                      kind: "number",
-                                      number: i + 1,
-                                      color: highlightItemId === a.id ? "#7fffff" : "#5ecfcf",
-                                    },
-                                  })),
-                              ]}
+                              markers={editMapMarkers}
+                              polylineSegments={mergedRouteTrafficSegments}
                               polylinePositions={mergedRoutePath}
                               polylineOptions={{
                                 color: mergedRouteIsReal ? "#ffd23f" : "#5ecfcf",
                                 weight: mergedRouteIsReal ? 5 : 4,
-                                dashed: !mergedRouteIsReal,
+                                dashed: !mergedRouteIsReal && !mergedRouteHasTraffic,
                               }}
                               onMarkerClick={(id) => {
                                 if (id === "hotel") return;
@@ -2056,42 +2250,43 @@ export default function App() {
                   </button>
                 </div>
                 <div className="map-box">
-                  <MapContainer center={selectedLodging?.latlng ?? [35.6804, 139.769]} zoom={12} style={{ height: "100%", width: "100%" }}>
+                  <MapContainer center={selectedLodgingLatLng ?? [35.6804, 139.769]} zoom={12} style={{ height: "100%", width: "100%" }}>
                     <TileLayer
                       attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>'
                       url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
                     />
-                    <Marker
-                      key={selectedLodging.id}
-                      position={selectedLodging.latlng}
-                      icon={lodgingMapIcon}
-                      zIndexOffset={800}
-                      eventHandlers={{
-                        click: () => {
-                          setMapInfo(`숙소 · ${selectedLodging.name} — ${selectedLodging.summary}`);
-                          setHighlightIds([selectedLodging.id]);
-                        },
-                      }}
-                    >
-                      <Popup>{selectedLodging.name}</Popup>
-                    </Marker>
+                    {selectedLodgingLatLng && (
+                      <Marker
+                        key={selectedLodging.id}
+                        position={selectedLodgingLatLng}
+                        icon={lodgingMapIcon}
+                        zIndexOffset={800}
+                        eventHandlers={{
+                          click: () => {
+                            setMapInfo(`숙소 · ${selectedLodging.name} — ${selectedLodging.summary}`);
+                            setHighlightIds([selectedLodging.id]);
+                          },
+                        }}
+                      >
+                        <Popup>{selectedLodging.name}</Popup>
+                      </Marker>
+                    )}
 
-                    {pickedContents.map((p) => {
-                      const num = spotNumberById.get(p.id) ?? 0;
+                    {resultMapMarkers.map((m) => {
                       return (
                         <Marker
-                          key={p.id}
-                          position={p.latlng}
-                          icon={dayNumberIcon(p.assignedDay, num)}
+                          key={m.key}
+                          position={m.latlng}
+                          icon={dayNumberIcon(m.assignedDay, m.number)}
                           zIndexOffset={400}
                           eventHandlers={{
                             click: () => {
-                              setMapInfo(`DAY${p.assignedDay} · ${num}. ${p.name} — ${p.summary}`);
-                              setHighlightIds([p.id]);
+                              setMapInfo(`DAY${m.assignedDay} · ${m.number}. ${m.name} — ${m.summary}`);
+                              setHighlightIds([m.id]);
                             },
                           }}
                         >
-                          <Popup>{p.name}</Popup>
+                          <Popup>{m.name}</Popup>
                         </Marker>
                       );
                     })}
@@ -2101,7 +2296,8 @@ export default function App() {
                       moveId={move}
                       onSegmentClick={(segment, e, dirInfo) => {
                         const eta = dirInfo?.duration ? ` · ${dirInfo.duration} (${dirInfo.distance})` : ` (${segment.duration})`;
-                        setMapInfo(`${segment.modeLabel} · ${segment.from.name} → ${segment.to.name}${eta}`);
+                        const policy = dirInfo?.fallbackNotice ? ` · ${dirInfo.fallbackNotice}` : "";
+                        setMapInfo(`${segment.modeLabel} · ${segment.from.name} → ${segment.to.name}${eta}${policy}`);
                         setHighlightIds([segment.from.id, segment.to.id]);
                         setTransitPopup({ position: e.latlng, segment, moveProfile, dirInfo });
                       }}
@@ -2234,7 +2430,7 @@ export default function App() {
           setCustomLodging(hotel);
           setSelectedLodgingId(hotel.id);
         }}
-        onLog={(log) => appendLog(log)}
+        onLog={appendLog}
       />
     </div>
   );
@@ -2253,6 +2449,74 @@ function haversineKm(a, b) {
     Math.sin(dLat / 2) ** 2 +
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
   return 2 * R * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+}
+
+function asValidLatLng(latlng) {
+  if (!Array.isArray(latlng) || latlng.length !== 2) return null;
+  const lat = Number(latlng[0]);
+  const lng = Number(latlng[1]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return [lat, lng];
+}
+
+function buildGeocodeQueries({ name, area, region, country }) {
+  const n = String(name ?? "").trim();
+  const a = String(area ?? "").trim();
+  const r = String(region ?? "").trim();
+  const c = String(country ?? "").trim();
+  const queries = [
+    `${n} ${a} ${r} ${c}`,
+    `${n} ${r} ${c}`,
+    `${n} ${c}`,
+    `${n} ${a} ${c}`,
+    `${a} ${r} ${c}`,
+  ]
+    .map((q) => q.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  return Array.from(new Set(queries));
+}
+
+async function geocodeBestLatLng({ name, area, region, country }) {
+  const queries = buildGeocodeQueries({ name, area, region, country });
+  for (const query of queries) {
+    const coords = await forwardGeocode(query);
+    const valid = asValidLatLng(coords);
+    if (valid) return valid;
+  }
+  return null;
+}
+
+function spreadOverlappingMapMarkers(markers, radius = 0.0012) {
+  if (!Array.isArray(markers) || markers.length <= 1) return markers;
+  const out = markers.map((m) => ({ ...m }));
+  const byCoord = new Map();
+  const hotelCoordKeys = new Set();
+
+  out.forEach((m, idx) => {
+    const key = `${Number(m.lat).toFixed(5)},${Number(m.lng).toFixed(5)}`;
+    if (m.pin?.kind === "hotel") {
+      hotelCoordKeys.add(key);
+      return;
+    }
+    if (!byCoord.has(key)) byCoord.set(key, []);
+    byCoord.get(key).push(idx);
+  });
+
+  for (const [key, idxs] of byCoord.entries()) {
+    if (idxs.length <= 1) {
+      if (hotelCoordKeys.has(key)) {
+        const i = idxs[0];
+        out[i].lat += radius;
+      }
+      continue;
+    }
+    idxs.forEach((idx, k) => {
+      const angle = (Math.PI * 2 * k) / idxs.length;
+      out[idx].lat += Math.cos(angle) * radius;
+      out[idx].lng += Math.sin(angle) * radius;
+    });
+  }
+  return out;
 }
 
 /** Parse Google Directions distance text ("1.2 km", "800 m") to km. */
@@ -2276,6 +2540,25 @@ function guessTransportMode(distanceKm, style) {
   if (distanceKm < 1) return walk(distanceKm);
   if (distanceKm < 8) return transit(distanceKm);
   return car(distanceKm);
+}
+
+function resolveSegmentTransportMode(seg, style, distanceKm) {
+  const mode = String(seg?.travelModeUsed ?? "").toUpperCase();
+  if (mode === "WALKING") return { icon: "🚶", label: "도보", minutes: Math.max(3, Math.round(distanceKm * 12)) };
+  if (mode === "TRANSIT") return { icon: "🚇", label: "대중교통", minutes: Math.max(4, Math.round(distanceKm * 4 + 6)) };
+  if (mode === "BICYCLING") return { icon: "🚲", label: "자전거", minutes: Math.max(4, Math.round(distanceKm * 5 + 3)) };
+  if (mode === "DRIVING") return { icon: "🚗", label: style === "public" ? "차량 이동" : "차", minutes: Math.max(5, Math.round(distanceKm * 2 + 5)) };
+  return guessTransportMode(distanceKm, style);
+}
+
+function formatTransitVehicleLabel(type = "") {
+  const upper = String(type).toUpperCase();
+  if (upper.includes("SUBWAY") || upper.includes("METRO")) return "지하철";
+  if (upper.includes("BUS")) return "버스";
+  if (upper.includes("LIGHT_RAIL")) return "경전철";
+  if (upper.includes("RAIL") || upper.includes("TRAIN")) return "철도";
+  if (upper.includes("FERRY")) return "페리";
+  return "대중교통";
 }
 
 function fmtMinutes(mins) {
@@ -2346,21 +2629,15 @@ function SortableActivityItem({ item, number, highlighted, onHighlight, onRemove
 }
 
 /**
- * Loading caption for showbox A during step transitions. Shows the main text,
- * animated dots, elapsed seconds, and a hint after 15s to let the user know
- * the local Ollama is still working (not stuck).
+ * Loading caption for showbox A during step transitions.
+ * Shows only current elapsed time (no ETA hints).
  */
 function LoadingCaption({ text, elapsed = 0 }) {
   return (
     <div className="step0-a__status loading-caption">
       <span className="var-chat__dots"><span /><span /><span /></span>
       <span className="loading-caption__text">{text}</span>
-      {elapsed > 0 && (
-        <span className="loading-caption__elapsed">{elapsed}초 경과</span>
-      )}
-      {elapsed >= 15 && (
-        <span className="loading-caption__hint">로컬 Ollama 모델은 응답에 최대 1분 걸릴 수 있습니다. 잠시만 기다려주세요…</span>
-      )}
+      <span className="loading-caption__elapsed">{elapsed}초 경과</span>
     </div>
   );
 }
@@ -2368,16 +2645,49 @@ function LoadingCaption({ text, elapsed = 0 }) {
 function renderMovePopup(segment, moveProfile, dirInfo) {
   const { from, to, duration, lineLabel } = segment;
   const hasGdir = dirInfo && (dirInfo.duration || dirInfo.distance);
+  const transitSteps = (dirInfo?.steps ?? []).filter((s) => s.travelMode === "TRANSIT" && s.transit);
+  const policy = dirInfo?.routePolicy ?? null;
+  const policyNotice = dirInfo?.fallbackNotice ?? null;
   return (
     <>
       <strong>{moveProfile.name} 구간 안내</strong>
       <div>
         구간: {from.name} {"→"} {to.name}
       </div>
+      {policyNotice && <div>경로 안내: {policyNotice}</div>}
+      {policy && (
+        <div>
+          경로 정책: 요청 {policy.requestedMode} · 적용 {policy.resolvedMode}
+          {policy.fallback ? " (대체 적용)" : ""}
+        </div>
+      )}
       {hasGdir ? (
         <>
           <div>소요 시간: {dirInfo.duration}</div>
           <div>이동 거리: {dirInfo.distance}</div>
+          {dirInfo.transitSummary && <div>노선 요약: {dirInfo.transitSummary}</div>}
+          {transitSteps.length > 0 && (
+            <>
+              <hr className="popup-hr" />
+              <strong>탑승 안내</strong>
+              <ul style={{ margin: "4px 0 0 14px", padding: 0, fontSize: "11px" }}>
+                {transitSteps.map((s, i) => {
+                  const t = s.transit;
+                  const vehicleLabel = formatTransitVehicleLabel(t.vehicleType);
+                  const lineLabelText = t.lineShort || t.lineName || t.vehicleName || vehicleLabel;
+                  const stopLabel = [t.departureStop, t.arrivalStop].filter(Boolean).join(" → ");
+                  return (
+                    <li key={`tx-${i}`} style={{ marginBottom: "3px" }}>
+                      <strong>{vehicleLabel} {lineLabelText}</strong>
+                      {t.headsign ? <span>{` (${t.headsign} 방면)`}</span> : null}
+                      {stopLabel ? <div>{stopLabel}</div> : null}
+                      {t.stopCount != null ? <div>정거장 {t.stopCount}개</div> : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
+          )}
           {dirInfo.steps && dirInfo.steps.length > 0 && (
             <>
               <hr className="popup-hr" />
