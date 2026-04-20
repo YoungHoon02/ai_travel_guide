@@ -12,6 +12,94 @@
 			"isBackground": false
 		},
 		{
+			"label": "build-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "test-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"test",
+				"--",
+				"--run"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "build-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "test-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"test",
+				"--",
+				"--run"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "build-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "test-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"test",
+				"--",
+				"--run"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "build-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "test-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"test",
+				"--",
+				"--run"
+			],
+			"isBackground": false
+		},
+		{
 			"label": "check-current-branch",
 			"type": "shell",
 			"command": "git",
