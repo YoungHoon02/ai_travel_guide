@@ -335,7 +335,16 @@ function fetchLegacyGoogleDirections(originLatLng, destLatLng, travelMode = "DRI
   });
 }
 
-async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, apiKey) {
+/**
+ * @param {[number,number]} originLatLng
+ * @param {[number,number]} destLatLng
+ * @param {string} travelMode
+ * @param {string} apiKey
+ * @param {{ departureTime?: string }} [opts={}]
+ *   departureTime — ISO 8601 UTC override. Only applied for TRANSIT/DRIVING.
+ *   Defaults to the current moment when not provided (existing behaviour).
+ */
+async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, apiKey, opts = {}) {
   const isTransit = travelMode === "TRANSIT";
   const isDriving = travelMode === "DRIVING";
 
@@ -367,10 +376,10 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
     languageCode: "ko",
   };
 
-  if (isTransit) baseBody.departureTime = new Date().toISOString();
+  if (isTransit) baseBody.departureTime = opts.departureTime ?? new Date().toISOString();
   if (travelMode === "DRIVING") {
     baseBody.routingPreference = "TRAFFIC_AWARE";
-    baseBody.departureTime = new Date().toISOString();
+    baseBody.departureTime = opts.departureTime ?? new Date().toISOString();
   }
 
   const requestVariants = [];
@@ -541,22 +550,38 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
   };
 }
 
-export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING") {
+/**
+ * Fetch a single point-to-point route via the configured routing backend.
+ *
+ * @param {[number,number]} originLatLng
+ * @param {[number,number]} destLatLng
+ * @param {string} [travelMode="DRIVING"]
+ * @param {{ departureTime?: string }} [options={}]
+ *   departureTime — ISO 8601 UTC (e.g. "2024-03-15T09:00:00Z").
+ *   When provided, bypasses the direction cache so the time-sensitive
+ *   sequential transit chain always gets a fresh result.
+ */
+export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING", options = {}) {
   if (!isValidLatLng(originLatLng) || !isValidLatLng(destLatLng)) return null;
   if (isSameLatLng(originLatLng, destLatLng)) {
     return buildZeroDistanceDirection(originLatLng, travelMode);
   }
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
+  const { departureTime = null } = options;
+  // Time-stamped transit requests must not use the cache (different times → different routes).
   const cacheKey = buildDirectionCacheKey(originLatLng, destLatLng, travelMode);
-  const now = Date.now();
-  const cached = directionsCache.get(cacheKey);
-  if (cached && cached.expiresAt > now) return cached.value;
-  if (directionsInFlight.has(cacheKey)) return directionsInFlight.get(cacheKey);
+  if (!departureTime) {
+    const now = Date.now();
+    const cached = directionsCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) return cached.value;
+    if (directionsInFlight.has(cacheKey)) return directionsInFlight.get(cacheKey);
+  }
 
+  const routeOpts = departureTime ? { departureTime } : {};
   const requestPromise = (async () => {
     const shouldTryRoutesApi = PREFER_ROUTES_API && Boolean(apiKey) && Date.now() >= routesApiDisabledUntil;
     if (shouldTryRoutesApi) {
-      const routesResult = await fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, apiKey);
+      const routesResult = await fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, apiKey, routeOpts);
       if (routesResult) return routesResult;
       // Routes 우선 모드에서는 레거시 DirectionsService를 기본적으로 호출하지 않는다.
       if (!ALLOW_LEGACY_DIRECTIONS_FALLBACK) return null;
@@ -564,6 +589,11 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
     if (!ALLOW_LEGACY_DIRECTIONS_FALLBACK && PREFER_ROUTES_API) return null;
     return await fetchLegacyGoogleDirections(originLatLng, destLatLng, travelMode);
   })();
+
+  if (departureTime) {
+    // Don't cache time-stamped results — let them complete and return directly.
+    return requestPromise;
+  }
 
   directionsInFlight.set(cacheKey, requestPromise);
   try {
@@ -578,9 +608,163 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
   }
 }
 
-export async function fetchScheduleDirections(schedule, moveId) {
+/**
+ * Sequential leg-by-leg transit routing for Google Routes API v2.
+ *
+ * The Routes API v2 does not allow multiple intermediate waypoints for
+ * TRANSIT mode. This function resolves that constraint by calling the API
+ * once per consecutive stop pair and chaining the times:
+ *
+ *   departureTime(B→C) = arrivalTime(A→B) + stayDuration(at B)
+ *
+ * All times are handled in ISO 8601 UTC so cross-timezone itineraries
+ * (e.g. Incheon → New York) work correctly.
+ *
+ * On a segment error the result records `error` but processing continues —
+ * the caller receives a full array with per-leg success/failure status.
+ *
+ * @param {Array<{latlng: [number,number], name?: string, stayDuration?: number}>} places
+ *   Ordered stop list. `stayDuration` is in **minutes** (default 0).
+ * @param {string} initialDepartureTime
+ *   ISO 8601 UTC timestamp for the first leg departure.
+ * @returns {Promise<Array<{
+ *   legIndex: number,
+ *   fromIndex: number,
+ *   toIndex: number,
+ *   fromName: string,
+ *   toName: string,
+ *   departureTime: string,
+ *   arrivalTime: string|null,
+ *   duration: string|null,
+ *   durationSecs: number|null,
+ *   distance: string|null,
+ *   transitSummary: string|null,
+ *   polylinePath: Array|null,
+ *   trafficSegments: Array,
+ *   error: string|null
+ * }>>}
+ */
+/**
+ * Parse an ISO 8601 UTC string and return its millisecond timestamp.
+ * Returns `null` when the input is missing or results in an invalid date,
+ * so callers can fall back gracefully instead of letting `toISOString()`
+ * throw a `RangeError: Invalid time value`.
+ */
+function parseDateMs(isoString) {
+  if (isoString == null || isoString === "") return null;
+  const ms = new Date(isoString).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export async function fetchTransitSequential(places, initialDepartureTime) {
+  const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
+  if (!apiKey || places.length < 2) return [];
+
+  // Validate the initial departure anchor — if unparseable, fall back to now.
+  const anchorMs = parseDateMs(initialDepartureTime) ?? Date.now();
+  let currentDepartureTimeMs = anchorMs;
+
+  const results = [];
+
+  for (let i = 0; i < places.length - 1; i++) {
+    const from = places[i];
+    const to = places[i + 1];
+    const fromName = from.name ?? `지점 ${i + 1}`;
+    const toName = to.name ?? `지점 ${i + 2}`;
+    const currentDepartureTime = new Date(currentDepartureTimeMs).toISOString();
+
+    // Call fetchRoutesApiDirections directly so the departureTime is always
+    // honoured regardless of the PREFER_ROUTES_API env setting. Sequential
+    // transit routing explicitly requires the Routes API v2.
+    let dir = null;
+    let segmentError = null;
+
+    try {
+      dir = await fetchRoutesApiDirections(from.latlng, to.latlng, "TRANSIT", apiKey, {
+        departureTime: currentDepartureTime,
+      });
+      if (!dir) segmentError = "대중교통 경로를 찾을 수 없습니다";
+    } catch (e) {
+      segmentError = e?.message ?? "알 수 없는 오류";
+    }
+
+    results.push({
+      legIndex: i,
+      fromIndex: i,
+      toIndex: i + 1,
+      fromName,
+      toName,
+      departureTime: currentDepartureTime,
+      duration: dir?.duration ?? null,
+      durationSecs: dir?.durationSecs ?? null,
+      distance: dir?.distance ?? null,
+      transitSummary: dir?.transitSummary ?? null,
+      polylinePath: dir?.polylinePath ?? null,
+      trafficSegments: dir?.trafficSegments ?? [],
+      error: segmentError,
+    });
+
+    // Propagate next departure: compute from departureTime + durationSecs + stayDuration.
+    // Guard: coerce stayDuration to a finite number of minutes (default 0) so that
+    // NaN or undefined values don't corrupt the time chain.
+    const rawStay = Number(to.stayDuration ?? 0);
+    const stayMs = Number.isFinite(rawStay) ? rawStay * 60 * 1000 : 0;
+    const durationMs = Number.isFinite(dir?.durationSecs) ? dir.durationSecs * 1000 : 0;
+    currentDepartureTimeMs = currentDepartureTimeMs + durationMs + stayMs;
+  }
+
+  return results;
+}
+
+/**
+ * Fetch directions for every consecutive stop pair in a schedule.
+ *
+ * For TRANSIT / "public" mode the Routes API v2 does not support
+ * multi-waypoint requests, so this dispatches to `fetchTransitSequential`
+ * (sequential leg-by-leg calls with departure-time chaining) when
+ * `options.initialDepartureTime` is provided. Without that option the
+ * existing parallel-call logic with DRIVING/WALKING fallbacks is used.
+ *
+ * All other travel modes always use parallel calls (unchanged).
+ *
+ * @param {Array<{id:string, latlng:[number,number], name:string, stayDuration?:number}>} schedule
+ * @param {string} moveId  — key in GMAPS_TRAVEL_MODE_MAP
+ * @param {{ initialDepartureTime?: string }} [options={}]
+ *   initialDepartureTime — ISO 8601 UTC for the first TRANSIT leg.
+ *   When provided, enables time-chained sequential routing for "public" mode.
+ */
+export async function fetchScheduleDirections(schedule, moveId, options = {}) {
   const travelMode = GMAPS_TRAVEL_MODE_MAP[moveId] ?? "DRIVING";
   if (!import.meta.env.VITE_GOOGLE_MAPS_API_KEY || schedule.length < 2) return [];
+
+  // ── TRANSIT sequential mode (when caller provides a departure anchor) ──────
+  if (moveId === "public" && options.initialDepartureTime) {
+    const places = schedule.map((s) => ({
+      latlng: s.latlng,
+      name: s.name,
+      stayDuration: s.stayDuration ?? 0,
+    }));
+    const legs = await fetchTransitSequential(places, options.initialDepartureTime);
+    return legs.map((leg) => ({
+      fromId: schedule[leg.fromIndex]?.id ?? null,
+      toId: schedule[leg.toIndex]?.id ?? null,
+      fromName: leg.fromName,
+      toName: leg.toName,
+      travelModeRequested: "TRANSIT",
+      duration: leg.duration,
+      durationSecs: leg.durationSecs,
+      distance: leg.distance,
+      transitSummary: leg.transitSummary,
+      polylinePath: leg.polylinePath,
+      trafficSegments: leg.trafficSegments,
+      // Expose both `departureTime` (TRANSIT-sequential field name) and
+      // `departureTimeISO` (the alias used by the non-TRANSIT parallel path)
+      // so consumers can use a single field name regardless of routing mode.
+      departureTime: leg.departureTime,
+      departureTimeISO: leg.departureTime,
+      error: leg.error,
+    }));
+  }
 
   const hasTransitStep = (dir) =>
     dir?.travelModeUsed === "TRANSIT" || (dir?.steps ?? []).some((s) => s.travelMode === "TRANSIT");
