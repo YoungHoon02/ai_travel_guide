@@ -651,7 +651,7 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
  * throw a `RangeError: Invalid time value`.
  */
 function parseDateMs(isoString) {
-  if (!isoString) return null;
+  if (isoString == null || isoString === "") return null;
   const ms = new Date(isoString).getTime();
   return Number.isFinite(ms) ? ms : null;
 }
