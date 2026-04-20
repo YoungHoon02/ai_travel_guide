@@ -101,6 +101,7 @@ const ROUTES_TRAFFIC_FIELD_MASK = [
   "routes.legs.travelAdvisory",
 ];
 const ROUTES_SOFT_DISABLE_WINDOW_MS = 5 * 60 * 1000;
+const ROUTES_MIN_DEPARTURE_LEAD_MS = 2 * 60 * 1000;
 const DIRECTIONS_CACHE_TTL_MS = 2 * 60 * 1000;
 const DIRECTIONS_FAILURE_CACHE_TTL_MS = 20 * 1000;
 let routesApiDisabledUntil = 0;
@@ -117,7 +118,8 @@ function isValidLatLng(latlng) {
   if (!Array.isArray(latlng) || latlng.length !== 2) return false;
   const lat = Number(latlng[0]);
   const lng = Number(latlng[1]);
-  return Number.isFinite(lat) && Number.isFinite(lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+  return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
 }
 
 function parseDurationSeconds(durationText) {
@@ -126,6 +128,13 @@ function parseDurationSeconds(durationText) {
   if (!m) return null;
   const v = Math.round(Number.parseFloat(m[1]));
   return Number.isFinite(v) ? v : null;
+}
+
+function ensureFutureDepartureIso(isoString) {
+  const minFutureMs = Date.now() + ROUTES_MIN_DEPARTURE_LEAD_MS;
+  const parsedMs = new Date(String(isoString ?? "")).getTime();
+  const candidateMs = Number.isFinite(parsedMs) ? parsedMs : minFutureMs;
+  return new Date(Math.max(candidateMs, minFutureMs)).toISOString();
 }
 
 function normalizeTransitStep(transitDetails) {
@@ -376,10 +385,10 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
     languageCode: "ko",
   };
 
-  if (isTransit) baseBody.departureTime = opts.departureTime ?? new Date().toISOString();
+  if (isTransit) baseBody.departureTime = ensureFutureDepartureIso(opts.departureTime);
   if (travelMode === "DRIVING") {
     baseBody.routingPreference = "TRAFFIC_AWARE";
-    baseBody.departureTime = opts.departureTime ?? new Date().toISOString();
+    baseBody.departureTime = ensureFutureDepartureIso(opts.departureTime);
   }
 
   const requestVariants = [];
@@ -672,6 +681,28 @@ export async function fetchTransitSequential(places, initialDepartureTime) {
     const fromName = from.name ?? `지점 ${i + 1}`;
     const toName = to.name ?? `지점 ${i + 2}`;
     const currentDepartureTime = new Date(currentDepartureTimeMs).toISOString();
+
+    if (!isValidLatLng(from.latlng) || !isValidLatLng(to.latlng)) {
+      const rawStay = Number(to.stayDuration ?? 0);
+      const stayMs = Number.isFinite(rawStay) ? rawStay * 60 * 1000 : 0;
+      results.push({
+        legIndex: i,
+        fromIndex: i,
+        toIndex: i + 1,
+        fromName,
+        toName,
+        departureTime: currentDepartureTime,
+        duration: null,
+        durationSecs: null,
+        distance: null,
+        transitSummary: null,
+        polylinePath: null,
+        trafficSegments: [],
+        error: "좌표 값이 유효하지 않아 대중교통 경로를 계산할 수 없습니다.",
+      });
+      currentDepartureTimeMs = currentDepartureTimeMs + stayMs;
+      continue;
+    }
 
     // Call fetchRoutesApiDirections directly so the departureTime is always
     // honoured regardless of the PREFER_ROUTES_API env setting. Sequential
