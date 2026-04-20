@@ -1,0 +1,211 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "build-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "build-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "test-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"test",
+				"--",
+				"--run"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "build-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "test-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"test",
+				"--",
+				"--run"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "build-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "test-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"test",
+				"--",
+				"--run"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "build-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "test-app",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"test",
+				"--",
+				"--run"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "check-current-branch",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"branch",
+				"--show-current"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "checkout-recheck-api",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"checkout",
+				"recheck-api"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "find-recheck-branch",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"branch",
+				"-a"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "find-recheck-filtered",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"branch",
+				"-a",
+				"--list",
+				"*recheck*"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "fetch-all",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"fetch",
+				"--all",
+				"--prune"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "list-remotes",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"remote",
+				"-v"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "check-origin-recheck",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"ls-remote",
+				"--heads",
+				"origin",
+				"recheck-api"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "check-upstream-recheck",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"ls-remote",
+				"--heads",
+				"upstream",
+				"recheck-api"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "create-and-checkout-recheck-api",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"checkout",
+				"-b",
+				"recheck-api"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "verify-branch",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"branch",
+				"--show-current"
+			],
+			"isBackground": false
+		}
+	]
+}

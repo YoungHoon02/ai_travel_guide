@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import GoogleMapView from "./GoogleMapView.jsx";
 import { forwardGeocode, generateHotelInsights } from "../api.js";
@@ -87,6 +87,9 @@ function priceLevelLabel(level) {
 }
 
 const FAVORITES_KEY = "ai-travel-guide:hotel-favorites";
+const HOTEL_SEARCH_INFLIGHT = new Map();
+const HOTEL_INSIGHTS_CACHE = new Map();
+const HOTEL_INSIGHTS_INFLIGHT = new Map();
 
 function loadFavoritesFromStorage() {
   try {
@@ -95,6 +98,23 @@ function loadFavoritesFromStorage() {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch { return []; }
+}
+
+function buildInsightsKey(list, country = "", region = "") {
+  const ids = (list ?? []).map((h) => h.id).join(",");
+  return `${String(country).trim().toLowerCase()}|${String(region).trim().toLowerCase()}|${ids}`;
+}
+
+async function searchHotelsDedup(query) {
+  const key = String(query ?? "").trim().toLowerCase();
+  if (!key) return [];
+  const pending = HOTEL_SEARCH_INFLIGHT.get(key);
+  if (pending) return pending;
+  const request = searchHotels(query).finally(() => {
+    HOTEL_SEARCH_INFLIGHT.delete(key);
+  });
+  HOTEL_SEARCH_INFLIGHT.set(key, request);
+  return request;
 }
 
 export default function HotelBrowseModal({ isOpen, onClose, country, region, onSelect, onLog }) {
@@ -118,6 +138,8 @@ export default function HotelBrowseModal({ isOpen, onClose, country, region, onS
   const [insightsById, setInsightsById] = useState({});
   const [insightsLoading, setInsightsLoading] = useState(false);
   const [activeFilter, setActiveFilter] = useState(null);
+  const searchSeqRef = useRef(0);
+  const insightsSeqRef = useRef(0);
 
   const toggleFavorite = useCallback((id) => {
     setFavorites((prev) => {
@@ -163,17 +185,36 @@ export default function HotelBrowseModal({ isOpen, onClose, country, region, onS
   // the card list can render immediately; insights fill in when ready.
   const loadInsightsFor = useCallback(async (list, countryVal, regionVal) => {
     if (!list || list.length === 0) return;
+    const key = buildInsightsKey(list, countryVal, regionVal);
+    const cached = HOTEL_INSIGHTS_CACHE.get(key);
+    if (cached) {
+      setInsightsById((prev) => ({ ...prev, ...cached }));
+      return;
+    }
+    const seq = ++insightsSeqRef.current;
     setInsightsLoading(true);
     try {
-      const result = await generateHotelInsights(list, { country: countryVal, region: regionVal }, onLog);
-      if (!result) return;
-      const map = {};
-      for (const item of result) {
-        if (item?.id) map[item.id] = item;
+      let pending = HOTEL_INSIGHTS_INFLIGHT.get(key);
+      if (!pending) {
+        pending = (async () => {
+          const result = await generateHotelInsights(list, { country: countryVal, region: regionVal }, onLog);
+          const map = {};
+          for (const item of (result ?? [])) {
+            if (item?.id) map[item.id] = item;
+          }
+          return map;
+        })().finally(() => {
+          HOTEL_INSIGHTS_INFLIGHT.delete(key);
+        });
+        HOTEL_INSIGHTS_INFLIGHT.set(key, pending);
       }
+      const map = await pending;
+      if (seq !== insightsSeqRef.current) return;
+      if (Object.keys(map).length === 0) return;
+      HOTEL_INSIGHTS_CACHE.set(key, map);
       setInsightsById((prev) => ({ ...prev, ...map }));
     } finally {
-      setInsightsLoading(false);
+      if (seq === insightsSeqRef.current) setInsightsLoading(false);
     }
   }, [onLog]);
 
@@ -182,24 +223,29 @@ export default function HotelBrowseModal({ isOpen, onClose, country, region, onS
     if (!isOpen || tab !== "browse") return;
     const query = `${region || ""} ${country || ""}`.trim();
     if (!query) return;
+    const seq = ++searchSeqRef.current;
     setLoading(true);
     setActiveFilter(null);
-    searchHotels(query).then((results) => {
+    setInsightsById({});
+    (async () => {
+      const results = await searchHotelsDedup(query);
+      if (seq !== searchSeqRef.current) return;
       setHotels(results);
-      setInsightsById({});
-      setLoading(false);
       setSelectedHotel(results[0] ?? null);
       loadInsightsFor(results, country, region);
-    });
+      setLoading(false);
+    })();
   }, [isOpen, tab, country, region, loadInsightsFor]);
 
   const handleSearch = useCallback(async () => {
     const query = searchQuery.trim() || `${region} ${country}`;
+    const seq = ++searchSeqRef.current;
     setLoading(true);
     setActiveFilter(null);
-    const results = await searchHotels(query);
-    setHotels(results);
     setInsightsById({});
+    const results = await searchHotelsDedup(query);
+    if (seq !== searchSeqRef.current) return;
+    setHotels(results);
     setLoading(false);
     setSelectedHotel(results[0] ?? null);
     loadInsightsFor(results, country, region);
