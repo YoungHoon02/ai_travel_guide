@@ -644,18 +644,34 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
  *   error: string|null
  * }>>}
  */
+/**
+ * Parse an ISO 8601 UTC string and return its millisecond timestamp.
+ * Returns `null` when the input is missing or results in an invalid date,
+ * so callers can fall back gracefully instead of letting `toISOString()`
+ * throw a `RangeError: Invalid time value`.
+ */
+function parseDateMs(isoString) {
+  if (!isoString) return null;
+  const ms = new Date(isoString).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
 export async function fetchTransitSequential(places, initialDepartureTime) {
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
   if (!apiKey || places.length < 2) return [];
 
+  // Validate the initial departure anchor — if unparseable, fall back to now.
+  const anchorMs = parseDateMs(initialDepartureTime) ?? Date.now();
+  let currentDepartureTimeMs = anchorMs;
+
   const results = [];
-  let currentDepartureTime = initialDepartureTime;
 
   for (let i = 0; i < places.length - 1; i++) {
     const from = places[i];
     const to = places[i + 1];
     const fromName = from.name ?? `지점 ${i + 1}`;
     const toName = to.name ?? `지점 ${i + 2}`;
+    const currentDepartureTime = new Date(currentDepartureTimeMs).toISOString();
 
     // Call fetchRoutesApiDirections directly so the departureTime is always
     // honoured regardless of the PREFER_ROUTES_API env setting. Sequential
@@ -688,17 +704,13 @@ export async function fetchTransitSequential(places, initialDepartureTime) {
       error: segmentError,
     });
 
-    // Propagate next departure: compute from departureTime + durationSecs + stayDuration,
-    // since the Routes API v2 doesn't expose per-leg arrivalTime in a convenient field.
-    const stayMs = (to.stayDuration ?? 0) * 60 * 1000;
-    if (dir?.durationSecs) {
-      const depMs = new Date(currentDepartureTime).getTime();
-      currentDepartureTime = new Date(depMs + dir.durationSecs * 1000 + stayMs).toISOString();
-    } else {
-      // No route info: advance only by stayDuration to keep the chain running.
-      const depMs = new Date(currentDepartureTime).getTime();
-      currentDepartureTime = new Date(depMs + stayMs).toISOString();
-    }
+    // Propagate next departure: compute from departureTime + durationSecs + stayDuration.
+    // Guard: coerce stayDuration to a finite number of minutes (default 0) so that
+    // NaN or undefined values don't corrupt the time chain.
+    const rawStay = Number(to.stayDuration ?? 0);
+    const stayMs = Number.isFinite(rawStay) ? rawStay * 60 * 1000 : 0;
+    const durationMs = Number.isFinite(dir?.durationSecs) ? dir.durationSecs * 1000 : 0;
+    currentDepartureTimeMs = currentDepartureTimeMs + durationMs + stayMs;
   }
 
   return results;
@@ -745,7 +757,11 @@ export async function fetchScheduleDirections(schedule, moveId, options = {}) {
       transitSummary: leg.transitSummary,
       polylinePath: leg.polylinePath,
       trafficSegments: leg.trafficSegments,
+      // Expose both `departureTime` (TRANSIT-sequential field name) and
+      // `departureTimeISO` (the alias used by the non-TRANSIT parallel path)
+      // so consumers can use a single field name regardless of routing mode.
       departureTime: leg.departureTime,
+      departureTimeISO: leg.departureTime,
       error: leg.error,
     }));
   }

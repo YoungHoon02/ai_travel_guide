@@ -78,6 +78,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
@@ -103,6 +104,44 @@ describe("fetchTransitSequential — input validation", () => {
     expect(result).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("falls back to Date.now() when initialDepartureTime is invalid and does not throw", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => jsonResponse(makeTransitRouteResponse({ durationSecs: 600 }))));
+
+    // Should not throw even with a nonsensical date string.
+    const before = Date.now();
+    const result = await fetchTransitSequential(
+      [{ latlng: [35.7, 139.7], name: "A" }, { latlng: [35.6, 139.8], name: "B" }],
+      "not-a-date"
+    );
+    const after = Date.now();
+
+    expect(result).toHaveLength(1);
+    // The departure time used in the leg should be a valid ISO string close to "now".
+    const depMs = new Date(result[0].departureTime).getTime();
+    expect(depMs).toBeGreaterThanOrEqual(before);
+    expect(depMs).toBeLessThanOrEqual(after + 1000); // allow 1s slack
+  });
+
+  it("treats NaN/undefined stayDuration as 0 and does not throw", async () => {
+    const fetchMock = vi.fn()
+      .mockReturnValueOnce(jsonResponse(makeTransitRouteResponse({ durationSecs: 1800 })))
+      .mockReturnValueOnce(jsonResponse(makeTransitRouteResponse({ durationSecs: 600 })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const places = [
+      { latlng: [35.7, 139.7], name: "A", stayDuration: undefined },
+      { latlng: [35.6, 139.8], name: "B", stayDuration: NaN }, // NaN should be treated as 0
+      { latlng: [35.5, 139.9], name: "C", stayDuration: 0 },
+    ];
+    // Should not throw RangeError.
+    const result = await fetchTransitSequential(places, "2024-03-15T09:00:00Z");
+
+    expect(result).toHaveLength(2);
+    // Leg 2 departure = 09:00 + 1800s (no extra stayDuration since NaN → 0)
+    const expectedDep2Ms = new Date("2024-03-15T09:00:00Z").getTime() + 1800 * 1000;
+    expect(new Date(result[1].departureTime).getTime()).toBe(expectedDep2Ms);
+  });
 });
 
 // ─── fetchTransitSequential — basic two-stop journey ──────────────────────────
@@ -123,7 +162,7 @@ describe("fetchTransitSequential — basic two-stop journey", () => {
     expect(result[0].toIndex).toBe(1);
     expect(result[0].fromName).toBe("A역");
     expect(result[0].toName).toBe("B역");
-    expect(result[0].departureTime).toBe("2024-03-15T09:00:00Z");
+    expect(new Date(result[0].departureTime).getTime()).toBe(new Date("2024-03-15T09:00:00Z").getTime());
     expect(result[0].durationSecs).toBe(1800);
     expect(result[0].error).toBeNull();
   });
@@ -171,7 +210,7 @@ describe("fetchTransitSequential — stayDuration time propagation", () => {
 
     expect(result).toHaveLength(2);
     // Leg 1: departs at initial time
-    expect(result[0].departureTime).toBe("2024-03-15T09:00:00Z");
+    expect(new Date(result[0].departureTime).getTime()).toBe(new Date("2024-03-15T09:00:00Z").getTime());
     // Leg 2 departure = 09:00 + 1800s travel + 60min stay = 09:00 + 30m + 60m = 10:30
     const expectedDep2Ms =
       new Date("2024-03-15T09:00:00Z").getTime() + 1800 * 1000 + 60 * 60 * 1000;
@@ -349,7 +388,7 @@ describe("fetchScheduleDirections — TRANSIT mode with initialDepartureTime", (
     expect(results[1].toId).toBe("c");
   });
 
-  it("includes departureTime and travelModeRequested in results", async () => {
+  it("includes departureTime, departureTimeISO and travelModeRequested in results", async () => {
     vi.stubGlobal("fetch", vi.fn(() => jsonResponse(makeTransitRouteResponse({ durationSecs: 1800 }))));
 
     const schedule = [
@@ -360,7 +399,10 @@ describe("fetchScheduleDirections — TRANSIT mode with initialDepartureTime", (
       initialDepartureTime: "2024-03-15T09:00:00Z",
     });
 
-    expect(leg.departureTime).toBe("2024-03-15T09:00:00Z");
+    expect(leg.departureTime).toBeDefined();
+    expect(new Date(leg.departureTime).getTime()).toBe(new Date("2024-03-15T09:00:00Z").getTime());
+    // departureTimeISO is the canonical alias so consumers can use a single field name.
+    expect(leg.departureTimeISO).toBe(leg.departureTime);
     expect(leg.travelModeRequested).toBe("TRANSIT");
   });
 
