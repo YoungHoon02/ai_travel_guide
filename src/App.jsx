@@ -594,7 +594,7 @@ export default function App() {
     return ids
       .map((id) => activeContents.find((c) => c.id === id))
       .filter(Boolean)
-      .map((item) => ({ ...item, duration: Math.max(30, (item.visitScore ?? 3) * 30) }));
+      .map((item) => ({ ...item, duration: calculateStayDurationMinutes(item) }));
   }, [schedule, activeDay, liveRoutePreview, activeContents]);
 
   // Build stop sequence for the active day: [lodging → activities → lodging].
@@ -604,7 +604,7 @@ export default function App() {
     const stops = [];
     if (lodgingLat) stops.push({ id: "__lodging-start", latlng: lodgingLat, name: selectedLodging.name, kind: "lodging-start" });
     for (const a of dayActivities) {
-      stops.push({ id: a.id, latlng: a.latlng, name: a.name, kind: "activity", activity: a, stayMin: a.duration ?? Math.max(30, (a.visitScore ?? 3) * 30) });
+      stops.push({ id: a.id, latlng: a.latlng, name: a.name, kind: "activity", activity: a, stayMin: a.duration ?? calculateStayDurationMinutes(a) });
     }
     if (lodgingLat && dayActivities.length > 0) {
       stops.push({ id: "__lodging-end", latlng: lodgingLat, name: selectedLodging.name, kind: "lodging-end" });
@@ -620,11 +620,19 @@ export default function App() {
     [editDayStops]
   );
 
-  const computeLegDepartureMs = useCallback((legs, targetIndex) => {
+  const tripBaseDateMs = useMemo(() => {
+    const start = planInputParsed?.startDate;
+    if (start) {
+      const parsed = Date.parse(`${start}T09:00:00`);
+      if (!Number.isNaN(parsed)) return parsed;
+    }
     const base = new Date();
     base.setHours(9, 0, 0, 0);
-    base.setDate(base.getDate() + Math.max(0, activeDay - 1));
-    let departureMs = base.getTime();
+    return base.getTime();
+  }, [planInputParsed?.startDate]);
+
+  const computeLegDepartureMs = useCallback((legs, targetIndex) => {
+    let departureMs = tripBaseDateMs + Math.max(0, activeDay - 1) * 24 * 60 * 60 * 1000;
     for (let i = 0; i < targetIndex; i += 1) {
       const leg = legs[i];
       const defaultArrival = departureMs + estimateLegDurationMinutes(
@@ -637,9 +645,9 @@ export default function App() {
       departureMs = arrivalMs + getStopStayMinutes(toStop) * 60 * 1000;
     }
     return departureMs;
-  }, [activeDay, editDayStops]);
+  }, [activeDay, editDayStops, tripBaseDateMs]);
 
-  const fetchLegChainFrom = useCallback(async (startLegIndex, reason = "update", legsOverride = null) => {
+  const fetchLegChainFrom = useCallback(async (startLegIndex, legsOverride = null) => {
     const sourceLegs = legsOverride ?? editDayLegs;
     if (startLegIndex < 0 || sourceLegs.length === 0 || editDayStops.length < 2) return;
     setEditDayLegs((prev) => prev.map((leg, idx) => (
@@ -659,7 +667,7 @@ export default function App() {
       }
 
       const departureTimeISO = new Date(departureMs).toISOString();
-      const routeData = await fetchGoogleDirections(fromStop.latlng, toStop.latlng, leg.travelMode, { departureTimeISO, reason });
+      const routeData = await fetchGoogleDirections(fromStop.latlng, toStop.latlng, leg.travelMode, { departureTimeISO });
       const arrivalMs =
         parseISOTimeMs(routeData?.arrivalTimeISO)
         ?? (routeData?.durationSecs != null ? departureMs + routeData.durationSecs * 1000 : departureMs + 15 * 60 * 1000);
@@ -1598,8 +1606,16 @@ export default function App() {
                                           <div
                                             key={`t-${idx}`}
                                             className="tl-item tl-item--transport"
+                                            role="button"
+                                            tabIndex={0}
+                                            aria-label={`구간 ${item.legIndex + 1} 경로 불러오기`}
                                             onClick={() => {
-                                              if (!item.real && !item.isLoading) fetchLegChainFrom(item.legIndex, "leg-select");
+                                              if (!item.real && !item.isLoading) fetchLegChainFrom(item.legIndex);
+                                            }}
+                                            onKeyDown={(event) => {
+                                              if (event.key !== "Enter" && event.key !== " ") return;
+                                              event.preventDefault();
+                                              if (!item.real && !item.isLoading) fetchLegChainFrom(item.legIndex);
                                             }}
                                           >
                                             <span className="tl-item__transport-line">
@@ -1618,6 +1634,7 @@ export default function App() {
                                                   key={option.value}
                                                   type="button"
                                                   className={`tl-item__mode-btn${item.travelMode === option.value ? " active" : ""}`}
+                                                  aria-label={`구간 ${item.legIndex + 1} ${option.label} 선택`}
                                                   onClick={(event) => {
                                                     event.stopPropagation();
                                                     const nextLegs = editDayLegs.map((leg, i) => (
@@ -1631,7 +1648,7 @@ export default function App() {
                                                         : leg
                                                     ));
                                                     setEditDayLegs(nextLegs);
-                                                    fetchLegChainFrom(item.legIndex, "mode-change", nextLegs);
+                                                    fetchLegChainFrom(item.legIndex, nextLegs);
                                                   }}
                                                 >
                                                   {option.icon} {option.label}
@@ -2416,10 +2433,16 @@ function parseISOTimeMs(iso) {
   return Number.isNaN(time) ? null : time;
 }
 
+function calculateStayDurationMinutes(activity) {
+  if (!activity) return 0;
+  const duration = activity.duration ?? (activity.visitScore ?? 3) * 30;
+  return Math.max(30, Math.round(duration));
+}
+
 function getStopStayMinutes(stop) {
   if (!stop || stop.kind !== "activity") return 0;
-  const stay = stop.stayMin ?? stop.activity?.duration ?? Math.max(30, (stop.activity?.visitScore ?? 3) * 30);
-  return Math.max(0, Math.round(stay));
+  const stay = stop.stayMin ?? calculateStayDurationMinutes(stop.activity);
+  return Math.max(0, stay);
 }
 
 function fmtMinutes(mins) {

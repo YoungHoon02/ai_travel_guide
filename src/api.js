@@ -72,6 +72,7 @@ const ROUTES_API_URL = "https://routes.googleapis.com/directions/v2:computeRoute
 const ROUTES_TRAVEL_MODE_MAP = {
   DRIVING: "DRIVE", WALKING: "WALK", BICYCLING: "BICYCLE", TRANSIT: "TRANSIT",
 };
+const SUPPORTED_TRAVEL_MODES = new Set(["TRANSIT", "WALKING", "DRIVING", "BICYCLING"]);
 const ROUTES_BASE_FIELD_MASK = [
   "routes.duration",
   "routes.distanceMeters",
@@ -88,10 +89,14 @@ const ROUTES_TRANSIT_FIELD_MASK = [
   "routes.legs.steps.transitDetails.transitLine.color",
   "routes.legs.steps.transitDetails.transitLine.nameShort",
 ];
+const DEFAULT_TRANSIT_PREFERENCES = {
+  routingPreference: "LESS_WALKING",
+  allowedTravelModes: ["SUBWAY", "TRAIN", "BUS"],
+};
 
 function normalizeTravelMode(mode) {
   const normalized = String(mode ?? "DRIVING").toUpperCase();
-  if (normalized === "TRANSIT" || normalized === "WALKING" || normalized === "DRIVING" || normalized === "BICYCLING") {
+  if (SUPPORTED_TRAVEL_MODES.has(normalized)) {
     return normalized;
   }
   return "DRIVING";
@@ -128,7 +133,15 @@ function transitLineColorFromRoute(route) {
   return null;
 }
 
-function buildRoutesRequestBody(originLatLng, destLatLng, travelMode, departureTimeISO) {
+function resolveArrivalTimeISO(leg, departureTimeISO, durationSecs) {
+  if (leg?.arrivalTime) return leg.arrivalTime;
+  const departureMs = Date.parse(departureTimeISO ?? "");
+  if (!Number.isFinite(departureMs) || durationSecs == null) return null;
+  return new Date(departureMs + durationSecs * 1000).toISOString();
+}
+
+function buildRoutesRequestBody(originLatLng, destLatLng, travelMode, options = {}) {
+  const departureTimeISO = options.departureTimeISO ?? null;
   const body = {
     origin: { location: { latLng: { latitude: originLatLng[0], longitude: originLatLng[1] } } },
     destination: { location: { latLng: { latitude: destLatLng[0], longitude: destLatLng[1] } } },
@@ -137,10 +150,7 @@ function buildRoutesRequestBody(originLatLng, destLatLng, travelMode, departureT
   };
   if (travelMode === "TRANSIT") {
     body.departureTime = departureTimeISO ?? new Date().toISOString();
-    body.transitPreferences = {
-      routingPreference: "LESS_WALKING",
-      allowedTravelModes: ["SUBWAY", "TRAIN", "BUS"],
-    };
+    body.transitPreferences = DEFAULT_TRANSIT_PREFERENCES;
   } else if (travelMode === "DRIVING") {
     body.routingPreference = "TRAFFIC_AWARE_OPTIMAL";
   } else if (travelMode === "WALKING") {
@@ -174,7 +184,7 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
         "X-Goog-Api-Key": apiKey,
         "X-Goog-FieldMask": (normalizedTravelMode === "TRANSIT" ? ROUTES_TRANSIT_FIELD_MASK : ROUTES_BASE_FIELD_MASK).join(","),
       },
-      body: JSON.stringify(buildRoutesRequestBody(originLatLng, destLatLng, normalizedTravelMode, departureTimeISO)),
+      body: JSON.stringify(buildRoutesRequestBody(originLatLng, destLatLng, normalizedTravelMode, { departureTimeISO })),
     });
     if (!res.ok) return null;
     const data = await res.json();
@@ -184,10 +194,8 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
     const durationSecs = parseRoutesDurationSecs(route.duration);
     const distanceMeters = route.distanceMeters ?? null;
     const leg0 = route.legs?.[0] ?? null;
-    const departureTime = leg0?.departureTime ?? departureTimeISO ?? null;
-    const arrivalTime =
-      leg0?.arrivalTime
-      ?? (departureTime && durationSecs != null ? new Date(new Date(departureTime).getTime() + durationSecs * 1000).toISOString() : null);
+    const departureTimeISOResolved = leg0?.departureTime ?? departureTimeISO ?? null;
+    const arrivalTimeISOResolved = resolveArrivalTimeISO(leg0, departureTimeISOResolved, durationSecs);
 
     const polylinePath =
       route.polyline?.encodedPolyline && window.google?.maps?.geometry
@@ -211,8 +219,8 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
       steps,
       polylinePath,
       travelMode: normalizedTravelMode,
-      departureTimeISO: departureTime,
-      arrivalTimeISO: arrivalTime,
+      departureTimeISO: departureTimeISOResolved,
+      arrivalTimeISO: arrivalTimeISOResolved,
       transitLineColor: transitLineColorFromRoute(route),
     };
   } catch { return null; }
