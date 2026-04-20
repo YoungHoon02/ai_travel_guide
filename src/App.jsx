@@ -23,7 +23,7 @@ import { CSS } from "@dnd-kit/utilities";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import { calcProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil, parseBooleanEnv } from "./utils.js";
-import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callLLM, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
+import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, fetchGoogleDirections, reverseGeocode, callLLM, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
 import {
   STEP_LABELS, RESULT_STEP, LAST_WIZARD_STEP, STAY_LOAD_TARGET, TRAVEL_TAGS,
   LODGINGS, SAVED_PLANS, CONTENTS, METRO_LINES, MOVES, THEME_CHIPS,
@@ -82,6 +82,12 @@ L.Icon.Default.mergeOptions({
 })();
 
 const LLM_LOG_DEBUG = parseBooleanEnv(import.meta.env.VITE_LLM_LOG_DEBUG);
+const LEG_MODE_OPTIONS = [
+  { value: "TRANSIT", label: "대중교통", icon: "🚇" },
+  { value: "DRIVING", label: "택시", icon: "🚕" },
+  { value: "WALKING", label: "도보", icon: "🚶" },
+];
+
 const sanitizeLogEntry = (entry) => {
   if (!entry) return entry;
   if (LLM_LOG_DEBUG) return entry;
@@ -164,10 +170,9 @@ export default function App() {
   const [copilotOpen, setCopilotOpen] = useState(false);
   // User-picked or custom-entered hotel. Overrides activeLodgings when set.
   const [customLodging, setCustomLodging] = useState(null);
-  // Real Google Directions segments for the Edit View active day.
-  // Shape: [{ fromId, toId, polylinePath, duration, durationSecs, distance }]
-  const [editDaySegments, setEditDaySegments] = useState([]);
-  const [editDaySegmentsLoading, setEditDaySegmentsLoading] = useState(false);
+  // Leg-based Routes API state for the Edit View active day.
+  // Shape: [{ startIndex, endIndex, travelMode, routeData, isLoading, color }]
+  const [editDayLegs, setEditDayLegs] = useState([]);
   const [tripDateMode, setTripDateMode] = useState(() => {
     try { return localStorage.getItem("tripDateMode") || "destination"; } catch { return "destination"; }
   });
@@ -582,10 +587,14 @@ export default function App() {
         llmStayNote: s.llmStayNote,
         assignedDay: s.day,
         time: s.startTime,
+        duration: s.duration,
       }));
     }
     const ids = liveRoutePreview?.[activeDay] ?? [];
-    return ids.map((id) => activeContents.find((c) => c.id === id)).filter(Boolean);
+    return ids
+      .map((id) => activeContents.find((c) => c.id === id))
+      .filter(Boolean)
+      .map((item) => ({ ...item, duration: Math.max(30, (item.visitScore ?? 3) * 30) }));
   }, [schedule, activeDay, liveRoutePreview, activeContents]);
 
   // Build stop sequence for the active day: [lodging → activities → lodging].
@@ -595,7 +604,7 @@ export default function App() {
     const stops = [];
     if (lodgingLat) stops.push({ id: "__lodging-start", latlng: lodgingLat, name: selectedLodging.name, kind: "lodging-start" });
     for (const a of dayActivities) {
-      stops.push({ id: a.id, latlng: a.latlng, name: a.name, kind: "activity", activity: a });
+      stops.push({ id: a.id, latlng: a.latlng, name: a.name, kind: "activity", activity: a, stayMin: a.duration ?? Math.max(30, (a.visitScore ?? 3) * 30) });
     }
     if (lodgingLat && dayActivities.length > 0) {
       stops.push({ id: "__lodging-end", latlng: lodgingLat, name: selectedLodging.name, kind: "lodging-end" });
@@ -611,25 +620,88 @@ export default function App() {
     [editDayStops]
   );
 
-  // Fetch real Google Directions for each consecutive pair of stops on the
-  // active day. Gives timeline blocks road-based durations / distances and
-  // feeds the map polyline with an actual road-following path. Falls back to
-  // haversine straight lines if DirectionsService is unavailable.
+  const computeLegDepartureMs = useCallback((legs, targetIndex) => {
+    const base = new Date();
+    base.setHours(9, 0, 0, 0);
+    base.setDate(base.getDate() + Math.max(0, activeDay - 1));
+    let departureMs = base.getTime();
+    for (let i = 0; i < targetIndex; i += 1) {
+      const leg = legs[i];
+      const defaultArrival = departureMs + estimateLegDurationMinutes(
+        editDayStops[leg?.startIndex]?.latlng,
+        editDayStops[leg?.endIndex]?.latlng,
+        leg?.travelMode
+      ) * 60 * 1000;
+      const arrivalMs = parseISOTimeMs(leg?.routeData?.arrivalTimeISO) ?? defaultArrival;
+      const toStop = editDayStops[leg?.endIndex];
+      departureMs = arrivalMs + getStopStayMinutes(toStop) * 60 * 1000;
+    }
+    return departureMs;
+  }, [activeDay, editDayStops]);
+
+  const fetchLegChainFrom = useCallback(async (startLegIndex, reason = "update", legsOverride = null) => {
+    const sourceLegs = legsOverride ?? editDayLegs;
+    if (startLegIndex < 0 || sourceLegs.length === 0 || editDayStops.length < 2) return;
+    setEditDayLegs((prev) => prev.map((leg, idx) => (
+      idx >= startLegIndex ? { ...leg, isLoading: true } : leg
+    )));
+
+    let departureMs = computeLegDepartureMs(sourceLegs, startLegIndex);
+    const nextLegs = [...sourceLegs];
+
+    for (let i = startLegIndex; i < nextLegs.length; i += 1) {
+      const leg = nextLegs[i];
+      const fromStop = editDayStops[leg.startIndex];
+      const toStop = editDayStops[leg.endIndex];
+      if (!fromStop?.latlng || !toStop?.latlng) {
+        nextLegs[i] = { ...leg, isLoading: false, routeData: null };
+        continue;
+      }
+
+      const departureTimeISO = new Date(departureMs).toISOString();
+      const routeData = await fetchGoogleDirections(fromStop.latlng, toStop.latlng, leg.travelMode, { departureTimeISO, reason });
+      const arrivalMs =
+        parseISOTimeMs(routeData?.arrivalTimeISO)
+        ?? (routeData?.durationSecs != null ? departureMs + routeData.durationSecs * 1000 : departureMs + 15 * 60 * 1000);
+      const color = routeData?.transitLineColor || legColorByMode(leg.travelMode);
+
+      nextLegs[i] = {
+        ...leg,
+        isLoading: false,
+        color,
+        routeData: routeData
+          ? {
+              ...routeData,
+              departureTimeISO,
+              arrivalTimeISO: routeData.arrivalTimeISO ?? new Date(arrivalMs).toISOString(),
+            }
+          : {
+              departureTimeISO,
+              arrivalTimeISO: new Date(arrivalMs).toISOString(),
+            },
+      };
+      departureMs = arrivalMs + getStopStayMinutes(toStop) * 60 * 1000;
+      setEditDayLegs([...nextLegs]);
+    }
+  }, [computeLegDepartureMs, editDayLegs, editDayStops]);
+
+  // Initialize leg-based state (B2 on-demand sequential loading).
   useEffect(() => {
     if (step !== 2) return;
-    const valid = editDayStops.filter((s) => s.latlng);
-    if (valid.length < 2) {
-      setEditDaySegments([]);
+    if (editDayStops.length < 2) {
+      setEditDayLegs([]);
       return;
     }
-    let cancelled = false;
-    setEditDaySegmentsLoading(true);
-    fetchScheduleDirections(valid, move).then((segs) => {
-      if (cancelled) return;
-      setEditDaySegments(segs ?? []);
-      setEditDaySegmentsLoading(false);
-    });
-    return () => { cancelled = true; };
+    const baseMode = defaultLegTravelMode(move);
+    const baseLegs = editDayStops.slice(0, -1).map((_, idx) => ({
+      startIndex: idx,
+      endIndex: idx + 1,
+      travelMode: baseMode,
+      routeData: null,
+      isLoading: false,
+      color: legColorByMode(baseMode),
+    }));
+    setEditDayLegs(baseLegs);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, editDayStopsKey, move]);
 
@@ -640,10 +712,6 @@ export default function App() {
   const timelineItems = useMemo(() => {
     const items = [];
     if (editDayStops.length === 0) return items;
-
-    const segLookup = new Map(
-      editDaySegments.map((s) => [`${s.fromId}→${s.toId}`, s])
-    );
 
     let cursor = 9 * 60; // minutes since midnight
 
@@ -680,55 +748,79 @@ export default function App() {
       const from = editDayStops[i - 1];
       const to = editDayStops[i];
       if (from.latlng && to.latlng) {
-        const seg = segLookup.get(`${from.id}→${to.id}`);
-        if (seg && seg.durationSecs != null) {
-          const realMinutes = Math.max(1, Math.round(seg.durationSecs / 60));
-          const realKm = parseDistanceKm(seg.distance);
-          const mode = guessTransportMode(realKm ?? 0, move);
+        const leg = editDayLegs[i - 1];
+        const routeData = leg?.routeData;
+        if (routeData && routeData.durationSecs != null) {
+          const realMinutes = Math.max(1, Math.round(routeData.durationSecs / 60));
+          const realKm = parseDistanceKm(routeData.distance);
+          const mode = transportLabelForMode(leg.travelMode);
           items.push({
             type: "transport",
             icon: mode.icon,
             label: mode.label,
+            legIndex: i - 1,
+            travelMode: leg.travelMode,
+            isLoading: Boolean(leg.isLoading),
+            color: leg.color,
             minutes: realMinutes,
             km: realKm ?? 0,
             real: true,
-            distanceText: seg.distance,
-            durationText: seg.duration,
+            distanceText: routeData.distance,
+            durationText: routeData.duration,
+            departureTimeISO: routeData.departureTimeISO,
+            arrivalTimeISO: routeData.arrivalTimeISO,
           });
           cursor += realMinutes;
         } else {
           const km = haversineKm(from.latlng, to.latlng);
-          const mode = guessTransportMode(km, move);
-          items.push({ type: "transport", ...mode, km, real: false });
-          cursor += mode.minutes;
+          const fallback = transportLabelForMode(leg?.travelMode ?? defaultLegTravelMode(move));
+          const fallbackMin = estimateLegDurationMinutes(from.latlng, to.latlng, leg?.travelMode ?? defaultLegTravelMode(move));
+          items.push({
+            type: "transport",
+            icon: fallback.icon,
+            label: fallback.label,
+            legIndex: i - 1,
+            travelMode: leg?.travelMode ?? defaultLegTravelMode(move),
+            isLoading: Boolean(leg?.isLoading),
+            color: leg?.color ?? legColorByMode(leg?.travelMode ?? defaultLegTravelMode(move)),
+            minutes: fallbackMin,
+            km,
+            real: false,
+          });
+          cursor += fallbackMin;
         }
       }
       pushStop(to);
     }
 
     return items;
-  }, [editDayStops, editDaySegments, move]);
+  }, [editDayStops, editDayLegs, move]);
 
-  // Merged road-following polyline for the Edit View map. Concatenates each
-  // segment's polylinePath into a single continuous path. Falls back to a
-  // straight-line path through stops when real directions are unavailable.
-  const mergedRoutePath = useMemo(() => {
-    const realSegs = editDaySegments.filter((s) => Array.isArray(s.polylinePath) && s.polylinePath.length >= 2);
-    if (realSegs.length > 0) {
-      const merged = [];
-      for (const seg of realSegs) {
-        for (const pt of seg.polylinePath) {
-          const last = merged[merged.length - 1];
-          if (!last || last[0] !== pt[0] || last[1] !== pt[1]) merged.push(pt);
-        }
-      }
-      if (merged.length >= 2) return merged;
-    }
-    const fallback = editDayStops.filter((s) => s.latlng).map((s) => s.latlng);
-    return fallback.length >= 2 ? fallback : [];
-  }, [editDaySegments, editDayStops]);
+  const legPolylines = useMemo(() => {
+    return editDayLegs
+      .map((leg, idx) => {
+        const from = editDayStops[leg.startIndex];
+        const to = editDayStops[leg.endIndex];
+        const realPath = leg.routeData?.polylinePath;
+        const positions = Array.isArray(realPath) && realPath.length >= 2
+          ? realPath
+          : (from?.latlng && to?.latlng ? [from.latlng, to.latlng] : []);
+        if (positions.length < 2) return null;
+        return {
+          id: `edit-leg-${idx}`,
+          positions,
+          options: {
+            color: leg.color,
+            weight: 5,
+            dashed: !(Array.isArray(realPath) && realPath.length >= 2),
+          },
+        };
+      })
+      .filter(Boolean);
+  }, [editDayLegs, editDayStops]);
 
-  const mergedRouteIsReal = editDaySegments.some((s) => Array.isArray(s.polylinePath) && s.polylinePath.length >= 2);
+  const mergedRouteIsReal = editDayLegs.some((leg) => Array.isArray(leg.routeData?.polylinePath) && leg.routeData.polylinePath.length >= 2);
+  const editDaySegmentsLoading = editDayLegs.some((leg) => leg.isLoading);
 
   const canNext = useMemo(() => {
     if (step === 0) return selectedDest !== null || Boolean(selectedPlanId);
@@ -1503,16 +1595,49 @@ export default function App() {
                                           (typeof item.km === "number" && item.km >= 1);
                                         const kmText = item.distanceText || (showKm ? `${item.km.toFixed(1)}km` : "");
                                         return (
-                                          <div key={`t-${idx}`} className="tl-item tl-item--transport">
+                                          <div
+                                            key={`t-${idx}`}
+                                            className="tl-item tl-item--transport"
+                                            onClick={() => {
+                                              if (!item.real && !item.isLoading) fetchLegChainFrom(item.legIndex, "leg-select");
+                                            }}
+                                          >
                                             <span className="tl-item__transport-line">
                                               <span className="tl-item__transport-arrow">↓</span>
                                               <span>{label}</span>
                                               <span className="tl-item__transport-sep">·</span>
                                               <span>{item.label}</span>
+                                              {item.isLoading && <span className="tl-item__transport-loading">불러오는 중…</span>}
                                               {showKm && (
                                                 <span className="tl-item__transport-km">{kmText}</span>
                                               )}
                                             </span>
+                                            <div className="tl-item__mode-switch" role="group" aria-label={`구간 ${item.legIndex + 1} 이동 수단`}>
+                                              {LEG_MODE_OPTIONS.map((option) => (
+                                                <button
+                                                  key={option.value}
+                                                  type="button"
+                                                  className={`tl-item__mode-btn${item.travelMode === option.value ? " active" : ""}`}
+                                                  onClick={(event) => {
+                                                    event.stopPropagation();
+                                                    const nextLegs = editDayLegs.map((leg, i) => (
+                                                      i === item.legIndex
+                                                        ? {
+                                                            ...leg,
+                                                            travelMode: option.value,
+                                                            routeData: null,
+                                                            color: legColorByMode(option.value),
+                                                          }
+                                                        : leg
+                                                    ));
+                                                    setEditDayLegs(nextLegs);
+                                                    fetchLegChainFrom(item.legIndex, "mode-change", nextLegs);
+                                                  }}
+                                                >
+                                                  {option.icon} {option.label}
+                                                </button>
+                                              ))}
+                                            </div>
                                           </div>
                                         );
                                       }
@@ -1571,12 +1696,7 @@ export default function App() {
                                     },
                                   })),
                               ]}
-                              polylinePositions={mergedRoutePath}
-                              polylineOptions={{
-                                color: mergedRouteIsReal ? "#ffd23f" : "#5ecfcf",
-                                weight: mergedRouteIsReal ? 5 : 4,
-                                dashed: !mergedRouteIsReal,
-                              }}
+                              polylines={legPolylines}
                               onMarkerClick={(id) => {
                                 if (id === "hotel") return;
                                 setHighlightItemId(id);
@@ -2265,17 +2385,41 @@ function parseDistanceKm(text) {
   return m[2].toLowerCase() === "m" ? v / 1000 : v;
 }
 
-function guessTransportMode(distanceKm, style) {
-  const walk = (km) => ({ icon: "🚶", label: "도보", minutes: Math.max(3, Math.round(km * 12)) });
-  const transit = (km) => ({ icon: "🚇", label: "대중교통", minutes: Math.round(km * 4 + 6) });
-  const car = (km) => ({ icon: "🚗", label: "차", minutes: Math.round(km * 2 + 5) });
-  if (style === "walking") return walk(distanceKm);
-  if (style === "public") return distanceKm < 1 ? walk(distanceKm) : transit(distanceKm);
-  if (style === "car") return distanceKm < 0.5 ? walk(distanceKm) : car(distanceKm);
-  // mixed (default)
-  if (distanceKm < 1) return walk(distanceKm);
-  if (distanceKm < 8) return transit(distanceKm);
-  return car(distanceKm);
+function defaultLegTravelMode(style) {
+  if (style === "public") return "TRANSIT";
+  if (style === "walking") return "WALKING";
+  return "DRIVING";
+}
+
+function transportLabelForMode(travelMode) {
+  if (travelMode === "TRANSIT") return { icon: "🚇", label: "대중교통" };
+  if (travelMode === "WALKING") return { icon: "🚶", label: "도보" };
+  return { icon: "🚕", label: "택시" };
+}
+
+function legColorByMode(travelMode) {
+  if (travelMode === "TRANSIT") return "#5ecfcf";
+  if (travelMode === "WALKING") return "#58a6ff";
+  return "#f97316";
+}
+
+function estimateLegDurationMinutes(fromLatLng, toLatLng, travelMode) {
+  const km = haversineKm(fromLatLng, toLatLng);
+  if (travelMode === "WALKING") return Math.max(4, Math.round(km * 12));
+  if (travelMode === "TRANSIT") return Math.max(6, Math.round(km * 4 + 6));
+  return Math.max(5, Math.round(km * 2 + 5));
+}
+
+function parseISOTimeMs(iso) {
+  if (!iso) return null;
+  const time = Date.parse(iso);
+  return Number.isNaN(time) ? null : time;
+}
+
+function getStopStayMinutes(stop) {
+  if (!stop || stop.kind !== "activity") return 0;
+  const stay = stop.stayMin ?? stop.activity?.duration ?? Math.max(30, (stop.activity?.visitScore ?? 3) * 30);
+  return Math.max(0, Math.round(stay));
 }
 
 function fmtMinutes(mins) {

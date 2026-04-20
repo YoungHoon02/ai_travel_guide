@@ -3436,6 +3436,37 @@ img.dest-card__thumb {
   background: rgba(94,207,207,0.08);
   border-radius: 2px;
 }
+.tl-item__transport-loading {
+  color: var(--mgs-orange);
+  font-size: 10px;
+  font-weight: 700;
+}
+.tl-item__mode-switch {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 34px;
+  margin-top: 4px;
+}
+.tl-item__mode-btn {
+  border: 1px solid var(--mgs-border);
+  background: rgba(15, 15, 18, 0.7);
+  color: var(--mgs-text-dim);
+  font-family: inherit;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.tl-item__mode-btn:hover {
+  border-color: var(--mgs-cyan-dim);
+  color: var(--mgs-text);
+}
+.tl-item__mode-btn.active {
+  border-color: var(--mgs-cyan);
+  color: var(--mgs-cyan);
+  background: rgba(94,207,207,0.14);
+}
 .tl-item__stay {
   color: var(--mgs-cyan);
   font-weight: 600;

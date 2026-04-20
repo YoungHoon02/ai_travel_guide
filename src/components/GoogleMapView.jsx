@@ -146,6 +146,7 @@ export default function GoogleMapView({
   markers = [],
   polylinePositions = [],
   polylineOptions,
+  polylines = [],
   onMarkerClick,
   fitBounds = true,
   className = "",
@@ -153,7 +154,7 @@ export default function GoogleMapView({
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const markerRefs = useRef([]);
-  const polylineRef = useRef(null);
+  const polylineRefs = useRef([]);
   // Hold latest click handler in a ref so marker effect doesn't refire when
   // the parent passes a fresh inline callback every render.
   const onMarkerClickRef = useRef(onMarkerClick);
@@ -268,41 +269,57 @@ export default function GoogleMapView({
   }, [markersKey, fitBounds]);
 
   // Content hash of polyline positions + style — same reasoning as markersKey.
+  const normalizedPolylines = useMemo(() => {
+    if (Array.isArray(polylines) && polylines.length > 0) return polylines;
+    if (polylinePositions.length < 2) return [];
+    return [{ positions: polylinePositions, options: polylineOptions ?? {} }];
+  }, [polylines, polylinePositions, polylineOptions]);
+
   const polylineKey = useMemo(
-    () => polylinePositions.map((p) => `${p[0]},${p[1]}`).join("|") + `#${polylineOptions?.color ?? ""}/${polylineOptions?.weight ?? ""}/${polylineOptions?.dashed ?? ""}`,
-    [polylinePositions, polylineOptions]
+    () => normalizedPolylines
+      .map((line) => {
+        const pts = (line?.positions ?? []).map((p) => `${p[0]},${p[1]}`).join("|");
+        const opt = line?.options ?? {};
+        return `${line?.id ?? ""}:${pts}#${opt.color ?? ""}/${opt.weight ?? ""}/${opt.dashed ?? ""}`;
+      })
+      .join("~"),
+    [normalizedPolylines]
   );
 
-  // Update polyline
+  // Update polyline(s)
   useEffect(() => {
     if (!mapRef.current) return;
-    if (polylineRef.current) {
-      polylineRef.current.setMap(null);
-      polylineRef.current = null;
-    }
-    if (polylinePositions.length < 2) return;
-    const color = polylineOptions?.color ?? "#5ecfcf";
-    const dashed = polylineOptions?.dashed !== false;
-    polylineRef.current = new window.google.maps.Polyline({
-      path: polylinePositions.map(([lat, lng]) => ({ lat, lng })),
-      strokeColor: color,
-      strokeOpacity: dashed ? 0 : 0.85,
-      strokeWeight: polylineOptions?.weight ?? 3,
-      icons: dashed
-        ? [
-            {
-              icon: {
-                path: "M 0,-1 0,1",
-                strokeOpacity: 1,
-                scale: 3,
-                strokeColor: color,
+    polylineRefs.current.forEach((line) => line.setMap(null));
+    polylineRefs.current = [];
+    if (normalizedPolylines.length === 0) return;
+    normalizedPolylines.forEach((line) => {
+      const positions = line?.positions ?? [];
+      if (positions.length < 2) return;
+      const options = line?.options ?? {};
+      const color = options.color ?? "#5ecfcf";
+      const dashed = options.dashed !== false;
+      const instance = new window.google.maps.Polyline({
+        path: positions.map(([lat, lng]) => ({ lat, lng })),
+        strokeColor: color,
+        strokeOpacity: dashed ? 0 : 0.85,
+        strokeWeight: options.weight ?? 3,
+        icons: dashed
+          ? [
+              {
+                icon: {
+                  path: "M 0,-1 0,1",
+                  strokeOpacity: 1,
+                  scale: 3,
+                  strokeColor: color,
+                },
+                offset: "0",
+                repeat: "12px",
               },
-              offset: "0",
-              repeat: "12px",
-            },
-          ]
-        : undefined,
-      map: mapRef.current,
+            ]
+          : undefined,
+        map: mapRef.current,
+      });
+      polylineRefs.current.push(instance);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [polylineKey]);
@@ -312,7 +329,8 @@ export default function GoogleMapView({
     return () => {
       markerRefs.current.forEach((m) => m.setMap(null));
       markerRefs.current = [];
-      if (polylineRef.current) polylineRef.current.setMap(null);
+      polylineRefs.current.forEach((line) => line.setMap(null));
+      polylineRefs.current = [];
     };
   }, []);
 

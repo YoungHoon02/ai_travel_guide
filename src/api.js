@@ -72,6 +72,82 @@ const ROUTES_API_URL = "https://routes.googleapis.com/directions/v2:computeRoute
 const ROUTES_TRAVEL_MODE_MAP = {
   DRIVING: "DRIVE", WALKING: "WALK", BICYCLING: "BICYCLE", TRANSIT: "TRANSIT",
 };
+const ROUTES_BASE_FIELD_MASK = [
+  "routes.duration",
+  "routes.distanceMeters",
+  "routes.polyline.encodedPolyline",
+  "routes.legs.departureTime",
+  "routes.legs.arrivalTime",
+  "routes.legs.steps.navigationInstruction",
+  "routes.legs.steps.staticDuration",
+  "routes.legs.steps.distanceMeters",
+  "routes.legs.steps.travelMode",
+];
+const ROUTES_TRANSIT_FIELD_MASK = [
+  ...ROUTES_BASE_FIELD_MASK,
+  "routes.legs.steps.transitDetails.transitLine.color",
+  "routes.legs.steps.transitDetails.transitLine.nameShort",
+];
+
+function normalizeTravelMode(mode) {
+  const normalized = String(mode ?? "DRIVING").toUpperCase();
+  if (normalized === "TRANSIT" || normalized === "WALKING" || normalized === "DRIVING" || normalized === "BICYCLING") {
+    return normalized;
+  }
+  return "DRIVING";
+}
+
+function parseRoutesDurationSecs(duration) {
+  if (!duration) return null;
+  const value = String(duration).trim();
+  const match = value.match(/^(\d+)(?:\.\d+)?s$/i);
+  if (match) return parseInt(match[1], 10);
+  const parsed = parseInt(value, 10);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function rgbColorToHex(color) {
+  if (!color) return null;
+  if (typeof color === "string") {
+    const hex = color.trim();
+    return /^#?[0-9a-f]{6}$/i.test(hex) ? (hex.startsWith("#") ? hex : `#${hex}`) : null;
+  }
+  const hasRGB = Number.isFinite(color.red) && Number.isFinite(color.green) && Number.isFinite(color.blue);
+  if (!hasRGB) return null;
+  const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+  const toHex = (v) => clamp(v).toString(16).padStart(2, "0");
+  return `#${toHex(color.red)}${toHex(color.green)}${toHex(color.blue)}`;
+}
+
+function transitLineColorFromRoute(route) {
+  const steps = route?.legs?.[0]?.steps ?? [];
+  for (const step of steps) {
+    const color = rgbColorToHex(step?.transitDetails?.transitLine?.color);
+    if (color) return color;
+  }
+  return null;
+}
+
+function buildRoutesRequestBody(originLatLng, destLatLng, travelMode, departureTimeISO) {
+  const body = {
+    origin: { location: { latLng: { latitude: originLatLng[0], longitude: originLatLng[1] } } },
+    destination: { location: { latLng: { latitude: destLatLng[0], longitude: destLatLng[1] } } },
+    travelMode: ROUTES_TRAVEL_MODE_MAP[travelMode] ?? "DRIVE",
+    languageCode: "ko",
+  };
+  if (travelMode === "TRANSIT") {
+    body.departureTime = departureTimeISO ?? new Date().toISOString();
+    body.transitPreferences = {
+      routingPreference: "LESS_WALKING",
+      allowedTravelModes: ["SUBWAY", "TRAIN", "BUS"],
+    };
+  } else if (travelMode === "DRIVING") {
+    body.routingPreference = "TRAFFIC_AWARE_OPTIMAL";
+  } else if (travelMode === "WALKING") {
+    body.routingPreference = "ROUTING_PREFERENCE_UNSPECIFIED";
+  }
+  return body;
+}
 
 function formatRouteDuration(secs) {
   const h = Math.floor(secs / 3600);
@@ -85,39 +161,33 @@ function formatRouteDistance(meters) {
   return `${meters} m`;
 }
 
-export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING") {
+export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING", options = {}) {
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
   if (!apiKey) return null;
+  const normalizedTravelMode = normalizeTravelMode(travelMode);
+  const departureTimeISO = options?.departureTimeISO ?? options?.departureTime ?? null;
   try {
     const res = await fetch(ROUTES_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": apiKey,
-        "X-Goog-FieldMask": [
-          "routes.duration",
-          "routes.distanceMeters",
-          "routes.polyline.encodedPolyline",
-          "routes.legs.steps.navigationInstruction",
-          "routes.legs.steps.staticDuration",
-          "routes.legs.steps.distanceMeters",
-          "routes.legs.steps.travelMode",
-        ].join(","),
+        "X-Goog-FieldMask": (normalizedTravelMode === "TRANSIT" ? ROUTES_TRANSIT_FIELD_MASK : ROUTES_BASE_FIELD_MASK).join(","),
       },
-      body: JSON.stringify({
-        origin: { location: { latLng: { latitude: originLatLng[0], longitude: originLatLng[1] } } },
-        destination: { location: { latLng: { latitude: destLatLng[0], longitude: destLatLng[1] } } },
-        travelMode: ROUTES_TRAVEL_MODE_MAP[travelMode] ?? "DRIVE",
-        languageCode: "ko",
-      }),
+      body: JSON.stringify(buildRoutesRequestBody(originLatLng, destLatLng, normalizedTravelMode, departureTimeISO)),
     });
     if (!res.ok) return null;
     const data = await res.json();
     const route = data?.routes?.[0];
     if (!route) return null;
 
-    const durationSecs = route.duration ? parseInt(route.duration) : null;
+    const durationSecs = parseRoutesDurationSecs(route.duration);
     const distanceMeters = route.distanceMeters ?? null;
+    const leg0 = route.legs?.[0] ?? null;
+    const departureTime = leg0?.departureTime ?? departureTimeISO ?? null;
+    const arrivalTime =
+      leg0?.arrivalTime
+      ?? (departureTime && durationSecs != null ? new Date(new Date(departureTime).getTime() + durationSecs * 1000).toISOString() : null);
 
     const polylinePath =
       route.polyline?.encodedPolyline && window.google?.maps?.geometry
@@ -128,9 +198,10 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
 
     const steps = (route.legs?.[0]?.steps ?? []).slice(0, 5).map((s) => ({
       instruction: escapeHtml((s.navigationInstruction?.instructions ?? "").slice(0, 80)),
-      duration: s.staticDuration ? formatRouteDuration(parseInt(s.staticDuration)) : "",
+      duration: s.staticDuration ? formatRouteDuration(parseRoutesDurationSecs(s.staticDuration) ?? 0) : "",
       distance: s.distanceMeters ? formatRouteDistance(s.distanceMeters) : "",
-      travelMode: s.travelMode ?? travelMode,
+      travelMode: s.travelMode ?? normalizedTravelMode,
+      transitLineShortName: s.transitDetails?.transitLine?.nameShort ?? null,
     }));
 
     return {
@@ -139,6 +210,10 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
       distance: distanceMeters ? formatRouteDistance(distanceMeters) : null,
       steps,
       polylinePath,
+      travelMode: normalizedTravelMode,
+      departureTimeISO: departureTime,
+      arrivalTimeISO: arrivalTime,
+      transitLineColor: transitLineColorFromRoute(route),
     };
   } catch { return null; }
 }
