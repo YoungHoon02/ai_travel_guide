@@ -7,14 +7,6 @@ import { osrmProfileForMove } from "../constants.js";
 export default function RoutedPolylines({ defs, moveId, onSegmentClick }) {
   const [geoms, setGeoms] = useState({});
   const [directionDetails, setDirectionDetails] = useState({});
-  const [gmapsReady, setGmapsReady] = useState(Boolean(window.__googleMapsLoaded));
-
-  useEffect(() => {
-    if (window.__googleMapsLoaded) return;
-    const handler = () => setGmapsReady(true);
-    window.addEventListener("googlemapsloaded", handler, { once: true });
-    return () => window.removeEventListener("googlemapsloaded", handler);
-  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -24,32 +16,30 @@ export default function RoutedPolylines({ defs, moveId, onSegmentClick }) {
     setGeoms(seed);
 
     const travelMode = GMAPS_TRAVEL_MODE_MAP[moveId] ?? "DRIVING";
+    const osrmProfile = osrmProfileForMove(moveId);
+
     (async () => {
-      if (gmapsReady) {
-        const entries = await Promise.all(
-          defs.map(async (def) => {
-            const dir = await fetchGoogleDirections(def.from.latlng, def.to.latlng, travelMode);
-            if (dir?.polylinePath && dir.polylinePath.length >= 2) return { id: def.id, path: dir.polylinePath, dir };
-            return { id: def.id, path: seed[def.id], dir: null };
-          })
-        );
-        if (cancelled) return;
-        setGeoms(Object.fromEntries(entries.map((e) => [e.id, e.path])));
-        setDirectionDetails(Object.fromEntries(entries.filter((e) => e.dir).map((e) => [e.id, e.dir])));
-        return;
-      }
-      const profile = osrmProfileForMove(moveId);
+      // Always try Google Directions first (returns null if VITE_GOOGLE_MAPS_API_KEY
+      // is unset). Fall back to OSRM per-segment if Google returns no polyline.
+      // fetchGoogleDirections uses a pure-JS polyline decoder so it works
+      // immediately — no need to wait for the Maps JS SDK to load.
       const entries = await Promise.all(
         defs.map(async (def) => {
-          const g = await fetchOsrmGeometry(def.from.latlng, def.to.latlng, profile);
-          return [def.id, g && g.length >= 2 ? g : seed[def.id]];
+          const dir = await fetchGoogleDirections(def.from.latlng, def.to.latlng, travelMode);
+          if (dir?.polylinePath && dir.polylinePath.length >= 2) {
+            return { id: def.id, path: dir.polylinePath, dir };
+          }
+          // Google unavailable or no polyline — try OSRM as fallback
+          const g = await fetchOsrmGeometry(def.from.latlng, def.to.latlng, osrmProfile);
+          return { id: def.id, path: g && g.length >= 2 ? g : seed[def.id], dir: null };
         })
       );
       if (cancelled) return;
-      setGeoms(Object.fromEntries(entries));
+      setGeoms(Object.fromEntries(entries.map((e) => [e.id, e.path])));
+      setDirectionDetails(Object.fromEntries(entries.filter((e) => e.dir).map((e) => [e.id, e.dir])));
     })();
     return () => { cancelled = true; };
-  }, [defs, moveId, gmapsReady]);
+  }, [defs, moveId]);
 
   return (
     <>

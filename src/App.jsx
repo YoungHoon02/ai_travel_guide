@@ -170,12 +170,14 @@ export default function App() {
   const [editDaySegmentsLoading, setEditDaySegmentsLoading] = useState(false);
 
   // ── Google Maps SDK ready flag ─────────────────────────────────────────────
-  // Declared early so direction-fetch effects that rely on
-  // window.google.maps.geometry (polyline decoding) can use it as a dep.
-  const [gmapsReady, setGmapsReady] = useState(Boolean(window.__googleMapsLoaded));
+  // Triggers a re-render when the Maps JS SDK finishes loading so that
+  // hasGoogleMaps-gated UI (VariableHandlerPanel route display, status text)
+  // updates. Route direction fetching no longer depends on this flag —
+  // fetchScheduleDirections uses a pure-JS polyline decoder + Routes REST API.
+  const [hasGoogleMaps, setHasGoogleMaps] = useState(Boolean(window.__googleMapsLoaded));
   useEffect(() => {
     if (window.__googleMapsLoaded) return;
-    const handler = () => setGmapsReady(true);
+    const handler = () => setHasGoogleMaps(true);
     window.addEventListener("googlemapsloaded", handler, { once: true });
     return () => window.removeEventListener("googlemapsloaded", handler);
   }, []);
@@ -626,12 +628,10 @@ export default function App() {
   // active day. Gives timeline blocks road-based durations / distances and
   // feeds the map polyline with an actual road-following path. Falls back to
   // haversine straight lines if DirectionsService is unavailable.
-  // gmapsReady is included so the effect re-runs once the Google Maps SDK
-  // finishes loading — without it the polyline decoding step inside
-  // fetchGoogleDirections (window.google.maps.geometry) would silently return
-  // null and the effect would never retry because its other deps stay the same.
+  // fetchGoogleDirections now uses a pure-JS polyline decoder so it no longer
+  // depends on the Maps JS SDK — no gmapsReady guard needed here.
   useEffect(() => {
-    if (step !== 2 || !gmapsReady) return;
+    if (step !== 2) return;
     const valid = editDayStops.filter((s) => s.latlng);
     if (valid.length < 2) {
       setEditDaySegments([]);
@@ -646,7 +646,7 @@ export default function App() {
     });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, editDayStopsKey, move, gmapsReady]);
+  }, [step, editDayStopsKey, move]);
 
   // Build timeline items for active day — lodging anchors + activities +
   // transport blocks between. Transport blocks use real Google Directions data
@@ -1238,12 +1238,12 @@ export default function App() {
   const [scheduleDirections, setScheduleDirections] = useState([]);
 
   useEffect(() => {
-    if (!gmapsReady || activeSchedule.length < 2) {
+    if (activeSchedule.length < 2) {
       setScheduleDirections([]);
       return;
     }
     fetchScheduleDirections(activeSchedule, move).then(setScheduleDirections);
-  }, [gmapsReady, activeSchedule, move]);
+  }, [activeSchedule, move]);
 
   const handleSendToLLM = useCallback(async () => {
     const text = chatInput.trim();
@@ -2153,7 +2153,7 @@ export default function App() {
               nearbyPlaces={nearbyPlaces}
               nearbyPlaceType={nearbyPlaceType}
               onNearbyTypeChange={handleNearbyTypeChange}
-              hasGoogleMaps={Boolean(window.__googleMapsLoaded)}
+              hasGoogleMaps={hasGoogleMaps}
               scheduleDirections={scheduleDirections}
             />
           </motion.div>

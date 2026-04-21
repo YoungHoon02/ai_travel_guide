@@ -85,6 +85,39 @@ function formatRouteDistance(meters) {
   return `${meters} m`;
 }
 
+// ─── Pure-JS Google Polyline decoder ─────────────────────────────────────────
+// Decodes a Google Encoded Polyline string without requiring the Maps JS SDK
+// (window.google.maps.geometry). Eliminates the SDK-load race condition for
+// route polylines: the REST API always returns the encoded string, and we can
+// decode it immediately regardless of whether the SDK has initialised.
+// Algorithm: https://developers.google.com/maps/documentation/utilities/polylinealgorithm
+function decodePolyline(encoded) {
+  const points = [];
+  let index = 0, lat = 0, lng = 0;
+  while (index < encoded.length) {
+    // Decode latitude delta
+    let b, shift = 0, result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+    // Decode longitude delta
+    shift = 0; result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    lng += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+    points.push([lat / 1e5, lng / 1e5]);
+  }
+  return points;
+}
+
 export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING") {
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
   if (!apiKey) return null;
@@ -119,12 +152,10 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
     const durationSecs = route.duration ? parseInt(route.duration) : null;
     const distanceMeters = route.distanceMeters ?? null;
 
-    const polylinePath =
-      route.polyline?.encodedPolyline && window.google?.maps?.geometry
-        ? window.google.maps.geometry.encoding
-            .decodePath(route.polyline.encodedPolyline)
-            .map((p) => [p.lat(), p.lng()])
-        : null;
+    // Use pure-JS decoder — no window.google.maps.geometry dependency.
+    const polylinePath = route.polyline?.encodedPolyline
+      ? decodePolyline(route.polyline.encodedPolyline)
+      : null;
 
     const steps = (route.legs?.[0]?.steps ?? []).slice(0, 5).map((s) => ({
       instruction: escapeHtml((s.navigationInstruction?.instructions ?? "").slice(0, 80)),
@@ -265,7 +296,9 @@ function sanitizeGeminiResponse(data) {
 
 
 export async function callLLM({ userMessage, plan, currentTime, location, weather, progress, history, directions, onLog }) {
-  if (!ACTIVE_LLM.key) {
+  // Per-function routing: support VITE_REALTIME_PROVIDER / VITE_REALTIME_MODEL overrides.
+  const cfg = resolveFnConfig("realtime");
+  if (!cfg.key) {
     const reqLog = { provider: "simulation", model: "rule-based", userMessage, timestamp: new Date().toISOString() };
     await new Promise((r) => setTimeout(r, 700));
     const result = simulateLLMResponse(userMessage, plan, currentTime);
@@ -277,42 +310,71 @@ export async function callLLM({ userMessage, plan, currentTime, location, weathe
   let reqBody = null; let resData = null; let raw = "";
 
   try {
-    if (ACTIVE_LLM.provider === "openai" || ACTIVE_LLM.provider === "ollama") {
-      const isOllama = ACTIVE_LLM.provider === "ollama";
+    if (cfg.provider === "openai" || cfg.provider === "ollama") {
+      const isOllama = cfg.provider === "ollama";
       const apiUrl = isOllama ? `${OLLAMA_URL}/v1/chat/completions` : "https://api.openai.com/v1/chat/completions";
       const headers = { "Content-Type": "application/json" };
-      if (!isOllama) headers.Authorization = `Bearer ${ACTIVE_LLM.key}`;
+      if (!isOllama) headers.Authorization = `Bearer ${cfg.key}`;
       const messages = [{ role: "system", content: systemContent }, ...chatMessages];
-      reqBody = { model: ACTIVE_LLM.model, messages, max_tokens: 4096, temperature: 0.7 };
+      reqBody = { model: cfg.model, messages, max_tokens: 4096, temperature: 0.7 };
       const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
-      if (!res.ok) throw new Error(ACTIVE_LLM.provider);
+      if (!res.ok) throw new Error(cfg.provider);
       resData = await res.json();
       raw = resData.choices?.[0]?.message?.content ?? "";
-    } else if (ACTIVE_LLM.provider === "gemini") {
+    } else if (cfg.provider === "gemini") {
       const geminiMessages = chatMessages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
       reqBody = { systemInstruction: { parts: [{ text: systemContent }] }, contents: geminiMessages, generationConfig: { temperature: 0.7, maxOutputTokens: 8192 } };
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(ACTIVE_LLM.model)}:generateContent?key=${encodeURIComponent(ACTIVE_LLM.key)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(reqBody) });
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cfg.model)}:generateContent?key=${encodeURIComponent(cfg.key)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(reqBody) });
       if (!res.ok) throw new Error("gemini");
       resData = await res.json();
       raw = (resData.candidates?.[0]?.content?.parts ?? []).map((p) => p.text).filter(Boolean).join("\n");
-    } else if (ACTIVE_LLM.provider === "claude") {
+    } else if (cfg.provider === "claude") {
       const claudeMessages = chatMessages.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
-      reqBody = { model: ACTIVE_LLM.model, system: systemContent, max_tokens: 1200, temperature: 0.7, messages: claudeMessages };
-      const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json", "x-api-key": ACTIVE_LLM.key, "anthropic-version": "2023-06-01" }, body: JSON.stringify(reqBody) });
+      // max_tokens raised to 4096 — the response includes Korean prose + a full
+      // JSON schedule block; 1200 was too low and caused Claude to truncate.
+      reqBody = { model: cfg.model, system: systemContent, max_tokens: 4096, temperature: 0.7, messages: claudeMessages };
+      const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json", "x-api-key": cfg.key, "anthropic-version": "2023-06-01" }, body: JSON.stringify(reqBody) });
       if (!res.ok) throw new Error("claude");
       resData = await res.json();
       raw = (resData.content ?? []).map((item) => item.text).filter(Boolean).join("\n");
     }
-    const jsonMatch = raw.match(/```json\s*([\s\S]*?)```/);
+
+    // ── Parse modifiedSchedule from the LLM response ──────────────────────
+    // Prefer ```json ... ``` fenced block (as instructed in the prompt).
+    // Fall back to extracting the outermost JSON object from the response by
+    // finding the first '{' and last '}' — more predictable than a greedy
+    // regex that could cross unrelated JSON objects. Then try tryRepairJSON
+    // for truncated/malformed output.
     let modifiedSchedule = null;
-    if (jsonMatch) { try { modifiedSchedule = JSON.parse(jsonMatch[1]).modifiedSchedule ?? null; } catch (e) { console.error("[LLM] JSON parse error:", e); } }
+    const jsonMatch = raw.match(/```json\s*([\s\S]*?)```/);
+    const jsonCandidate = (() => {
+      if (jsonMatch) return jsonMatch[1];
+      const start = raw.indexOf('{');
+      const end = raw.lastIndexOf('}');
+      if (start !== -1 && end > start) return raw.slice(start, end + 1);
+      return null;
+    })();
+    if (jsonCandidate) {
+      try {
+        const parsed = JSON.parse(jsonCandidate);
+        modifiedSchedule = parsed.modifiedSchedule ?? null;
+      } catch {
+        try {
+          const parsed = JSON.parse(tryRepairJSON(jsonCandidate));
+          modifiedSchedule = parsed.modifiedSchedule ?? null;
+        } catch (e) {
+          console.error("[LLM] JSON parse error:", e);
+        }
+      }
+    }
+
     const result = { text: raw.replace(/```json[\s\S]*?```/g, "").trim(), modifiedSchedule };
-    const logResData = ACTIVE_LLM.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
-    if (onLog) onLog({ provider: ACTIVE_LLM.provider, model: ACTIVE_LLM.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: result.text, modifiedSchedule, timestamp: new Date().toISOString() });
+    const logResData = cfg.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
+    if (onLog) onLog({ provider: cfg.provider, model: cfg.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: result.text, modifiedSchedule, timestamp: new Date().toISOString() });
     return result;
   } catch {
     const fallback = simulateLLMResponse(userMessage, plan, currentTime);
-    if (onLog) onLog({ provider: ACTIVE_LLM.provider + " (fallback)", model: "rule-based", userMessage, requestBody: reqBody, responseText: fallback.text, modifiedSchedule: fallback.modifiedSchedule, error: true, timestamp: new Date().toISOString() });
+    if (onLog) onLog({ provider: cfg.provider + " (fallback)", model: "rule-based", userMessage, requestBody: reqBody, responseText: fallback.text, modifiedSchedule: fallback.modifiedSchedule, error: true, timestamp: new Date().toISOString() });
     return fallback;
   }
 }
