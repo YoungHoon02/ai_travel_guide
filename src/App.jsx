@@ -168,6 +168,17 @@ export default function App() {
   // Shape: [{ fromId, toId, polylinePath, duration, durationSecs, distance }]
   const [editDaySegments, setEditDaySegments] = useState([]);
   const [editDaySegmentsLoading, setEditDaySegmentsLoading] = useState(false);
+
+  // ── Google Maps SDK ready flag ─────────────────────────────────────────────
+  // Declared early so direction-fetch effects that rely on
+  // window.google.maps.geometry (polyline decoding) can use it as a dep.
+  const [gmapsReady, setGmapsReady] = useState(Boolean(window.__googleMapsLoaded));
+  useEffect(() => {
+    if (window.__googleMapsLoaded) return;
+    const handler = () => setGmapsReady(true);
+    window.addEventListener("googlemapsloaded", handler, { once: true });
+    return () => window.removeEventListener("googlemapsloaded", handler);
+  }, []);
   const [tripDateMode, setTripDateMode] = useState(() => {
     try { return localStorage.getItem("tripDateMode") || "destination"; } catch { return "destination"; }
   });
@@ -615,8 +626,12 @@ export default function App() {
   // active day. Gives timeline blocks road-based durations / distances and
   // feeds the map polyline with an actual road-following path. Falls back to
   // haversine straight lines if DirectionsService is unavailable.
+  // gmapsReady is included so the effect re-runs once the Google Maps SDK
+  // finishes loading — without it the polyline decoding step inside
+  // fetchGoogleDirections (window.google.maps.geometry) would silently return
+  // null and the effect would never retry because its other deps stay the same.
   useEffect(() => {
-    if (step !== 2) return;
+    if (step !== 2 || !gmapsReady) return;
     const valid = editDayStops.filter((s) => s.latlng);
     if (valid.length < 2) {
       setEditDaySegments([]);
@@ -631,7 +646,7 @@ export default function App() {
     });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, editDayStopsKey, move]);
+  }, [step, editDayStopsKey, move, gmapsReady]);
 
   // Build timeline items for active day — lodging anchors + activities +
   // transport blocks between. Transport blocks use real Google Directions data
@@ -1221,14 +1236,6 @@ export default function App() {
 
   // ── Schedule Directions (Google Maps Directions API) ──────────────────────
   const [scheduleDirections, setScheduleDirections] = useState([]);
-  const [gmapsReady, setGmapsReady] = useState(Boolean(window.__googleMapsLoaded));
-
-  useEffect(() => {
-    if (window.__googleMapsLoaded) return;
-    const handler = () => setGmapsReady(true);
-    window.addEventListener("googlemapsloaded", handler, { once: true });
-    return () => window.removeEventListener("googlemapsloaded", handler);
-  }, []);
 
   useEffect(() => {
     if (!gmapsReady || activeSchedule.length < 2) {
