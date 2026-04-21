@@ -7,6 +7,14 @@ import { osrmProfileForMove } from "../constants.js";
 export default function RoutedPolylines({ defs, moveId, onSegmentClick }) {
   const [geoms, setGeoms] = useState({});
   const [directionDetails, setDirectionDetails] = useState({});
+  const [gmapsReady, setGmapsReady] = useState(Boolean(window.__googleMapsLoaded));
+
+  useEffect(() => {
+    if (window.__googleMapsLoaded) return;
+    const handler = () => setGmapsReady(true);
+    window.addEventListener("googlemapsloaded", handler, { once: true });
+    return () => window.removeEventListener("googlemapsloaded", handler);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -17,7 +25,7 @@ export default function RoutedPolylines({ defs, moveId, onSegmentClick }) {
 
     const travelMode = GMAPS_TRAVEL_MODE_MAP[moveId] ?? "DRIVING";
     (async () => {
-      if (window.__googleMapsLoaded) {
+      if (gmapsReady) {
         const entries = await Promise.all(
           defs.map(async (def) => {
             const dir = await fetchGoogleDirections(def.from.latlng, def.to.latlng, travelMode);
@@ -41,7 +49,7 @@ export default function RoutedPolylines({ defs, moveId, onSegmentClick }) {
       setGeoms(Object.fromEntries(entries));
     })();
     return () => { cancelled = true; };
-  }, [defs, moveId]);
+  }, [defs, moveId, gmapsReady]);
 
   return (
     <>
