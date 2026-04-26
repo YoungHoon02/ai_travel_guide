@@ -898,13 +898,41 @@ export function reverseGeocode(lat, lng) {
 }
 
 // ─── Forward geocode (city name → lat/lng via Google Maps) ───────────────────
-export function forwardGeocode(query) {
+//
+// `options`:
+//   bounds   — `{ south, west, north, east }` rectangular bias box; Google
+//              treats it as a soft preference, not a strict filter
+//   region   — ccTLD region bias ("jp", "kr", ...)
+//   details  — when true, resolve with an enriched object instead of `[lat,lng]`,
+//              so callers can detect partial matches and pick the best query.
+//
+// Default return shape (no `details`) is `[lat, lng] | null`, preserving
+// backward compatibility with callers that only need coordinates.
+export function forwardGeocode(query, options = {}) {
   return new Promise((resolve) => {
     if (!window.google?.maps?.Geocoder) { resolve(null); return; }
-    new window.google.maps.Geocoder().geocode({ address: query }, (results, status) => {
+    const { bounds, region, details = false } = options;
+    const request = { address: query };
+    if (bounds && Number.isFinite(bounds.south) && Number.isFinite(bounds.west)
+      && Number.isFinite(bounds.north) && Number.isFinite(bounds.east)) {
+      request.bounds = {
+        south: bounds.south, west: bounds.west, north: bounds.north, east: bounds.east,
+      };
+    }
+    if (region) request.region = region;
+    new window.google.maps.Geocoder().geocode(request, (results, status) => {
       if (status === "OK" && results?.[0]) {
-        const loc = results[0].geometry.location;
-        resolve([loc.lat(), loc.lng()]);
+        const r = results[0];
+        const loc = r.geometry.location;
+        const latlng = [loc.lat(), loc.lng()];
+        if (!details) { resolve(latlng); return; }
+        resolve({
+          latlng,
+          partialMatch: Boolean(r.partial_match),
+          locationType: r.geometry?.location_type ?? null,
+          formattedAddress: r.formatted_address ?? null,
+          types: r.types ?? [],
+        });
       } else { resolve(null); }
     });
   });

@@ -154,7 +154,9 @@ Output STRICTLY valid JSON object:
           "area": "district name in Korean",
           "visitScore": 1-5,
           "llmStayNote": "expected duration note in Korean",
-          "indoor": true/false
+          "indoor": true/false,
+          "lat": 35.6762,
+          "lng": 139.6503
         }
       ]
     }
@@ -179,6 +181,10 @@ Rules:
 - Balance indoor/outdoor
 - Include 4-6 alternative spots the user can swap in
 - visitScore: 1=30min, 2=1h, 3=1.5h, 4=2h, 5=3h+
+- "lat"/"lng": include the spot's actual decimal coordinates IF and ONLY IF you
+  are confident — do NOT guess. The downstream geocoder will resolve coordinates
+  for spots without lat/lng. Wrong coordinates put pins in the wrong city, so
+  prefer omission over hallucination. Use WGS84 decimals (e.g. 35.6762 / 139.6503).
 
 ## Travel style constraint (radius budget for activity picks)
 The user message includes a "이동 스타일" preference. Use it as a HARD radius

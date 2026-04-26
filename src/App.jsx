@@ -25,6 +25,13 @@ import L from "leaflet";
 import { calcProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil, parseBooleanEnv } from "./utils.js";
 import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callLLM, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
 import {
+  useEditDayRouting,
+  LEG_MODE_OPTIONS,
+  defaultLegTravelMode,
+  transportLabelForMode,
+  calculateStayDurationMinutes,
+} from "./hooks/useEditDayRouting.js";
+import {
   STEP_LABELS, RESULT_STEP, LAST_WIZARD_STEP, STAY_LOAD_TARGET, TRAVEL_TAGS,
   LODGINGS, SAVED_PLANS, CONTENTS, METRO_LINES, MOVES, THEME_CHIPS,
   dayNumberIcon, lodgingMapIcon, findDayInBuckets, categoriesForContent,
@@ -164,10 +171,9 @@ export default function App() {
   const [copilotOpen, setCopilotOpen] = useState(false);
   // User-picked or custom-entered hotel. Overrides activeLodgings when set.
   const [customLodging, setCustomLodging] = useState(null);
-  // Real Google Directions segments for the Edit View active day.
-  // Shape: [{ fromId, toId, polylinePath, duration, durationSecs, distance }]
-  const [editDaySegments, setEditDaySegments] = useState([]);
-  const [editDaySegmentsLoading, setEditDaySegmentsLoading] = useState(false);
+  // Forward-ref into the leg routing hook so resetGeneratedPlanState (declared
+  // above the hook call) can flush leg state. Synced after the hook runs.
+  const resetEditDayLegsRef = useRef(null);
   const [gmapsReady, setGmapsReady] = useState(Boolean(window.__googleMapsLoaded));
   useEffect(() => {
     if (window.__googleMapsLoaded) return;
@@ -187,6 +193,10 @@ export default function App() {
   // Click → fills input, focuses it. User can append region/constraints
   // ("일본 힐링 여행") before hitting Enter. No auto-submit — single unified
   // input-driven LLM path, chips are just shortcuts.
+  // Theme chip currently hovered or focused. Mirrored into the hint slot
+  // above the chips row so the icon-only buttons still surface their label
+  // without relying on native title tooltips.
+  const [activeThemeChip, setActiveThemeChip] = useState(null);
   const handleThemeChip = useCallback((seedText) => {
     setDestQuery(seedText);
     setTimeout(() => {
@@ -233,8 +243,7 @@ export default function App() {
     setSelectedLodgingId("");
     setSchedule([]);
     setOptimizedDayPicks(null);
-    setEditDaySegments([]);
-    setEditDaySegmentsLoading(false);
+    resetEditDayLegsRef.current?.();
     setHighlightItemId(null);
     setHighlightIds([]);
     setTransitPopup(null);
@@ -428,14 +437,10 @@ export default function App() {
         lodgingPromiseRef.current = null;
         if (lodgings && lodgings.length > 0) {
           const refined = await Promise.all(lodgings.map(async (l) => {
-            const validCoords = await geocodeBestLatLng({
-              name: l.name,
-              area: l.area,
-              region,
-              country,
+            const resolved = await resolveSpotLatLng({
+              spot: l, region, country, cityCenterLatLng, fallbackLatLng: cityCenterLatLng,
             });
-            if (validCoords) return { ...l, latlng: validCoords };
-            if (cityCenterLatLng) return { ...l, latlng: cityCenterLatLng, approximateLatlng: true };
+            if (resolved) return { ...l, latlng: resolved.latlng, approximateLatlng: resolved.approximate };
             return l;
           }));
           resolvedLodgings = refined;
@@ -458,14 +463,10 @@ export default function App() {
             asValidLatLng(resolvedLodgings?.[0]?.latlng) ??
             cityCenterLatLng;
           const refined = await Promise.all(allSpots.map(async (s) => {
-            const validCoords = await geocodeBestLatLng({
-              name: s.name,
-              area: s.area,
-              region,
-              country,
+            const resolved = await resolveSpotLatLng({
+              spot: s, region, country, cityCenterLatLng, fallbackLatLng,
             });
-            if (validCoords) return { ...s, latlng: validCoords };
-            if (fallbackLatLng) return { ...s, latlng: fallbackLatLng, approximateLatlng: true };
+            if (resolved) return { ...s, latlng: resolved.latlng, approximateLatlng: resolved.approximate };
             return s;
           }));
           setDynContents(refined);
@@ -479,7 +480,9 @@ export default function App() {
               ...d,
               spots: (d.spots ?? []).map((s) => {
                 const found = refined.find((r) => r.id === s.id);
-                return found ? { ...s, latlng: found.latlng, img: found.img } : s;
+                return found
+                  ? { ...s, latlng: found.latlng, img: found.img, approximateLatlng: found.approximateLatlng }
+                  : s;
               }),
             })),
           };
@@ -511,15 +514,17 @@ export default function App() {
     if (missing.length === 0) return;
     let cancelled = false;
     (async () => {
+      const cityCenterLatLng = asValidLatLng(await forwardGeocode(`${region} ${country}`));
       const fixes = await Promise.all(
         missing.map(async (s) => {
-          const validCoords = await geocodeBestLatLng({
+          const geo = await geocodeBestLatLng({
             name: s.name,
             area: s.area,
             region,
             country,
+            cityCenterLatLng,
           });
-          return validCoords ? { id: s.id, latlng: validCoords, approximateLatlng: false } : null;
+          return geo ? { id: s.id, latlng: geo.latlng, approximateLatlng: geo.confidence !== "high" } : null;
         })
       );
       if (cancelled) return;
@@ -528,7 +533,7 @@ export default function App() {
       setSchedule((prev) =>
         prev.map((s) => {
           const fix = fixMap.get(s.id);
-          return fix ? { ...s, latlng: fix.latlng, approximateLatlng: false } : s;
+          return fix ? { ...s, latlng: fix.latlng, approximateLatlng: fix.approximateLatlng } : s;
         })
       );
     })();
@@ -646,6 +651,7 @@ export default function App() {
         area: s.area,
         type: s.category,
         latlng: s.latlng,
+        approximateLatlng: Boolean(s.approximateLatlng),
         indoor: s.indoor,
         visitScore: s.visitScore,
         img: s.img,
@@ -687,37 +693,29 @@ export default function App() {
     [editDayStops, selectedLodgingLatLng]
   );
 
-  // Fetch real Google Directions for each consecutive pair of stops on the
-  // active day. Gives timeline blocks road-based durations / distances and
-  // feeds the map polyline with an actual road-following path. Falls back to
-  // haversine straight lines if DirectionsService is unavailable.
-  useEffect(() => {
-    if (step !== 2) return;
-    if (!gmapsReady) {
-      setEditDaySegments([]);
-      setEditDaySegmentsLoading(false);
-      return;
-    }
-    const valid = editDayStops
-      .map((s) => {
-        const latlng = asValidLatLng(s.latlng) ?? selectedLodgingLatLng;
-        return latlng ? { ...s, latlng } : null;
-      })
-      .filter(Boolean);
-    if (valid.length < 2) {
-      setEditDaySegments([]);
-      return;
-    }
-    let cancelled = false;
-    setEditDaySegmentsLoading(true);
-    fetchScheduleDirections(valid, move).then((segs) => {
-      if (cancelled) return;
-      setEditDaySegments(segs ?? []);
-      setEditDaySegmentsLoading(false);
-    });
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, editDayStopsKey, move, selectedLodgingLatLng, gmapsReady]);
+  // Edit View per-day routing: leg state, debounced chain fetch, polylines.
+  // See src/hooks/useEditDayRouting.js. resetEditDayLegs is forwarded into a
+  // ref above so resetGeneratedPlanState (which is declared earlier) can call it.
+  const {
+    editDayLegs,
+    editDayLegsLoading,
+    legPolylines,
+    legPolylinesHasReal,
+    legPolylinesHasTraffic,
+    handleLegModeChange,
+    retryLegChainFrom,
+    resetEditDayLegs,
+  } = useEditDayRouting({
+    step,
+    gmapsReady,
+    editDayStops,
+    editDayStopsKey,
+    move,
+    selectedLodgingLatLng,
+    tripStartDate: planInputParsed?.startDate ?? null,
+    activeDay,
+  });
+  resetEditDayLegsRef.current = resetEditDayLegs;
 
   // Build timeline items for active day — lodging anchors + activities +
   // transport blocks between. Transport blocks use real Google Directions data
@@ -727,8 +725,8 @@ export default function App() {
     const items = [];
     if (editDayStops.length === 0) return items;
 
-    const segLookup = new Map(
-      editDaySegments.map((s) => [`${s.fromId}→${s.toId}`, s])
+    const legByPair = new Map(
+      editDayLegs.map((l) => [`${l.fromId}→${l.toId}`, l])
     );
 
     let cursor = 9 * 60; // minutes since midnight
@@ -740,7 +738,7 @@ export default function App() {
         items.push({ type: "lodging", kind: "end", name: stop.name, latlng: stop.latlng, time: fmtMinutes(cursor) });
       } else if (stop.kind === "activity") {
         const a = stop.activity;
-        const stayMin = Math.max(30, (a.visitScore ?? 3) * 30);
+        const stayMin = calculateStayDurationMinutes(a);
         const startTime = fmtMinutes(cursor);
         cursor += stayMin;
         const endTime = fmtMinutes(cursor);
@@ -751,6 +749,7 @@ export default function App() {
           category: a.type,
           area: a.area,
           latlng: a.latlng,
+          approximateLatlng: Boolean(a.approximateLatlng),
           startTime,
           endTime,
           stayMin,
@@ -768,96 +767,59 @@ export default function App() {
       const fromLatLng = asValidLatLng(from.latlng) ?? selectedLodgingLatLng;
       const toLatLng = asValidLatLng(to.latlng) ?? selectedLodgingLatLng;
       if (fromLatLng && toLatLng) {
-        const seg = segLookup.get(`${from.id}→${to.id}`);
-        if (seg && seg.durationSecs != null) {
-          const realMinutes = Math.max(1, Math.round(seg.durationSecs / 60));
-          const realKm = parseDistanceKm(seg.distance);
-          const mode = resolveSegmentTransportMode(seg, move, realKm ?? 0);
+        const leg = legByPair.get(`${from.id}→${to.id}`);
+        const route = leg?.routeData;
+        if (route && Number.isFinite(route.durationSecs)) {
+          const realMinutes = Math.max(1, Math.round(route.durationSecs / 60));
+          const realKm = parseDistanceKm(route.distance);
+          const modeInfo = transportLabelForMode(leg.travelMode);
           items.push({
             type: "transport",
-            icon: mode.icon,
-            label: mode.label,
+            legIndex: leg.legIndex,
+            travelMode: leg.travelMode,
+            icon: modeInfo.icon,
+            label: modeInfo.label,
             minutes: realMinutes,
             km: realKm ?? 0,
             real: true,
-            distanceText: seg.distance,
-            durationText: seg.duration,
-            transitSummary: seg.transitSummary ?? null,
-            policyNotice: seg.fallbackNotice ?? null,
+            distanceText: route.distance,
+            durationText: route.duration,
+            transitSummary: route.transitSummary ?? null,
+            policyNotice: route.fallbackNotice ?? null,
+            isLoading: false,
+            error: null,
           });
           cursor += realMinutes;
         } else {
           const km = haversineKm(fromLatLng, toLatLng);
-          const mode = guessTransportMode(km, move);
+          const fallbackMode = guessTransportMode(km, move);
+          const travelMode = leg?.travelMode ?? defaultLegTravelMode(move);
+          const modeInfo = transportLabelForMode(travelMode);
           items.push({
             type: "transport",
-            ...mode,
+            legIndex: leg?.legIndex ?? i - 1,
+            travelMode,
+            icon: modeInfo.icon,
+            label: modeInfo.label,
+            minutes: fallbackMode.minutes,
             km,
             real: false,
-            policyNotice:
-              move === "public"
+            isLoading: Boolean(leg?.isLoading),
+            error: leg?.error ?? null,
+            policyNotice: leg?.error
+              ? null
+              : move === "public"
                 ? "실시간 대중교통 경로를 찾지 못해 근사 이동시간을 표시합니다."
                 : null,
           });
-          cursor += mode.minutes;
+          cursor += fallbackMode.minutes;
         }
       }
       pushStop(to);
     }
 
     return items;
-  }, [editDayStops, editDaySegments, move, selectedLodgingLatLng]);
-
-  // Merged road-following polyline for the Edit View map. Concatenates each
-  // segment's polylinePath into a single continuous path. Falls back to a
-  // straight-line path through stops when real directions are unavailable.
-  const mergedRoutePath = useMemo(() => {
-    const realSegs = editDaySegments.filter(
-      (s) => !s.isApproximate && Array.isArray(s.polylinePath) && s.polylinePath.length >= 2
-    );
-    if (realSegs.length > 0) {
-      const merged = [];
-      for (const seg of realSegs) {
-        for (const pt of seg.polylinePath) {
-          const last = merged[merged.length - 1];
-          if (!last || last[0] !== pt[0] || last[1] !== pt[1]) merged.push(pt);
-        }
-      }
-      if (merged.length >= 2) return merged;
-    }
-    const fallback = editDayStops
-      .map((s) => asValidLatLng(s.latlng) ?? selectedLodgingLatLng)
-      .filter(Boolean);
-    return fallback.length >= 2 ? fallback : [];
-  }, [editDaySegments, editDayStops, selectedLodgingLatLng]);
-
-  const mergedRouteTrafficSegments = useMemo(() => {
-    const segments = [];
-    for (const seg of editDaySegments) {
-      for (const trafficSeg of seg.trafficSegments ?? []) {
-        if (!Array.isArray(trafficSeg.path) || trafficSeg.path.length < 2) continue;
-        const deduped = [];
-        for (const pt of trafficSeg.path) {
-          const last = deduped[deduped.length - 1];
-          if (!last || last[0] !== pt[0] || last[1] !== pt[1]) deduped.push(pt);
-        }
-        if (deduped.length < 2) continue;
-        segments.push({
-          positions: deduped,
-          color: trafficSeg.color,
-          weight: 6,
-          opacity: 0.95,
-          dashed: false,
-        });
-      }
-    }
-    return segments;
-  }, [editDaySegments]);
-
-  const mergedRouteIsReal = editDaySegments.some(
-    (s) => !s.isApproximate && Array.isArray(s.polylinePath) && s.polylinePath.length >= 2
-  );
-  const mergedRouteHasTraffic = mergedRouteTrafficSegments.length > 0;
+  }, [editDayStops, editDayLegs, move, selectedLodgingLatLng]);
 
   const editMapMarkers = useMemo(() => {
     const markers = [];
@@ -1073,14 +1035,10 @@ export default function App() {
           selectedLodgingLatLng ??
           cityCenterLatLng;
         const refined = await Promise.all(allSpots.map(async (s) => {
-          const validCoords = await geocodeBestLatLng({
-            name: s.name,
-            area: s.area,
-            region,
-            country,
+          const resolved = await resolveSpotLatLng({
+            spot: s, region, country, cityCenterLatLng, fallbackLatLng,
           });
-          if (validCoords) return { ...s, latlng: validCoords };
-          if (fallbackLatLng) return { ...s, latlng: fallbackLatLng, approximateLatlng: true };
+          if (resolved) return { ...s, latlng: resolved.latlng, approximateLatlng: resolved.approximate };
           return s;
         }));
         setDynContents(refined);
@@ -1251,14 +1209,11 @@ export default function App() {
       const lodgings = await generateLodgings(autoCountry, autoRegion, logCb);
       if (lodgings.length > 0) {
         const refined = await Promise.all(lodgings.map(async (l) => {
-          const validCoords = await geocodeBestLatLng({
-            name: l.name,
-            area: l.area,
-            region: autoRegion,
-            country: autoCountry,
+          const resolved = await resolveSpotLatLng({
+            spot: l, region: autoRegion, country: autoCountry,
+            cityCenterLatLng, fallbackLatLng: cityCenterLatLng,
           });
-          if (validCoords) return { ...l, latlng: validCoords };
-          if (cityCenterLatLng) return { ...l, latlng: cityCenterLatLng, approximateLatlng: true };
+          if (resolved) return { ...l, latlng: resolved.latlng, approximateLatlng: resolved.approximate };
           return l;
         }));
         setDynLodgings(refined);
@@ -1276,14 +1231,11 @@ export default function App() {
           asValidLatLng(selectedLodgingLatLng) ??
           cityCenterLatLng;
         const refined = await Promise.all(allSpots.map(async (s) => {
-          const validCoords = await geocodeBestLatLng({
-            name: s.name,
-            area: s.area,
-            region: autoRegion,
-            country: autoCountry,
+          const resolved = await resolveSpotLatLng({
+            spot: s, region: autoRegion, country: autoCountry,
+            cityCenterLatLng, fallbackLatLng,
           });
-          if (validCoords) return { ...s, latlng: validCoords };
-          if (fallbackLatLng) return { ...s, latlng: fallbackLatLng, approximateLatlng: true };
+          if (resolved) return { ...s, latlng: resolved.latlng, approximateLatlng: resolved.approximate };
           return s;
         }));
         setDynContents(refined);
@@ -1704,13 +1656,31 @@ export default function App() {
                                         );
                                       }
                                       if (item.type === "transport") {
+                                        const legNum = (item.legIndex ?? 0) + 1;
                                         const label = item.durationText || `${item.minutes}분`;
                                         const showKm =
                                           item.distanceText ||
                                           (typeof item.km === "number" && item.km >= 1);
                                         const kmText = item.distanceText || (showKm ? `${item.km.toFixed(1)}km` : "");
+                                        const canRetry = !item.real && !item.isLoading && item.legIndex != null;
                                         return (
-                                          <div key={`t-${idx}`} className="tl-item tl-item--transport">
+                                          <div
+                                            key={`t-${idx}`}
+                                            className={`tl-item tl-item--transport${canRetry ? " tl-item--transport-retry" : ""}`}
+                                            role={canRetry ? "button" : undefined}
+                                            tabIndex={canRetry ? 0 : -1}
+                                            aria-label={canRetry ? `구간 ${legNum} 경로 다시 불러오기` : undefined}
+                                            onClick={canRetry ? () => retryLegChainFrom(item.legIndex) : undefined}
+                                            onKeyDown={
+                                              canRetry
+                                                ? (e) => {
+                                                    if (e.key !== "Enter" && e.key !== " ") return;
+                                                    e.preventDefault();
+                                                    retryLegChainFrom(item.legIndex);
+                                                  }
+                                                : undefined
+                                            }
+                                          >
                                             <span className="tl-item__transport-line">
                                               <span className="tl-item__transport-arrow">↓</span>
                                               <span>{label}</span>
@@ -1722,7 +1692,40 @@ export default function App() {
                                               {item.transitSummary && (
                                                 <span className="tl-item__transport-km">{item.transitSummary}</span>
                                               )}
+                                              {item.isLoading && (
+                                                <span className="tl-item__transport-loading">계산중…</span>
+                                              )}
                                             </span>
+                                            {item.legIndex != null && (
+                                              <div
+                                                className="tl-item__mode-switch"
+                                                onClick={(e) => e.stopPropagation()}
+                                                onKeyDown={(e) => e.stopPropagation()}
+                                                role="group"
+                                                aria-label={`구간 ${legNum} 교통수단`}
+                                              >
+                                                {LEG_MODE_OPTIONS.map((opt) => {
+                                                  const active = opt.value === item.travelMode;
+                                                  return (
+                                                    <button
+                                                      key={opt.value}
+                                                      type="button"
+                                                      className={`tl-item__mode-btn${active ? " active" : ""}`}
+                                                      aria-pressed={active}
+                                                      aria-label={`구간 ${legNum} ${opt.label}`}
+                                                      disabled={item.isLoading}
+                                                      onClick={() => handleLegModeChange(item.legIndex, opt.value)}
+                                                    >
+                                                      <span aria-hidden="true">{opt.icon}</span>
+                                                      <span>{opt.label}</span>
+                                                    </button>
+                                                  );
+                                                })}
+                                              </div>
+                                            )}
+                                            {item.error && (
+                                              <span className="tl-item__transport-km">⚠ {item.error}</span>
+                                            )}
                                             {item.policyNotice && (
                                               <span className="tl-item__transport-km">{item.policyNotice}</span>
                                             )}
@@ -1749,28 +1752,22 @@ export default function App() {
                           </div>
                           <div className="edit-view__map">
                             <div className="edit-view__map-legend">
-                              <span className={`legend-swatch${mergedRouteIsReal || mergedRouteHasTraffic ? "" : " legend-swatch--dashed"}`} />
+                              <span className={`legend-swatch${legPolylinesHasReal || legPolylinesHasTraffic ? "" : " legend-swatch--dashed"}`} />
                               <span className="legend-label">
-                                {mergedRouteHasTraffic ? "교통 혼잡 반영 도로 경로" : mergedRouteIsReal ? "Google 실제 도로 경로" : "직선 근사"}
+                                {legPolylinesHasTraffic ? "교통 혼잡 반영 도로 경로" : legPolylinesHasReal ? "Google 실제 도로 경로" : "직선 근사"}
                               </span>
-                              {mergedRouteHasTraffic && (
+                              {legPolylinesHasTraffic && (
                                 <span className="legend-label-dim">· 혼잡도 색상(녹/황/적)</span>
                               )}
                               <span className="legend-sep">·</span>
                               <span className="legend-label-dim">{moveProfile?.icon} {moveProfile?.name}</span>
-                              {editDaySegmentsLoading && <span className="legend-label-dim">· 계산중…</span>}
+                              {editDayLegsLoading && <span className="legend-label-dim">· 계산중…</span>}
                             </div>
                             <GoogleMapView
                               center={selectedLodgingLatLng ?? [35.6804, 139.769]}
                               zoom={13}
                               markers={editMapMarkers}
-                              polylineSegments={mergedRouteTrafficSegments}
-                              polylinePositions={mergedRoutePath}
-                              polylineOptions={{
-                                color: mergedRouteIsReal ? "#ffd23f" : "#5ecfcf",
-                                weight: mergedRouteIsReal ? 5 : 4,
-                                dashed: !mergedRouteIsReal && !mergedRouteHasTraffic,
-                              }}
+                              polylineSegments={legPolylines}
                               onMarkerClick={(id) => {
                                 if (id === "hotel") return;
                                 setHighlightItemId(id);
@@ -1838,17 +1835,14 @@ export default function App() {
                     {step === 0 && (
                       <>
                         <p className="step0-hero__credit">AI 여행 플래너/가이드 · Designed by <a href="https://github.com/Floyre" target="_blank" rel="noopener noreferrer" className="wizard-footer__link">CJH</a></p>
-                        <div className="step0-hero__title-row">
-                          <h2 className="step0-hero__title">{destActiveQuestion === "__custom__" ? "추가적인 요구사항을 입력해주세요" : destActiveQuestion ?? "Choose your destiny"}</h2>
-                          <label className="step0-hero__fsd" title="FSD — AI가 알잘딱으로 전부 결정">
-                            <input type="checkbox" checked={fsdMode} onChange={(e) => setFsdMode(e.target.checked)} />
-                            <span className="step0-hero__fsd-label">FSD</span>
-                            <span className="step0-hero__fsd-beta">BETA</span>
-                          </label>
-                        </div>
+                        <h2 className="step0-hero__title">{destActiveQuestion === "__custom__" ? "추가적인 요구사항을 입력해주세요" : destActiveQuestion ?? "Choose your destiny"}</h2>
                         {!destActiveQuestion && destSuggestions.length === 0 && (
                           <div className="step0-theme-chips">
-                            <span className="step0-theme-chips__hint">빠른 시작 — 원하는 vibe 를 고르거나 직접 입력하세요</span>
+                            <span className={`step0-theme-chips__hint${activeThemeChip ? " step0-theme-chips__hint--active" : ""}`}>
+                              {activeThemeChip
+                                ? `${activeThemeChip.icon} ${activeThemeChip.label}`
+                                : "빠른 시작 — 원하는 vibe 를 고르거나 직접 입력하세요"}
+                            </span>
                             <div className="step0-theme-chips__grid">
                               {THEME_CHIPS.map((t) => (
                                 <button
@@ -1856,10 +1850,15 @@ export default function App() {
                                   type="button"
                                   className="step0-theme-chip"
                                   onClick={() => handleThemeChip(t.seed)}
-                                  title={`"${t.seed}" 로 입력창 채우기`}
+                                  onMouseEnter={() => setActiveThemeChip(t)}
+                                  onMouseLeave={() => setActiveThemeChip((prev) => (prev?.label === t.label ? null : prev))}
+                                  onFocus={() => setActiveThemeChip(t)}
+                                  onBlur={() => setActiveThemeChip((prev) => (prev?.label === t.label ? null : prev))}
+                                  title={`${t.label} — "${t.seed}" 로 입력창 채우기`}
+                                  aria-label={`${t.label} — ${t.seed}`}
                                   disabled={destLoading}
                                 >
-                                  <span className="step0-theme-chip__icon">{t.icon}</span>
+                                  <span className="step0-theme-chip__icon" aria-hidden="true">{t.icon}</span>
                                   <span className="step0-theme-chip__label">{t.label}</span>
                                 </button>
                               ))}
@@ -1876,6 +1875,11 @@ export default function App() {
                             onChange={(e) => setDestQuery(e.target.value)}
                             onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); fsdMode ? handleAutopilot() : handleDestQuery(); } }}
                           />
+                          <label className="step0-hero__fsd" title="FSD — AI가 알잘딱으로 전부 결정">
+                            <input type="checkbox" checked={fsdMode} onChange={(e) => setFsdMode(e.target.checked)} />
+                            <span className="step0-hero__fsd-label">FSD</span>
+                            <span className="step0-hero__fsd-beta">BETA</span>
+                          </label>
                           <button type="button" className={`step0-hero__lucky${diceRolling ? " dice-rolling" : ""}`} disabled={destLoading} onClick={handleLucky} title="I'm feeling lucky — LLM 랜덤 테마 생성">
                             <svg className="dice-svg" viewBox="0 0 24 24" width="20" height="20">
                               <rect x="2" y="2" width="20" height="20" rx="3" fill="none" stroke="currentColor" strokeWidth="1.5" />
@@ -2476,14 +2480,91 @@ function buildGeocodeQueries({ name, area, region, country }) {
   return Array.from(new Set(queries));
 }
 
-async function geocodeBestLatLng({ name, area, region, country }) {
-  const queries = buildGeocodeQueries({ name, area, region, country });
-  for (const query of queries) {
-    const coords = await forwardGeocode(query);
-    const valid = asValidLatLng(coords);
-    if (valid) return valid;
+// Build a soft ±radiusKm rectangle around `cityCenterLatLng` to bias the
+// geocoder toward the city. Lat degrees are ~111km; lng degrees shrink with
+// cos(lat). The bounds are a *preference*, not a strict filter — Google may
+// still return out-of-box matches, which we filter via distance check.
+function buildCityBoundsBias(cityCenterLatLng, radiusKm = 60) {
+  const [lat, lng] = cityCenterLatLng ?? [];
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const latDelta = radiusKm / 111;
+  const lngDelta = radiusKm / (111 * Math.cos((lat * Math.PI) / 180) || 1);
+  return {
+    south: lat - latDelta,
+    north: lat + latDelta,
+    west: lng - lngDelta,
+    east: lng + lngDelta,
+  };
+}
+
+/**
+ * Geocode an LLM-supplied place name with a city bias and distance check.
+ *
+ * Returns `{ latlng, confidence }` where:
+ *   confidence: "high" — non-partial match within `maxDistanceKm` of the city,
+ *               "low"  — found, but partial-match or far from the city center
+ *                        (still surfaced so the map renders something, but
+ *                        callers should mark the spot as approximate)
+ *   `null` if no result on any query variant.
+ *
+ * Trying queries in order of specificity (`name + area + region + country`
+ * down to `area + region + country`) lets us prefer high-precision matches
+ * before falling back to broader district-level results.
+ */
+/**
+ * Resolve a spot's latlng with a 3-step priority:
+ *   1. LLM-supplied { lat, lng } if present and within `maxDistanceKm` of the
+ *      city center (LLMs hallucinate coords sometimes — distance check rejects
+ *      obvious nonsense like "Paris pin in São Paulo")
+ *   2. Geocoded result from `geocodeBestLatLng` (city-biased, partial-match aware)
+ *   3. Caller-provided `fallbackLatLng` (typically the lodging or city center)
+ *
+ * Returns `{ latlng, approximate, source }`. `approximate=true` means callers
+ * should mark the slot with a "위치 추정" badge so users know the pin may be off.
+ */
+async function resolveSpotLatLng({ spot, region, country, cityCenterLatLng, fallbackLatLng, maxDistanceKm = 200 }) {
+  const llmLatLng = asValidLatLng([spot?.lat, spot?.lng]);
+  if (llmLatLng) {
+    const tooFar = cityCenterLatLng
+      ? haversineKm(cityCenterLatLng, llmLatLng) > maxDistanceKm
+      : false;
+    if (!tooFar) return { latlng: llmLatLng, approximate: false, source: "llm" };
   }
+  const geo = await geocodeBestLatLng({
+    name: spot?.name,
+    area: spot?.area,
+    region,
+    country,
+    cityCenterLatLng,
+    maxDistanceKm,
+  });
+  if (geo) return { latlng: geo.latlng, approximate: geo.confidence !== "high", source: "geocode" };
+  if (fallbackLatLng) return { latlng: fallbackLatLng, approximate: true, source: "fallback" };
   return null;
+}
+
+async function geocodeBestLatLng({ name, area, region, country, cityCenterLatLng, maxDistanceKm = 120 }) {
+  const queries = buildGeocodeQueries({ name, area, region, country });
+  const bounds = buildCityBoundsBias(cityCenterLatLng);
+  let lowConfidenceFallback = null;
+
+  for (const query of queries) {
+    const result = await forwardGeocode(query, { bounds: bounds ?? undefined, details: true });
+    if (!result) continue;
+    const latlng = asValidLatLng(result.latlng);
+    if (!latlng) continue;
+    const distanceKm = cityCenterLatLng
+      ? haversineKm(cityCenterLatLng, latlng)
+      : 0;
+    const isWithinCity = distanceKm <= maxDistanceKm;
+    if (!result.partialMatch && isWithinCity) {
+      return { latlng, confidence: "high" };
+    }
+    if (!lowConfidenceFallback) {
+      lowConfidenceFallback = { latlng, confidence: "low" };
+    }
+  }
+  return lowConfidenceFallback;
 }
 
 function spreadOverlappingMapMarkers(markers, radius = 0.0012) {
@@ -2542,15 +2623,6 @@ function guessTransportMode(distanceKm, style) {
   return car(distanceKm);
 }
 
-function resolveSegmentTransportMode(seg, style, distanceKm) {
-  const mode = String(seg?.travelModeUsed ?? "").toUpperCase();
-  if (mode === "WALKING") return { icon: "🚶", label: "도보", minutes: Math.max(3, Math.round(distanceKm * 12)) };
-  if (mode === "TRANSIT") return { icon: "🚇", label: "대중교통", minutes: Math.max(4, Math.round(distanceKm * 4 + 6)) };
-  if (mode === "BICYCLING") return { icon: "🚲", label: "자전거", minutes: Math.max(4, Math.round(distanceKm * 5 + 3)) };
-  if (mode === "DRIVING") return { icon: "🚗", label: style === "public" ? "차량 이동" : "차", minutes: Math.max(5, Math.round(distanceKm * 2 + 5)) };
-  return guessTransportMode(distanceKm, style);
-}
-
 function formatTransitVehicleLabel(type = "") {
   const upper = String(type).toUpperCase();
   if (upper.includes("SUBWAY") || upper.includes("METRO")) return "지하철";
@@ -2607,7 +2679,17 @@ function SortableActivityItem({ item, number, highlighted, onHighlight, onRemove
       <span className="tl-item__time">{item.startTime}</span>
       <span className="tl-item__marker">{number}</span>
       <div className="tl-item__body">
-        <strong className="tl-item__name">{item.name}</strong>
+        <strong className="tl-item__name">
+          {item.name}
+          {item.approximateLatlng && (
+            <span
+              className="tl-item__approx-badge"
+              title="Geocoder 신뢰도가 낮아 위치가 부정확할 수 있습니다. 핀을 직접 확인하세요."
+            >
+              ⚠ 위치 추정
+            </span>
+          )}
+        </strong>
         <span className="tl-item__meta">
           {item.category} · {item.area}
           {item.stayMin > 0 && (
