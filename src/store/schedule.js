@@ -315,6 +315,120 @@ export function recalculateDayTimes(schedule, day, { transitMinutes = 30 } = {})
   return result;
 }
 
+/**
+ * Apply LLM-emitted partial patches to a schedule.
+ *
+ * Each patch references a slot by id and carries one of three ops:
+ *   - { id, op: "replace", fields: Partial<Slot> }  — merges fields into existing slot
+ *   - { id, op: "remove" }                          — removes slot (rejected if locked)
+ *   - { afterId, op: "insert", slot: Slot }         — inserts new slot after afterId
+ *                                                     (or at start of day if afterId=null)
+ *
+ * Behavior contract:
+ *   - Locked slots can only be patched if `force: true`. Default behavior is to
+ *     silently skip them so a misbehaving LLM cannot move/delete lodging anchors.
+ *   - After all patches apply, `recalculateDayTimes` re-runs for any day whose
+ *     slots were touched. Caller doesn't need to think about time cascade.
+ *   - Final result is validated; on failure, the original schedule is returned
+ *     untouched and `report` carries the error string.
+ *
+ * Returns { applied, merged, report, touchedDays }.
+ */
+export function applyPatches(schedule, patches, { force = false } = {}) {
+  if (!Array.isArray(patches) || patches.length === 0) {
+    return { applied: false, merged: schedule, report: "no patches", touchedDays: [] };
+  }
+  const byId = new Map(schedule.map((s) => [s.id, s]));
+  const lockedIds = new Set(schedule.filter((s) => s.locked).map((s) => s.id));
+  const touchedDays = new Set();
+  const skipped = [];
+
+  // Work on a mutable copy of the array — final shape gets re-sorted via
+  // recalculateDayTimes below, so we can do simple in-place ops here.
+  let next = [...schedule];
+
+  for (const patch of patches) {
+    if (!patch || typeof patch !== "object") {
+      skipped.push("malformed patch");
+      continue;
+    }
+    const { op } = patch;
+    if (op === "replace") {
+      const existing = byId.get(patch.id);
+      if (!existing) { skipped.push(`replace: id ${patch.id} not found`); continue; }
+      if (existing.locked && !force) { skipped.push(`replace: locked ${patch.id}`); continue; }
+      // Merge fields but keep id + day immutable. endTime is recomputed if
+      // duration or startTime changed (recalculateDayTimes does this anyway,
+      // but we keep the slot self-consistent in the meantime).
+      const fields = patch.fields ?? {};
+      const merged = { ...existing, ...fields, id: existing.id, day: existing.day };
+      if (fields.startTime || fields.duration) {
+        const start = merged.startTime;
+        const dur = Number.isFinite(merged.duration) ? merged.duration : existing.duration;
+        merged.endTime = minToTime(timeToMin(start) + dur);
+      }
+      next = next.map((s) => (s.id === existing.id ? merged : s));
+      byId.set(existing.id, merged);
+      touchedDays.add(existing.day);
+      continue;
+    }
+    if (op === "remove") {
+      const existing = byId.get(patch.id);
+      if (!existing) { skipped.push(`remove: id ${patch.id} not found`); continue; }
+      if (existing.locked && !force) { skipped.push(`remove: locked ${patch.id}`); continue; }
+      next = next.filter((s) => s.id !== existing.id);
+      byId.delete(existing.id);
+      touchedDays.add(existing.day);
+      continue;
+    }
+    if (op === "insert") {
+      const slot = patch.slot;
+      if (!slot || !slot.id) { skipped.push("insert: missing slot or id"); continue; }
+      if (byId.has(slot.id)) { skipped.push(`insert: duplicate id ${slot.id}`); continue; }
+      // afterId=null/undefined means insert at the start of its day. Position
+      // doesn't matter for correctness because recalculateDayTimes resorts by
+      // startTime — we just need the slot in the array.
+      next = [...next, slot];
+      byId.set(slot.id, slot);
+      touchedDays.add(slot.day);
+      continue;
+    }
+    skipped.push(`unknown op: ${op}`);
+  }
+
+  // Cascade times for every touched day so a startTime change ripples through
+  // the rest of that day automatically. Caller doesn't have to think about it.
+  let result = next;
+  for (const d of touchedDays) result = recalculateDayTimes(result, d);
+
+  const v = validateSchedule(result);
+  if (!v.ok) {
+    return {
+      applied: false,
+      merged: schedule,
+      report: v.errors.join("; "),
+      touchedDays: [...touchedDays],
+      skipped,
+    };
+  }
+  // Re-protect locked slots in case a patch silently mutated one (defense in
+  // depth — applyPatches itself rejects them above, but a buggy `force` caller
+  // shouldn't be able to demote a locked anchor).
+  if (!force) {
+    for (const id of lockedIds) {
+      const original = schedule.find((s) => s.id === id);
+      if (original && !result.find((s) => s.id === id)) result = [...result, original];
+    }
+  }
+  return {
+    applied: true,
+    merged: result,
+    report: skipped.length > 0 ? `applied with skips: ${skipped.join("; ")}` : null,
+    touchedDays: [...touchedDays],
+    skipped,
+  };
+}
+
 /** Swap primary lodging across all anchor slots (Edit View hotel picker). */
 export function swapPrimaryLodging(schedule, lodgingInfo) {
   return schedule.map((s) => {

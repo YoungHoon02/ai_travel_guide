@@ -6,6 +6,7 @@ import {
   replaceSlot,
   removeSlot,
   getPrimaryLodging,
+  applyPatches,
 } from "../store/schedule.js";
 
 /**
@@ -65,27 +66,39 @@ ${scheduleText}
 일반 텍스트로만 응답하세요. JSON 블록을 포함하지 마세요.
 
 ### 일정 수정 시:
-텍스트 설명 후 반드시 아래 JSON 블록을 포함하세요:
+텍스트 설명 후 반드시 아래 JSON 블록을 포함하세요. **부분 수정은 \`scope: "partial"\` + \`patches\` 형식을, 전면 재구성은 \`scope: "full"\` + \`modifiedSchedule\` 형식을 사용하세요.**
+
+#### A) 부분 수정 (권장 — 대부분의 경우 이 형식)
+영향받은 슬롯만 patch로 보내세요. 시간 cascade(다음 슬롯들 시간 자동 밀림)는 시스템이 처리하므로 **변경된 슬롯의 startTime만 바꿔주면 됩니다** — 영향받지 않은 슬롯은 절대 patches에 포함하지 마세요.
 
 \`\`\`json
 {
-  "modifiedSchedule": [... 수정된 전체 TimeSlot 배열 — 모든 필드 유지 ...],
+  "scope": "partial",
+  "patches": [
+    { "id": "기존슬롯id", "op": "replace", "fields": { "startTime": "10:30", "name": "..." } },
+    { "id": "기존슬롯id", "op": "remove" },
+    { "op": "insert", "afterId": "참조슬롯id또는null", "slot": { "id": "새unique id", "day": 1, "kind": "activity", "startTime": "14:00", "duration": 90, "name": "...", "area": "...", "indoor": false, "locked": false } }
+  ],
   "changes": [
-    {
-      "action": "replaced" | "removed" | "timeShift",
-      "oldName": "기존 항목명",
-      "newName": "새 항목명 (replaced일 때만)",
-      "reason": "변경 사유"
-    }
+    { "action": "replaced" | "removed" | "timeShift" | "added", "oldName": "...", "newName": "...", "reason": "..." }
   ]
 }
 \`\`\`
 
+#### B) 전면 재구성 (특수 — day 전체를 다시 짤 때만)
+
+\`\`\`json
+{
+  "scope": "full",
+  "modifiedSchedule": [... 수정된 전체 TimeSlot 배열 ...],
+  "changes": [...]
+}
+\`\`\`
+
 ## 중요사항
-- \`locked: true\` 인 슬롯 (숙소 앵커 등) 은 절대 수정하지 마세요
-- 시간 연속성을 유지하세요 (겹치는 시간 없이)
-- 새 슬롯 추가 시 기존 슬롯과 같은 필드 구조 유지: id, day, kind, startTime, endTime, duration, name, area, indoor, locked
-- id 는 기존 id 를 유지하거나 새로 추가 시 unique 하게 부여하세요
+- \`locked: true\` 인 슬롯 (숙소 앵커 등) 은 절대 수정하지 마세요 — patch 또는 modifiedSchedule에 포함해도 시스템이 거부합니다
+- **부분 수정 시 시간 cascade는 시스템이 자동 처리**: 슬롯 C의 startTime만 바꾸면 D/E는 자동으로 밀립니다. patches에 D/E를 넣지 마세요
+- 새 슬롯 insert 시 unique한 id 부여 (예: \`slot-new-1\`)
 - duration 은 분 단위입니다
 - 대체 장소 추천 시 같은 area 내 또는 인접 area 의 실제 존재하는 장소를 제안하세요`;
 }
@@ -170,17 +183,31 @@ async function fetchLLM(systemPrompt, chatMessages) {
 
 function parseResponse(raw) {
   const jsonMatch = raw.match(/```json\s*([\s\S]*?)```/);
-  if (!jsonMatch) return { text: raw.trim(), modifiedSchedule: null, changes: null };
+  if (!jsonMatch) {
+    return { text: raw.trim(), scope: "none", modifiedSchedule: null, patches: null, changes: null };
+  }
   try {
     const parsed = JSON.parse(jsonMatch[1]);
     const text = raw.replace(/```json[\s\S]*?```/g, "").trim();
+    // Backward-compat: legacy responses had `modifiedSchedule` without an
+    // explicit `scope`. Treat those as full-replace mode. The new partial
+    // mode is `scope: "partial"` + `patches[]`.
+    const scopeRaw = String(parsed.scope ?? "").toLowerCase();
+    const hasPatches = Array.isArray(parsed.patches) && parsed.patches.length > 0;
+    const hasFull = Array.isArray(parsed.modifiedSchedule);
+    let scope;
+    if (scopeRaw === "partial" || (hasPatches && !hasFull)) scope = "partial";
+    else if (scopeRaw === "full" || hasFull) scope = "full";
+    else scope = "none";
     return {
       text,
-      modifiedSchedule: parsed.modifiedSchedule ?? null,
+      scope,
+      modifiedSchedule: hasFull ? parsed.modifiedSchedule : null,
+      patches: hasPatches ? parsed.patches : null,
       changes: parsed.changes ?? null,
     };
   } catch {
-    return { text: raw.trim(), modifiedSchedule: null, changes: null };
+    return { text: raw.trim(), scope: "none", modifiedSchedule: null, patches: null, changes: null };
   }
 }
 
@@ -267,7 +294,22 @@ export default function CopilotPanel({
 
       setMessages((prev) => [...prev, { role: "assistant", content: parsed.text }]);
 
-      if (parsed.modifiedSchedule) {
+      // Dispatch on scope: "partial" → applyPatches (id-based, time cascade
+      // automatic, locked-protected), "full" → legacy applyProposedSchedule
+      // (full array replace). Both end at onScheduleChange with merged state.
+      if (parsed.scope === "partial") {
+        const { applied, merged, report } = applyPatches(schedule, parsed.patches);
+        if (applied) {
+          onScheduleChange?.(merged);
+          if (parsed.changes) setChanges(parsed.changes);
+          if (report) console.info("[Co-Pilot] partial applied with skips:", report);
+        } else {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: `⚠️ 부분 수정 적용 실패: ${report}` },
+          ]);
+        }
+      } else if (parsed.scope === "full") {
         const { applied, merged, report } = applyProposedSchedule(schedule, parsed.modifiedSchedule);
         if (applied) {
           onScheduleChange?.(merged);

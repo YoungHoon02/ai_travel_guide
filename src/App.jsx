@@ -108,6 +108,12 @@ export default function App() {
   const dynMoves = null;
   const [dynItinerary, setDynItinerary] = useState(null); // { days: [...], alternatives: [...] }
   const [dataLoading, setDataLoading] = useState(false);
+  // Lodging-anchored nearby preview used in step 2 when LLM dynContents is
+  // absent — replaces the hardcoded Japan defaults (constants.js CONTENTS) so
+  // non-Japan trips don't show irrelevant cards on first paint.
+  const [nearbyPreview, setNearbyPreview] = useState([]);
+  // Cache by lodging id so revisiting step 2 doesn't refire Places API.
+  const nearbyPreviewCacheRef = useRef(new Map());
 
   // Measure A showbox height to determine max visible dest cards
   const showboxRef = useRef(null);
@@ -140,7 +146,10 @@ export default function App() {
     return () => observers.forEach((o) => o.disconnect());
   }, [step]);
   const activeLodgings = dynLodgings ?? LODGINGS;
-  const activeContents = dynContents ?? CONTENTS;
+  // Priority: LLM-generated > lodging-nearby Places preview > hardcoded CONTENTS
+  // (offline safety net, originally Japan-centric). Once the user generates a
+  // dynamic itinerary or a nearby search succeeds, the safety net is hidden.
+  const activeContents = dynContents ?? (nearbyPreview.length > 0 ? nearbyPreview : CONTENTS);
   const activeMoves = dynMoves ?? MOVES;
 
   // Wrapper helpers using dynamic data
@@ -165,6 +174,33 @@ export default function App() {
   const [activeDay, setActiveDay] = useState(1);
   // Edit view — highlighted item (for map ↔ timeline sync)
   const [highlightItemId, setHighlightItemId] = useState(null);
+  // Edit view — leg indices whose turn-by-turn step list is expanded.
+  // Independent from highlight so users can keep multiple legs open.
+  const [expandedLegIndices, setExpandedLegIndices] = useState(() => new Set());
+  // Edit view — day-level routing options. dayStartTime overrides the 09:00
+  // anchor for transit departure-time chaining; transitPrefs is forwarded to
+  // the Routes API only for TRANSIT legs.
+  const [dayStartTime, setDayStartTime] = useState("09:00");
+  // routingPreference: ""(default) | "LESS_WALKING" | "FEWER_TRANSFERS"
+  // allowedModes: subset of ["BUS","SUBWAY","TRAIN","LIGHT_RAIL","RAIL"]; [] → no restriction
+  const [transitRoutingPref, setTransitRoutingPref] = useState("");
+  const [transitAllowedModes, setTransitAllowedModes] = useState(() => []);
+  const transitPrefs = useMemo(() => {
+    const out = {};
+    if (transitRoutingPref) out.routingPreference = transitRoutingPref;
+    if (Array.isArray(transitAllowedModes) && transitAllowedModes.length > 0) {
+      out.allowedTravelModes = transitAllowedModes;
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }, [transitRoutingPref, transitAllowedModes]);
+  const toggleLegExpanded = useCallback((legIndex) => {
+    setExpandedLegIndices((prev) => {
+      const next = new Set(prev);
+      if (next.has(legIndex)) next.delete(legIndex);
+      else next.add(legIndex);
+      return next;
+    });
+  }, []);
   // Hotel browse modal (full-screen picker with Google Places search)
   const [hotelModalOpen, setHotelModalOpen] = useState(false);
   // Co-Pilot floating panel — open/close toggle inside Edit View (step 2)
@@ -607,6 +643,52 @@ export default function App() {
     [selectedLodging]
   );
 
+  // Lodging-anchored nearby preview. Fires only on step 2 entry / lodging
+  // change, and only when the LLM hasn't already produced dynContents (which
+  // takes priority in activeContents). One Places API call per distinct
+  // lodging id — cached on nearbyPreviewCacheRef.
+  useEffect(() => {
+    if (step !== 2 || !gmapsReady || !selectedLodging || !selectedLodgingLatLng) return;
+    if (dynContents) return; // LLM result already populated, skip preview.
+    const cacheKey = selectedLodging.id ?? `${selectedLodgingLatLng[0]},${selectedLodgingLatLng[1]}`;
+    const cached = nearbyPreviewCacheRef.current.get(cacheKey);
+    if (cached) {
+      setNearbyPreview(cached);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const places = await fetchNearbyPlaces(
+        selectedLodgingLatLng[0],
+        selectedLodgingLatLng[1],
+        "tourist_attraction",
+        1500,
+        12
+      );
+      if (cancelled) return;
+      // Generic Unsplash fallback for places without a Google photo —
+      // matches the existing CONTENTS image style so cards render uniformly.
+      const fallbackImg = "https://images.unsplash.com/photo-1503614472-8c93d56e92ce?auto=format&fit=crop&w=300&q=70";
+      const transformed = (places ?? [])
+        .filter((p) => p.latlng)
+        .map((p) => ({
+          id: `nearby:${p.id}`,
+          name: p.name,
+          type: p.category || "관광",
+          area: p.vicinity ?? "",
+          latlng: p.latlng,
+          visitScore: Math.min(5, Math.max(1, Math.round(p.rating ?? 3.5))),
+          img: p.photoUrl || fallbackImg,
+        }));
+      if (transformed.length === 0) {
+        console.info(`[nearby] no places within 1.5km of ${selectedLodging.name ?? "lodging"}`);
+      }
+      nearbyPreviewCacheRef.current.set(cacheKey, transformed);
+      setNearbyPreview(transformed);
+    })();
+    return () => { cancelled = true; };
+  }, [step, gmapsReady, selectedLodging, selectedLodgingLatLng, dynContents]);
+
   const requiredStayLoad = STAY_LOAD_TARGET;
   // Derived selectedSpotIds — flat unique list of all days' spot ids
   const selectedSpotIds = useMemo(() => {
@@ -693,6 +775,20 @@ export default function App() {
     [editDayStops, selectedLodgingLatLng]
   );
 
+  // Whole-day "Open in Google Maps" deep link. Lodging → all activities (in
+  // current order) → lodging. Travel mode follows the day-level move style
+  // (public/car/walking/...). Returns null when there are no activities yet.
+  const dayMultiStopUrl = useMemo(() => {
+    const stops = editDayStops
+      .map((s) => asValidLatLng(s.latlng))
+      .filter(Boolean);
+    if (stops.length < 2) return null;
+    return buildGoogleMapsMultiStopUrl({
+      stops,
+      travelMode: defaultLegTravelMode(move),
+    });
+  }, [editDayStops, move]);
+
   // Edit View per-day routing: leg state, debounced chain fetch, polylines.
   // See src/hooks/useEditDayRouting.js. resetEditDayLegs is forwarded into a
   // ref above so resetGeneratedPlanState (which is declared earlier) can call it.
@@ -714,6 +810,8 @@ export default function App() {
     selectedLodgingLatLng,
     tripStartDate: planInputParsed?.startDate ?? null,
     activeDay,
+    dayStartTime,
+    transitPreferences: transitPrefs,
   });
   resetEditDayLegsRef.current = resetEditDayLegs;
 
@@ -777,6 +875,7 @@ export default function App() {
             type: "transport",
             legIndex: leg.legIndex,
             travelMode: leg.travelMode,
+            travelModeUsed: route.travelModeUsed ?? leg.travelMode,
             icon: modeInfo.icon,
             label: modeInfo.label,
             minutes: realMinutes,
@@ -786,6 +885,11 @@ export default function App() {
             durationText: route.duration,
             transitSummary: route.transitSummary ?? null,
             policyNotice: route.fallbackNotice ?? null,
+            steps: Array.isArray(route.steps) ? route.steps : [],
+            fromLatLng,
+            toLatLng,
+            fromName: from.name ?? null,
+            toName: to.name ?? null,
             isLoading: false,
             error: null,
           });
@@ -799,11 +903,17 @@ export default function App() {
             type: "transport",
             legIndex: leg?.legIndex ?? i - 1,
             travelMode,
+            travelModeUsed: travelMode,
             icon: modeInfo.icon,
             label: modeInfo.label,
             minutes: fallbackMode.minutes,
             km,
             real: false,
+            steps: [],
+            fromLatLng,
+            toLatLng,
+            fromName: from.name ?? null,
+            toName: to.name ?? null,
             isLoading: Boolean(leg?.isLoading),
             error: leg?.error ?? null,
             policyNotice: leg?.error
@@ -1071,6 +1181,20 @@ export default function App() {
       return { ...prev, [activeDay]: arrayMove(list, oldIdx, newIdx) };
     });
   }, [activeDay]);
+
+  // Reorder the active day's activities by greedy nearest-neighbor from the
+  // lodging anchor. Manual trigger only — never silently reorders user's plan.
+  const handleOptimizeRoute = useCallback(() => {
+    if (!Array.isArray(dayActivities) || dayActivities.length < 2) return;
+    const orderedIds = nearestNeighborOrder(dayActivities, selectedLodgingLatLng);
+    setDayAssignments((prev) => {
+      const current = prev[activeDay] ?? [];
+      // Preserve any IDs in the bucket that aren't in dayActivities (defensive).
+      const knownIds = new Set(orderedIds);
+      const trailing = current.filter((id) => !knownIds.has(id));
+      return { ...prev, [activeDay]: [...orderedIds, ...trailing] };
+    });
+  }, [dayActivities, selectedLodgingLatLng, activeDay]);
 
   /** Swap an item with its prev/next sibling within its day. */
   const moveSpotInDay = useCallback((id, day, dir) => {
@@ -1615,6 +1739,88 @@ export default function App() {
                             </div>
                           ) : null;
                         })()}
+                        <div className="edit-view__route-prefs" role="group" aria-label="경로 계산 옵션">
+                          <label className="edit-view__route-pref">
+                            <span className="edit-view__route-pref-label">출발</span>
+                            <input
+                              type="time"
+                              className="edit-view__route-pref-input"
+                              value={dayStartTime}
+                              onChange={(e) => setDayStartTime(e.target.value || "09:00")}
+                              aria-label="DAY 출발 시각"
+                            />
+                          </label>
+                          <label className="edit-view__route-pref">
+                            <span className="edit-view__route-pref-label">대중교통</span>
+                            <select
+                              className="edit-view__route-pref-input"
+                              value={transitRoutingPref}
+                              onChange={(e) => setTransitRoutingPref(e.target.value)}
+                              aria-label="대중교통 환승/도보 우선"
+                            >
+                              <option value="">자동</option>
+                              <option value="LESS_WALKING">도보 적게</option>
+                              <option value="FEWER_TRANSFERS">환승 적게</option>
+                            </select>
+                          </label>
+                          <div className="edit-view__route-pref edit-view__route-pref--chips" role="group" aria-label="허용 교통수단">
+                            {[
+                              { value: "BUS", label: "버스" },
+                              { value: "SUBWAY", label: "지하철" },
+                              { value: "TRAIN", label: "철도" },
+                            ].map((opt) => {
+                              const active = transitAllowedModes.includes(opt.value);
+                              return (
+                                <button
+                                  key={opt.value}
+                                  type="button"
+                                  className={`edit-view__route-pref-chip${active ? " active" : ""}`}
+                                  aria-pressed={active}
+                                  onClick={() =>
+                                    setTransitAllowedModes((prev) =>
+                                      prev.includes(opt.value)
+                                        ? prev.filter((v) => v !== opt.value)
+                                        : [...prev, opt.value]
+                                    )
+                                  }
+                                >
+                                  {opt.label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <button
+                            type="button"
+                            className="edit-view__route-optimize"
+                            onClick={handleOptimizeRoute}
+                            disabled={dayActivities.length < 2}
+                            title="숙소에서 시작해 가장 가까운 곳을 차례로 방문하도록 정렬합니다"
+                            aria-label="동선 최적화"
+                          >
+                            🧭 동선 최적화
+                          </button>
+                          {dayMultiStopUrl ? (
+                            <a
+                              className="edit-view__route-open-gmaps"
+                              href={dayMultiStopUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title="이 날 일정 전체를 구글 지도에서 한 번에 보기"
+                              aria-label="DAY 전체 동선 구글맵에서 열기"
+                            >
+                              🗺️ 전체 동선 구글맵
+                            </a>
+                          ) : (
+                            <button
+                              type="button"
+                              className="edit-view__route-open-gmaps"
+                              disabled
+                              aria-label="DAY 전체 동선 구글맵에서 열기"
+                            >
+                              🗺️ 전체 동선 구글맵
+                            </button>
+                          )}
+                        </div>
                         <div className="edit-view__body">
                           <div className="edit-view__timeline">
                             {dataLoading && (
@@ -1663,10 +1869,17 @@ export default function App() {
                                           (typeof item.km === "number" && item.km >= 1);
                                         const kmText = item.distanceText || (showKm ? `${item.km.toFixed(1)}km` : "");
                                         const canRetry = !item.real && !item.isLoading && item.legIndex != null;
+                                        const hasSteps = Array.isArray(item.steps) && item.steps.length > 0;
+                                        const expanded = item.legIndex != null && expandedLegIndices.has(item.legIndex);
+                                        const deepLinkUrl = buildGoogleMapsDirectionsUrl({
+                                          fromLatLng: item.fromLatLng,
+                                          toLatLng: item.toLatLng,
+                                          travelMode: item.travelModeUsed ?? item.travelMode,
+                                        });
                                         return (
                                           <div
                                             key={`t-${idx}`}
-                                            className={`tl-item tl-item--transport${canRetry ? " tl-item--transport-retry" : ""}`}
+                                            className={`tl-item tl-item--transport${canRetry ? " tl-item--transport-retry" : ""}${expanded ? " tl-item--transport-open" : ""}`}
                                             role={canRetry ? "button" : undefined}
                                             tabIndex={canRetry ? 0 : -1}
                                             aria-label={canRetry ? `구간 ${legNum} 경로 다시 불러오기` : undefined}
@@ -1695,6 +1908,33 @@ export default function App() {
                                               {item.isLoading && (
                                                 <span className="tl-item__transport-loading">계산중…</span>
                                               )}
+                                              {hasSteps && (
+                                                <button
+                                                  type="button"
+                                                  className="tl-item__step-toggle"
+                                                  aria-expanded={expanded}
+                                                  aria-label={`구간 ${legNum} 상세 ${expanded ? "접기" : "펼치기"}`}
+                                                  onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    toggleLegExpanded(item.legIndex);
+                                                  }}
+                                                >
+                                                  {expanded ? "▾ 상세 접기" : "▸ 상세 보기"}
+                                                </button>
+                                              )}
+                                              {deepLinkUrl && (
+                                                <a
+                                                  className="tl-item__deeplink"
+                                                  href={deepLinkUrl}
+                                                  target="_blank"
+                                                  rel="noopener noreferrer"
+                                                  onClick={(e) => e.stopPropagation()}
+                                                  aria-label={`구간 ${legNum} 구글 지도에서 열기`}
+                                                  title="구글 지도에서 열기"
+                                                >
+                                                  🧭 구글맵
+                                                </a>
+                                              )}
                                             </span>
                                             {item.legIndex != null && (
                                               <div
@@ -1722,6 +1962,51 @@ export default function App() {
                                                   );
                                                 })}
                                               </div>
+                                            )}
+                                            {expanded && hasSteps && (
+                                              <ol className="tl-item__steps">
+                                                {item.steps.map((step, sIdx) => {
+                                                  const stepMode = String(step.travelMode ?? "").toUpperCase();
+                                                  const isTransit = stepMode === "TRANSIT" && step.transit;
+                                                  const stepIcon =
+                                                    stepMode === "WALKING"
+                                                      ? "🚶"
+                                                      : stepMode === "TRANSIT"
+                                                        ? "🚇"
+                                                        : stepMode === "DRIVING"
+                                                          ? "🚗"
+                                                          : "·";
+                                                  const transitDetail = isTransit ? formatTransitStepDetail(step.transit) : "";
+                                                  const instruction = isTransit
+                                                    ? step.transit.lineShort || step.transit.lineName || step.transit.vehicleName || "대중교통 탑승"
+                                                    : stripInstructionHtml(step.instruction) || (stepMode === "WALKING" ? "도보 이동" : "이동");
+                                                  return (
+                                                    <li key={sIdx} className="tl-item__step">
+                                                      <span className="tl-item__step-icon" aria-hidden="true">{stepIcon}</span>
+                                                      <div className="tl-item__step-body">
+                                                        <span className="tl-item__step-instruction">{instruction}</span>
+                                                        {isTransit && (
+                                                          <>
+                                                            {(step.transit.departureStop || step.transit.arrivalStop) && (
+                                                              <span className="tl-item__step-meta">
+                                                                {step.transit.departureStop || "출발"} → {step.transit.arrivalStop || "도착"}
+                                                              </span>
+                                                            )}
+                                                            {transitDetail && (
+                                                              <span className="tl-item__step-meta">{transitDetail}</span>
+                                                            )}
+                                                          </>
+                                                        )}
+                                                        {(step.duration || step.distance) && (
+                                                          <span className="tl-item__step-meta tl-item__step-meta--num">
+                                                            {[step.duration, step.distance].filter(Boolean).join(" · ")}
+                                                          </span>
+                                                        )}
+                                                      </div>
+                                                    </li>
+                                                  );
+                                                })}
+                                              </ol>
                                             )}
                                             {item.error && (
                                               <span className="tl-item__transport-km">⚠ {item.error}</span>
@@ -2455,6 +2740,47 @@ function haversineKm(a, b) {
   return 2 * R * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
 
+// Greedy nearest-neighbor TSP for ordering a day's activities. Anchored at
+// the lodging coordinate (start). Activities without valid coordinates are
+// appended at the end in their original order so the user doesn't lose them.
+//
+// O(n²) on activity count — fine for n ≤ ~20, which is far above any realistic
+// daily plan. Doesn't try 2-opt; for typical 5–10 stops per day, NN gets
+// within a few percent of optimal and stays predictable for the user.
+function nearestNeighborOrder(activities, startLatLng) {
+  if (!Array.isArray(activities) || activities.length <= 1) {
+    return activities.map((a) => a.id);
+  }
+  const withCoords = [];
+  const withoutCoords = [];
+  for (const a of activities) {
+    if (asValidLatLng(a.latlng)) withCoords.push(a);
+    else withoutCoords.push(a);
+  }
+  let current = asValidLatLng(startLatLng) ?? withCoords[0]?.latlng ?? null;
+  const remaining = [...withCoords];
+  const ordered = [];
+  while (remaining.length > 0) {
+    if (!current) {
+      ordered.push(...remaining);
+      break;
+    }
+    let bestIdx = 0;
+    let bestKm = Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const km = haversineKm(current, remaining[i].latlng);
+      if (km < bestKm) {
+        bestKm = km;
+        bestIdx = i;
+      }
+    }
+    const pick = remaining.splice(bestIdx, 1)[0];
+    ordered.push(pick);
+    current = pick.latlng;
+  }
+  return [...ordered, ...withoutCoords].map((a) => a.id);
+}
+
 function asValidLatLng(latlng) {
   if (!Array.isArray(latlng) || latlng.length !== 2) return null;
   const lat = Number(latlng[0]);
@@ -2621,6 +2947,85 @@ function guessTransportMode(distanceKm, style) {
   if (distanceKm < 1) return walk(distanceKm);
   if (distanceKm < 8) return transit(distanceKm);
   return car(distanceKm);
+}
+
+// Map our internal travelMode tag to Google Maps URL `travelmode` param.
+// Bicycling falls back to "transit" since Google's web URL doesn't accept "bicycling"
+// for the dir/?api=1 endpoint in all regions; transit is the safer default for
+// non-driving non-walking modes.
+function googleMapsTravelModeParam(mode) {
+  const m = String(mode ?? "").toUpperCase();
+  if (m === "WALKING") return "walking";
+  if (m === "DRIVING") return "driving";
+  if (m === "TRANSIT") return "transit";
+  if (m === "BICYCLING") return "bicycling";
+  return "transit";
+}
+
+// Build a Google Maps deep link for a single leg. Opens the native app on
+// mobile / google.com/maps on desktop. Coordinates are passed as "lat,lng".
+function buildGoogleMapsDirectionsUrl({ fromLatLng, toLatLng, travelMode }) {
+  if (!Array.isArray(fromLatLng) || fromLatLng.length !== 2) return null;
+  if (!Array.isArray(toLatLng) || toLatLng.length !== 2) return null;
+  const origin = `${fromLatLng[0]},${fromLatLng[1]}`;
+  const destination = `${toLatLng[0]},${toLatLng[1]}`;
+  const params = new URLSearchParams({
+    api: "1",
+    origin,
+    destination,
+    travelmode: googleMapsTravelModeParam(travelMode),
+  });
+  return `https://www.google.com/maps/dir/?${params.toString()}`;
+}
+
+// Build a multi-stop Google Maps deep link for a full day's plan. Stops is
+// an ordered array of [lat,lng] tuples (typically: lodging → A → B → ... →
+// lodging). Google Maps URL spec accepts up to 9 waypoints between origin and
+// destination; we slice if exceeded so the link still opens with the first 9.
+function buildGoogleMapsMultiStopUrl({ stops, travelMode }) {
+  const valid = (stops ?? []).filter(
+    (s) => Array.isArray(s) && s.length === 2 && Number.isFinite(Number(s[0])) && Number.isFinite(Number(s[1]))
+  );
+  if (valid.length < 2) return null;
+  const origin = `${valid[0][0]},${valid[0][1]}`;
+  const destination = `${valid[valid.length - 1][0]},${valid[valid.length - 1][1]}`;
+  const middle = valid.slice(1, -1).slice(0, 9);
+  const params = new URLSearchParams({
+    api: "1",
+    origin,
+    destination,
+    travelmode: googleMapsTravelModeParam(travelMode),
+  });
+  // URLSearchParams encodes "|" as "%7C" — Google accepts both forms.
+  if (middle.length > 0) {
+    params.set("waypoints", middle.map((c) => `${c[0]},${c[1]}`).join("|"));
+  }
+  return `https://www.google.com/maps/dir/?${params.toString()}`;
+}
+
+// Strip Google's HTML instruction tags for a clean text label. The Routes API
+// returns plain-ish text already (we pre-escape in api.js), but legacy
+// DirectionsService can yield HTML — this guards both paths.
+function stripInstructionHtml(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/<\/?(?:b|div|wbr|span|br)[^>]*>/gi, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Compose the secondary line shown under each transit step, e.g.
+// "지하철 · JR 야마노테선 → 시부야 (4정거장)".
+function formatTransitStepDetail(transit) {
+  if (!transit) return "";
+  const vehicle = formatTransitVehicleLabel(transit.vehicleType);
+  const line = transit.lineShort || transit.lineName || transit.vehicleName || "";
+  const headsign = transit.headsign ? `→ ${transit.headsign}` : "";
+  const stops = Number.isFinite(transit.stopCount)
+    ? `(${transit.stopCount}정거장)`
+    : "";
+  return [vehicle, line, headsign, stops].filter(Boolean).join(" ");
 }
 
 function formatTransitVehicleLabel(type = "") {

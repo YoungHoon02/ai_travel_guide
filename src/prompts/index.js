@@ -16,6 +16,7 @@ export {
   TRANSPORT_PROMPT,
   LODGING_PROMPT,
   ITINERARY_PROMPT,
+  ALTERNATIVES_PROMPT,
   buildLuckyThemePrompt,
   buildPlanParserPrompt,
 } from "./planning.js";

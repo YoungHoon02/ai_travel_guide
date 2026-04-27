@@ -4,6 +4,7 @@ import {
   TRANSPORT_PROMPT,
   LODGING_PROMPT,
   ITINERARY_PROMPT,
+  ALTERNATIVES_PROMPT,
   buildRealtimeSystemPrompt,
 } from "./prompts/index.js";
 
@@ -47,19 +48,44 @@ export async function fetchWeather(lat, lng) {
 }
 
 // ─── Google Maps nearby places (New API) ─────────────────────────────────────
-export async function fetchNearbyPlaces(lat, lng, type = "tourist_attraction", radius = 1500) {
+export async function fetchNearbyPlaces(lat, lng, type = "tourist_attraction", radius = 1500, maxResults = 6) {
   if (!window.google?.maps?.places?.Place) return [];
   try {
     const { places } = await window.google.maps.places.Place.searchNearby({
       locationRestriction: { center: { lat, lng }, radius },
       includedPrimaryTypes: [type],
-      fields: ["displayName", "formattedAddress", "rating", "currentOpeningHours", "id"],
-      maxResultCount: 6,
+      // location lets the caller place markers / fetch directions without a
+      // follow-up Place Details call. photos enables thumbnail generation via
+      // fetchPlacePhoto. primaryTypeDisplayName provides a localized category.
+      fields: ["displayName", "formattedAddress", "rating", "currentOpeningHours", "id", "location", "photos", "primaryTypeDisplayName"],
+      maxResultCount: maxResults,
     });
-    return (places ?? []).map((p) => ({
-      name: p.displayName, vicinity: p.formattedAddress, rating: p.rating,
-      openNow: p.currentOpeningHours?.isOpen?.() ?? null, id: p.id,
-    }));
+    return (places ?? []).map((p) => {
+      const loc = p.location;
+      const placeLat = typeof loc?.lat === "function" ? loc.lat() : loc?.lat;
+      const placeLng = typeof loc?.lng === "function" ? loc.lng() : loc?.lng;
+      const latlng = Number.isFinite(placeLat) && Number.isFinite(placeLng) ? [placeLat, placeLng] : null;
+      // Call getURI inline while the Place object is still alive — once the
+      // searchNearby promise resolves the Photo handles remain valid for the
+      // session, but capturing the URL up-front avoids storing live refs.
+      let photoUrl = null;
+      try {
+        const photo = Array.isArray(p.photos) && p.photos.length > 0 ? p.photos[0] : null;
+        if (photo && typeof photo.getURI === "function") {
+          photoUrl = photo.getURI({ maxWidth: 600 });
+        }
+      } catch {}
+      return {
+        name: p.displayName,
+        vicinity: p.formattedAddress,
+        rating: p.rating,
+        openNow: p.currentOpeningHours?.isOpen?.() ?? null,
+        id: p.id,
+        latlng,
+        photoUrl,
+        category: p.primaryTypeDisplayName ?? null,
+      };
+    });
   } catch { return []; }
 }
 
@@ -76,6 +102,9 @@ const PREFER_ROUTES_API = parseBooleanEnv(import.meta.env.VITE_PREFER_ROUTES_API
 const ENHANCED_TRANSIT = parseBooleanEnv(import.meta.env.VITE_ENHANCED_TRANSIT, true);
 const ENHANCED_TRAFFIC = parseBooleanEnv(import.meta.env.VITE_ROUTE_TRAFFIC_COLORS, true);
 const ALLOW_LEGACY_DIRECTIONS_FALLBACK = parseBooleanEnv(import.meta.env.VITE_ALLOW_LEGACY_DIRECTIONS_FALLBACK, false);
+// Set VITE_ROUTES_API_DEBUG=true to see full request body + response body for
+// every Routes API failure. Off by default to avoid console noise.
+const ROUTES_API_DEBUG = parseBooleanEnv(import.meta.env.VITE_ROUTES_API_DEBUG, false);
 const ROUTES_BASE_FIELD_MASK = [
   "routes.duration",
   "routes.distanceMeters",
@@ -104,7 +133,11 @@ const ROUTES_SOFT_DISABLE_WINDOW_MS = 5 * 60 * 1000;
 const DIRECTIONS_CACHE_TTL_MS = 2 * 60 * 1000;
 const DIRECTIONS_FAILURE_CACHE_TTL_MS = 20 * 1000;
 let routesApiDisabledUntil = 0;
-let lastRoutesApiErrorSig = "";
+// Per-variant signature dedupe — keyed by `${travelMode}:${variant.tag}` so
+// each distinct variant gets one warning even if its body changes between
+// calls. Reset (cleared) every 5 min to allow fresh diagnostics.
+const variantErrorSigs = new Map();
+const VARIANT_ERROR_DEDUPE_MS = 5 * 60 * 1000;
 let legacyDirectionsDisabledUntil = 0;
 let routesTrafficSupportState = "unknown"; // unknown | probing | supported | unsupported
 let routesTrafficUnsupportedUntil = 0;
@@ -192,6 +225,37 @@ function buildTrafficSegments(polylinePath, intervals) {
       color: trafficSpeedColor(speed),
       path,
     });
+  }
+  return out;
+}
+
+// Color palette for step-level polyline rendering. Walking sections of a
+// transit leg should look different from the bus/subway sections so the user
+// can tell at a glance where they need to walk vs ride.
+const STEP_MODE_COLORS = {
+  WALKING: "#5ecfcf",
+  TRANSIT: "#ffd23f",
+  DRIVING: "#e8a020",
+  BICYCLING: "#a3e635",
+};
+
+export function colorForStepMode(mode) {
+  const m = String(mode ?? "").toUpperCase();
+  return STEP_MODE_COLORS[m] ?? "#5ecfcf";
+}
+
+// Build per-step polyline segments from a normalized direction result. Each
+// returned entry is { mode, color, path }, suitable for rendering as a
+// distinct polyline. Falls back to [] when steps lack geometry — caller
+// should fall back to the leg-level `polylinePath` in that case.
+export function buildStepSegments(direction) {
+  if (!direction || !Array.isArray(direction.steps)) return [];
+  const out = [];
+  for (const step of direction.steps) {
+    const path = step.polylinePath;
+    if (!Array.isArray(path) || path.length < 2) continue;
+    const mode = String(step.travelMode ?? "").toUpperCase();
+    out.push({ mode, color: colorForStepMode(mode), path });
   }
   return out;
 }
@@ -376,7 +440,23 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
     languageCode: "ko",
   };
 
-  if (isTransit) baseBody.departureTime = opts.departureTime ?? new Date().toISOString();
+  if (isTransit) {
+    baseBody.departureTime = opts.departureTime ?? new Date().toISOString();
+    // transitPreferences: { allowedTravelModes?: [...], routingPreference?: "LESS_WALKING"|"FEWER_TRANSFERS" }
+    // Forwarded only when caller supplies explicit preferences — Routes API
+    // rejects empty objects with INVALID_ARGUMENT.
+    const prefs = opts.transitPreferences;
+    if (prefs && typeof prefs === "object") {
+      const cleaned = {};
+      if (Array.isArray(prefs.allowedTravelModes) && prefs.allowedTravelModes.length > 0) {
+        cleaned.allowedTravelModes = prefs.allowedTravelModes;
+      }
+      if (typeof prefs.routingPreference === "string" && prefs.routingPreference) {
+        cleaned.routingPreference = prefs.routingPreference;
+      }
+      if (Object.keys(cleaned).length > 0) baseBody.transitPreferences = cleaned;
+    }
+  }
   if (travelMode === "DRIVING") {
     baseBody.routingPreference = "TRAFFIC_AWARE";
     baseBody.departureTime = opts.departureTime ?? new Date().toISOString();
@@ -425,8 +505,23 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
       fieldMask: ROUTES_BASE_FIELD_MASK.join(","),
     });
 
+    // Auto-fallback when transitPreferences is the offender. We strip prefs
+    // before the relaxed variant so a single bad pref combo doesn't poison
+    // the whole leg fetch — the relaxed variant gets one more chance after
+    // this with no languageCode either.
+    if (baseBody.transitPreferences) {
+      const noPrefsBody = { ...baseBody };
+      delete noPrefsBody.transitPreferences;
+      requestVariants.push({
+        tag: "transit-no-prefs",
+        body: noPrefsBody,
+        fieldMask: ROUTES_BASE_FIELD_MASK.join(","),
+      });
+    }
+
     const relaxedTransitBody = { ...baseBody };
     delete relaxedTransitBody.languageCode;
+    delete relaxedTransitBody.transitPreferences;
     requestVariants.push({
       tag: "transit-relaxed",
       body: relaxedTransitBody,
@@ -480,6 +575,22 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
       finalizeVariantSupport(variant.tag, false, res.status);
       lastError = await res.text().catch(() => "");
       if (res.status === 400) hadBadRequest = true;
+      // Per-variant dedupe so each distinct variant tag gets exactly one
+      // warning per 5-min window, with body + response excerpts. Verbose mode
+      // (VITE_ROUTES_API_DEBUG=true) bypasses dedupe and prints full bodies.
+      const sigKey = `${travelMode}:${variant.tag}`;
+      const lastAt = variantErrorSigs.get(sigKey) ?? 0;
+      const dedupeExpired = Date.now() - lastAt > VARIANT_ERROR_DEDUPE_MS;
+      if (ROUTES_API_DEBUG || dedupeExpired) {
+        variantErrorSigs.set(sigKey, Date.now());
+        const bodyPreview = ROUTES_API_DEBUG
+          ? JSON.stringify(variant.body)
+          : JSON.stringify(variant.body).slice(0, 200);
+        const errPreview = ROUTES_API_DEBUG ? lastError : lastError.slice(0, 300);
+        console.warn(
+          `[Routes API] ${res.status} on variant=${variant.tag} mode=${travelMode}\n  body: ${bodyPreview}\n  resp: ${errPreview}`
+        );
+      }
       continue;
     }
     finalizeVariantSupport(variant.tag, true, res.status);
@@ -490,25 +601,22 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
 
   if (!route) {
     if (hadBadRequest) routesApiDisabledUntil = Date.now() + ROUTES_SOFT_DISABLE_WINDOW_MS;
-    if (lastError) {
-      const signature = `${travelMode}:${lastError.slice(0, 180)}`;
-      if (signature !== lastRoutesApiErrorSig) {
-        lastRoutesApiErrorSig = signature;
-        console.warn("[Routes API] computeRoutes failed:", lastError.slice(0, 500));
-      }
-    }
+    // Per-variant warnings already fired in the loop above; no further log
+    // here to avoid duplicating the same context.
     return null;
   }
 
   const durationSecs = parseDurationSeconds(route.duration);
   const distanceMeters = route.distanceMeters ?? null;
 
-  const polylinePath =
-    route.polyline?.encodedPolyline && window.google?.maps?.geometry
-      ? window.google.maps.geometry.encoding
-          .decodePath(route.polyline.encodedPolyline)
-          .map((p) => [p.lat(), p.lng()])
-      : null;
+  const decodeEncodedPath = (encoded) => {
+    if (!encoded || !window.google?.maps?.geometry) return null;
+    return window.google.maps.geometry.encoding
+      .decodePath(encoded)
+      .map((p) => [p.lat(), p.lng()]);
+  };
+
+  const polylinePath = decodeEncodedPath(route.polyline?.encodedPolyline);
   const trafficSegments =
     isDriving && polylinePath
       ? buildTrafficSegments(polylinePath, extractTrafficIntervals(route))
@@ -523,6 +631,7 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
       distance: s.distanceMeters ? formatRouteDistance(s.distanceMeters) : "",
       travelMode: travelModeUsed,
       transit: normalizeTransitStep(s.transitDetails),
+      polylinePath: decodeEncodedPath(s.polyline?.encodedPolyline),
     };
   });
   const transitLineLabels = Array.from(
@@ -556,10 +665,12 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
  * @param {[number,number]} originLatLng
  * @param {[number,number]} destLatLng
  * @param {string} [travelMode="DRIVING"]
- * @param {{ departureTime?: string }} [options={}]
+ * @param {{ departureTime?: string, transitPreferences?: { allowedTravelModes?: string[], routingPreference?: "LESS_WALKING"|"FEWER_TRANSFERS" } }} [options={}]
  *   departureTime — ISO 8601 UTC (e.g. "2024-03-15T09:00:00Z").
  *   When provided, bypasses the direction cache so the time-sensitive
  *   sequential transit chain always gets a fresh result.
+ *   transitPreferences — Forwarded to the Routes API only for TRANSIT mode.
+ *   Presence also bypasses the cache (different prefs → different routes).
  */
 export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode = "DRIVING", options = {}) {
   if (!isValidLatLng(originLatLng) || !isValidLatLng(destLatLng)) return null;
@@ -567,17 +678,20 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
     return buildZeroDistanceDirection(originLatLng, travelMode);
   }
   const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
-  const { departureTime = null } = options;
-  // Time-stamped transit requests must not use the cache (different times → different routes).
+  const { departureTime = null, transitPreferences = null } = options;
+  // Time-stamped or pref-tuned transit requests must not use the cache.
+  const bypassCache = Boolean(departureTime) || Boolean(transitPreferences);
   const cacheKey = buildDirectionCacheKey(originLatLng, destLatLng, travelMode);
-  if (!departureTime) {
+  if (!bypassCache) {
     const now = Date.now();
     const cached = directionsCache.get(cacheKey);
     if (cached && cached.expiresAt > now) return cached.value;
     if (directionsInFlight.has(cacheKey)) return directionsInFlight.get(cacheKey);
   }
 
-  const routeOpts = departureTime ? { departureTime } : {};
+  const routeOpts = {};
+  if (departureTime) routeOpts.departureTime = departureTime;
+  if (transitPreferences) routeOpts.transitPreferences = transitPreferences;
   const requestPromise = (async () => {
     const shouldTryRoutesApi = PREFER_ROUTES_API && Boolean(apiKey) && Date.now() >= routesApiDisabledUntil;
     if (shouldTryRoutesApi) {
@@ -590,8 +704,8 @@ export async function fetchGoogleDirections(originLatLng, destLatLng, travelMode
     return await fetchLegacyGoogleDirections(originLatLng, destLatLng, travelMode);
   })();
 
-  if (departureTime) {
-    // Don't cache time-stamped results — let them complete and return directly.
+  if (bypassCache) {
+    // Don't cache time-stamped or pref-tuned results — let them complete and return directly.
     return requestPromise;
   }
 
@@ -971,6 +1085,7 @@ export async function fetchOsrmGeometry(fromLatLng, toLatLng, profile) {
 // ─── LLM configuration ──────────────────────────────────────────────────────
 const LLM_PROVIDER = (import.meta.env.VITE_LLM_PROVIDER || "openai").trim().toLowerCase();
 const OLLAMA_URL = (import.meta.env.VITE_OLLAMA_URL || "http://localhost:11434").trim();
+const LMSTUDIO_URL = (import.meta.env.VITE_LMSTUDIO_URL || "http://localhost:1234").trim();
 const OLLAMA_TAGS_TTL_MS = 60 * 1000;
 let ollamaTagsCache = { expiresAt: 0, models: null };
 const LLM_SETTINGS = {
@@ -978,8 +1093,27 @@ const LLM_SETTINGS = {
   gemini: { provider: "gemini", label: "Gemini", key: import.meta.env.VITE_GEMINI_API_KEY, model: (import.meta.env.VITE_GEMINI_MODEL || "gemini-2.5-flash-lite").trim(), keyEnv: "VITE_GEMINI_API_KEY" },
   claude: { provider: "claude", label: "Claude", key: import.meta.env.VITE_CLAUDE_API_KEY, model: (import.meta.env.VITE_CLAUDE_MODEL || "claude-3-5-sonnet-latest").trim(), keyEnv: "VITE_CLAUDE_API_KEY" },
   ollama: { provider: "ollama", label: "Ollama (local)", key: "ollama", model: (import.meta.env.VITE_OLLAMA_MODEL || "bjoernb/gemma4-31b-think").trim(), keyEnv: "VITE_OLLAMA_MODEL" },
+  lmstudio: { provider: "lmstudio", label: "LM Studio (local)", key: "lmstudio", model: (import.meta.env.VITE_LMSTUDIO_MODEL || "local-model").trim(), keyEnv: "VITE_LMSTUDIO_MODEL" },
 };
 export const ACTIVE_LLM = LLM_SETTINGS[LLM_PROVIDER] ?? LLM_SETTINGS.openai;
+
+// True for providers that speak the OpenAI Chat Completions wire format.
+// LM Studio + Ollama both expose `/v1/chat/completions`, but only Ollama
+// accepts the `options.num_ctx` extension — LM Studio rejects unknown body
+// fields on stricter versions, so we keep the request body minimal for it.
+function isOpenAICompatProvider(provider) {
+  return provider === "openai" || provider === "ollama" || provider === "lmstudio";
+}
+
+function openAICompatUrl(provider) {
+  if (provider === "ollama") return `${OLLAMA_URL}/v1/chat/completions`;
+  if (provider === "lmstudio") return `${LMSTUDIO_URL}/v1/chat/completions`;
+  return "https://api.openai.com/v1/chat/completions";
+}
+
+function needsOpenAIAuthHeader(provider) {
+  return provider === "openai";
+}
 
 function shouldRetryOllamaModel(errText) {
   const msg = String(errText ?? "").toLowerCase();
@@ -1066,15 +1200,17 @@ export async function callLLM({ userMessage, plan, currentTime, location, weathe
   let reqBody = null; let resData = null; let raw = "";
 
   try {
-    if (ACTIVE_LLM.provider === "openai" || ACTIVE_LLM.provider === "ollama") {
-      const isOllama = ACTIVE_LLM.provider === "ollama";
-      const apiUrl = isOllama ? `${OLLAMA_URL}/v1/chat/completions` : "https://api.openai.com/v1/chat/completions";
+    if (isOpenAICompatProvider(ACTIVE_LLM.provider)) {
+      const apiUrl = openAICompatUrl(ACTIVE_LLM.provider);
       const headers = { "Content-Type": "application/json" };
-      if (!isOllama) headers.Authorization = `Bearer ${ACTIVE_LLM.key}`;
+      if (needsOpenAIAuthHeader(ACTIVE_LLM.provider)) headers.Authorization = `Bearer ${ACTIVE_LLM.key}`;
       const messages = [{ role: "system", content: systemContent }, ...chatMessages];
       reqBody = { model: ACTIVE_LLM.model, messages, max_tokens: 4096, temperature: 0.7 };
       const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
-      if (!res.ok) throw new Error(ACTIVE_LLM.provider);
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`${ACTIVE_LLM.provider} ${res.status}: ${errText.slice(0, 300)}`);
+      }
       resData = await res.json();
       raw = resData.choices?.[0]?.message?.content ?? "";
     } else if (ACTIVE_LLM.provider === "gemini") {
@@ -1110,6 +1246,8 @@ export async function callLLM({ userMessage, plan, currentTime, location, weathe
 // Stack-based repair: inserts missing } before ] when an object is still open,
 // then appends any remaining unclosed structures at the end.
 // Handles the common LLM pattern where the last array item is missing its closing }.
+// Also closes a string truncated mid-value, then drops a trailing partial
+// property ("key":) or trailing comma so the result is parseable.
 function tryRepairJSON(str) {
   const stack = [];
   let result = '';
@@ -1129,9 +1267,94 @@ function tryRepairJSON(str) {
       result += ch;
     } else { result += ch; }
   }
-  result = result.trimEnd().replace(/,\s*$/, '');
+  // Close an unterminated string (truncation cut off mid-value).
+  if (inStr) result += '"';
+  // Drop dangling "key": or "key" with no value, then any trailing comma/colon.
+  result = result.trimEnd();
+  result = result.replace(/,?\s*"[^"\\]*"\s*:\s*$/, '');
+  result = result.replace(/[,:]\s*$/, '');
   while (stack.length > 0) result += stack.pop();
   return result;
+}
+
+// Strip ```json ... ``` fences. Tolerates a missing closing fence (response
+// truncated mid-output) — without this, the leading ```json prefix poisons
+// JSON.parse on every truncated LLM reply.
+function stripCodeFence(text) {
+  let out = text.trim();
+  const open = out.match(/^```(?:json|JSON)?\s*\n?/);
+  if (open) out = out.slice(open[0].length);
+  const close = out.match(/\n?\s*```\s*$/);
+  if (close) out = out.slice(0, out.length - close[0].length);
+  return out.trim();
+}
+
+// Find the position right after the last fully-closed element inside the
+// innermost open array. Used to pick a safe cut point for continuation: if we
+// trim the partial response back to here, the model can resume by emitting
+// "," + next array element without having to mid-string-resume.
+// Returns -1 when there's no such position (e.g. response cuts off before any
+// array element finished).
+function findLastSafeArrayCutPoint(str) {
+  let inStr = false, escape = false;
+  const stack = [];
+  let lastSafeCut = -1;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inStr) { escape = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === '{' || ch === '[') { stack.push(ch); continue; }
+    if (ch === '}' || ch === ']') {
+      stack.pop();
+      if (stack.length > 0 && stack[stack.length - 1] === '[') {
+        lastSafeCut = i + 1;
+      }
+    }
+  }
+  return lastSafeCut;
+}
+
+// Best-effort continuation when finish_reason indicates truncation. Sends one
+// follow-up call with the (trimmed) partial as a prior assistant turn and asks
+// the model to resume. Only wired for openai/ollama since they're the
+// providers most likely to truncate on small contexts; gemini/claude have
+// larger output budgets in this codebase. Returns the merged cleaned text on
+// success, or null if continuation isn't safe / fails / model refuses.
+async function tryContinue(cfg, systemPrompt, userMessage, partialCleaned) {
+  if (!isOpenAICompatProvider(cfg.provider)) return null;
+  const cutPoint = findLastSafeArrayCutPoint(partialCleaned);
+  if (cutPoint < 0) return null;
+  const trimmed = partialCleaned.slice(0, cutPoint);
+  const continuationMsg = `이전 응답이 토큰 한도로 잘렸습니다. 위 JSON을 그대로 이어서 완성해주세요.\n- 이미 출력된 내용은 절대 반복하지 말고 다음 항목부터만 출력\n- 동일한 JSON 형식 유지\n- 코드 펜스나 설명 텍스트 없이 JSON 일부 텍스트만 출력\n- ","로 시작해 다음 객체를 추가하거나, 배열을 닫는 "]"로 시작 가능`;
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userMessage },
+    { role: "assistant", content: trimmed },
+    { role: "user", content: continuationMsg },
+  ];
+  const url = openAICompatUrl(cfg.provider);
+  const headers = { "Content-Type": "application/json" };
+  let body;
+  if (cfg.provider === "ollama") {
+    body = { model: cfg.model, messages, temperature: 0.5, options: { num_ctx: 8192 } };
+  } else if (cfg.provider === "lmstudio") {
+    body = { model: cfg.model, messages, max_tokens: 4096, temperature: 0.5 };
+  } else {
+    headers.Authorization = `Bearer ${cfg.key}`;
+    body = { model: cfg.model, messages, max_tokens: 4096, temperature: 0.5 };
+  }
+  try {
+    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const continuation = data.choices?.[0]?.message?.content ?? "";
+    if (!continuation) return null;
+    return trimmed + stripCodeFence(continuation);
+  } catch {
+    return null;
+  }
 }
 
 // ─── Destination LLM ─────────────────────────────────────────────────────────
@@ -1172,15 +1395,22 @@ export async function callDestinationLLM(userMessage, chatHistory, onLog, count 
   }
   let reqBody = null; let resData = null; let raw = "";
   try {
-    if (ACTIVE_LLM.provider === "openai" || ACTIVE_LLM.provider === "ollama") {
-      const isOllama = ACTIVE_LLM.provider === "ollama";
-      const apiUrl = isOllama ? `${OLLAMA_URL}/v1/chat/completions` : "https://api.openai.com/v1/chat/completions";
+    if (isOpenAICompatProvider(ACTIVE_LLM.provider)) {
+      const apiUrl = openAICompatUrl(ACTIVE_LLM.provider);
       const headers = { "Content-Type": "application/json" };
-      if (!isOllama) headers.Authorization = `Bearer ${ACTIVE_LLM.key}`;
+      if (needsOpenAIAuthHeader(ACTIVE_LLM.provider)) headers.Authorization = `Bearer ${ACTIVE_LLM.key}`;
       const apiMsgs = [{ role: "system", content: DEST_SYSTEM_PROMPT }, ...messages];
       reqBody = { model: ACTIVE_LLM.model, messages: apiMsgs, max_tokens: 4096, temperature: 0.7 };
+      // response_format support varies: OpenAI/Ollama accept "json_object",
+      // LM Studio only accepts "json_schema" or "text" → omit and rely on the
+      // system prompt + tryRepairJSON. num_ctx is Ollama-only.
+      if (ACTIVE_LLM.provider !== "lmstudio") reqBody.response_format = { type: "json_object" };
+      if (ACTIVE_LLM.provider === "ollama") reqBody.options = { num_ctx: 8192 };
       const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
-      if (!res.ok) throw new Error(ACTIVE_LLM.provider);
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`${ACTIVE_LLM.provider} ${res.status}: ${errText.slice(0, 300)}`);
+      }
       resData = await res.json();
       raw = resData.choices?.[0]?.message?.content ?? "";
     } else if (ACTIVE_LLM.provider === "gemini") {
@@ -1215,9 +1445,13 @@ export async function callDestinationLLM(userMessage, chatHistory, onLog, count 
       resData = await res.json();
       raw = (resData.content ?? []).map((item) => item.text).filter(Boolean).join("\n");
     }
-    let cleaned = raw.trim();
-    const codeBlock = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (codeBlock) cleaned = codeBlock[1].trim();
+    let cleaned = stripCodeFence(raw);
+    const finishReason = resData?.choices?.[0]?.finish_reason ?? resData?.candidates?.[0]?.finishReason ?? resData?.stop_reason ?? null;
+    const truncated = finishReason === "length" || finishReason === "MAX_TOKENS" || finishReason === "max_tokens";
+    if (truncated) {
+      const continued = await tryContinue({ provider: ACTIVE_LLM.provider, model: ACTIVE_LLM.model, key: ACTIVE_LLM.key }, DEST_SYSTEM_PROMPT, prefixed, cleaned);
+      if (continued && continued.length > cleaned.length) cleaned = continued;
+    }
     let parsed;
     try { parsed = JSON.parse(cleaned); } catch (_) { parsed = JSON.parse(tryRepairJSON(cleaned)); }
     const logResData = ACTIVE_LLM.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
@@ -1255,7 +1489,7 @@ export async function callGenericLLM(systemPrompt, userMessage, onLog, fnName) {
       const apiUrl = "https://api.openai.com/v1/chat/completions";
       const headers = { "Content-Type": "application/json" };
       headers.Authorization = `Bearer ${cfg.key}`;
-      reqBody = { model: cfg.model, messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userMessage }], max_tokens: 4096, temperature: 0.7 };
+      reqBody = { model: cfg.model, messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userMessage }], max_tokens: 4096, temperature: 0.7, response_format: { type: "json_object" } };
       const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
@@ -1264,10 +1498,15 @@ export async function callGenericLLM(systemPrompt, userMessage, onLog, fnName) {
       resData = await res.json();
       raw = resData.choices?.[0]?.message?.content ?? "";
     } else if (cfg.provider === "ollama") {
-      const apiUrl = `${OLLAMA_URL}/v1/chat/completions`;
+      const apiUrl = openAICompatUrl(cfg.provider);
       const headers = { "Content-Type": "application/json" };
       const messages = [{ role: "system", content: systemPrompt }, { role: "user", content: userMessage }];
-      const buildBody = (model) => ({ model, messages, temperature: 0.7 });
+      // num_ctx raises the model's runtime context window above the 4k default
+      // so itinerary outputs don't get truncated. Ollama's OpenAI-compat
+      // endpoint forwards `options` straight to the runtime. response_format
+      // forces JSON-only output (no prose/code-fence preamble) — Ollama maps
+      // this to its `format: "json"` mode internally.
+      const buildBody = (model) => ({ model, messages, temperature: 0.7, options: { num_ctx: 8192 }, response_format: { type: "json_object" } });
 
       usedModel = cfg.model;
       reqBody = buildBody(usedModel);
@@ -1294,6 +1533,28 @@ export async function callGenericLLM(systemPrompt, userMessage, onLog, fnName) {
       }
       resData = await res.json();
       raw = resData.choices?.[0]?.message?.content ?? "";
+    } else if (cfg.provider === "lmstudio") {
+      // LM Studio exposes the OpenAI Chat Completions wire format on
+      // VITE_LMSTUDIO_URL (default http://localhost:1234). Differences vs
+      // OpenAI/Ollama: rejects the `options` extension (Ollama-only) AND
+      // rejects response_format.type="json_object" (only "json_schema"/"text"
+      // are accepted). We rely on the system prompt + tryRepairJSON to keep
+      // outputs JSON-shaped without the format hint.
+      const apiUrl = openAICompatUrl(cfg.provider);
+      const headers = { "Content-Type": "application/json" };
+      reqBody = {
+        model: cfg.model,
+        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userMessage }],
+        max_tokens: 4096,
+        temperature: 0.7,
+      };
+      const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`lmstudio ${res.status}: ${errText.slice(0, 300)}`);
+      }
+      resData = await res.json();
+      raw = resData.choices?.[0]?.message?.content ?? "";
     } else if (cfg.provider === "gemini") {
       reqBody = { systemInstruction: { parts: [{ text: systemPrompt }] }, contents: [{ role: "user", parts: [{ text: userMessage }] }], generationConfig: { temperature: 0.7, maxOutputTokens: 8192, responseMimeType: "application/json" } };
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cfg.model)}:generateContent?key=${encodeURIComponent(cfg.key)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(reqBody) });
@@ -1313,9 +1574,15 @@ export async function callGenericLLM(systemPrompt, userMessage, onLog, fnName) {
       resData = await res.json();
       raw = (resData.content ?? []).map((item) => item.text).filter(Boolean).join("\n");
     }
-    let cleaned = raw.trim();
-    const codeBlock = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (codeBlock) cleaned = codeBlock[1].trim();
+    let cleaned = stripCodeFence(raw);
+    // Truncation detection across providers — finish_reason on openai/ollama,
+    // finishReason on gemini, stop_reason on claude.
+    const finishReason = resData?.choices?.[0]?.finish_reason ?? resData?.candidates?.[0]?.finishReason ?? resData?.stop_reason ?? null;
+    const truncated = finishReason === "length" || finishReason === "MAX_TOKENS" || finishReason === "max_tokens";
+    if (truncated) {
+      const continued = await tryContinue(cfg, systemPrompt, userMessage, cleaned);
+      if (continued && continued.length > cleaned.length) cleaned = continued;
+    }
     let parsed;
     try { parsed = JSON.parse(cleaned); } catch (_) { parsed = JSON.parse(tryRepairJSON(cleaned)); }
     const logResData = cfg.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
@@ -1480,12 +1747,25 @@ function normalizeItineraryResult(result, dayCount) {
 }
 
 // ─── Generate complete itinerary (spots pre-assigned to days) ────────────────
+// Split into two parallel LLM calls (days + alternatives) so each output stays
+// well under the model's context window. Combined output was hitting truncation
+// on small local models (4k window). Alternatives don't reference specific
+// spot IDs from the days, so they can be generated in parallel with shared
+// trip context. If the alternatives call fails we still return the days.
 export async function generateItinerary(country, city, tags, days, transportName, onLog) {
   const dayCount = parseTripDayCount(days);
   const tagStr = tags.length > 0 ? tags.join(", ") : "전체";
-  const msg = `${country} ${city} ${dayCount - 1}박${dayCount}일 여행 일정 생성.\n선호 성향: ${tagStr}\n이동수단: ${transportName}\n${dayCount}일간의 완벽한 일정을 만들어줘.\n중요: days 배열은 DAY 1부터 DAY ${dayCount}까지 정확히 ${dayCount}개를 포함해야 하며, day 값은 누락 없이 연속이어야 한다.`;
-  const result = await callGenericLLM(ITINERARY_PROMPT, msg, onLog, "itinerary");
-  const normalized = normalizeItineraryResult(result, dayCount);
+  const tripContext = `${country} ${city} ${dayCount - 1}박${dayCount}일 여행.\n선호 성향: ${tagStr}\n이동수단: ${transportName}`;
+  const daysMsg = `${tripContext}\n${dayCount}일간의 완벽한 일정을 만들어줘.\n중요: days 배열은 DAY 1부터 DAY ${dayCount}까지 정확히 ${dayCount}개를 포함해야 하며, day 값은 누락 없이 연속이어야 한다.`;
+  const altsMsg = `${tripContext}\n위 여행에 어울리는 대체 가능한 명소 3곳을 추천해줘.`;
+
+  const [daysResult, altsResult] = await Promise.all([
+    callGenericLLM(ITINERARY_PROMPT, daysMsg, onLog, "itinerary"),
+    callGenericLLM(ALTERNATIVES_PROMPT, altsMsg, onLog, "alternatives").catch(() => null),
+  ]);
+
+  const merged = { ...(daysResult ?? {}), alternatives: Array.isArray(altsResult?.alternatives) ? altsResult.alternatives : [] };
+  const normalized = normalizeItineraryResult(merged, dayCount);
   if (normalized?.days && normalized.days.length > 0) return normalized;
   return null;
 }

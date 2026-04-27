@@ -147,39 +147,28 @@ Output STRICTLY valid JSON object:
       "spots": [
         {
           "id": "unique-id",
-          "name": "Spot name in Korean (English)",
-          "type": "category in Korean",
-          "summary": "brief Korean description (max 40 chars)",
+          "name": "Korean name only — do NOT add English in parentheses",
+          "type": "category in Korean (max 8 chars)",
+          "summary": "brief Korean description (max 25 chars)",
           "time": "HH:MM",
-          "area": "district name in Korean",
+          "area": "district name in Korean (max 10 chars)",
           "visitScore": 1-5,
-          "llmStayNote": "expected duration note in Korean",
+          "llmStayNote": "duration note in Korean (max 20 chars)",
           "indoor": true/false,
           "lat": 35.6762,
           "lng": 139.6503
         }
       ]
     }
-  ],
-  "alternatives": [
-    {
-      "id": "alt-unique-id",
-      "name": "Alternative spot name",
-      "type": "category",
-      "summary": "why this is a good swap option",
-      "replaces": "which type of spot this can replace",
-      "area": "district",
-      "visitScore": 1-5,
-      "indoor": true/false
-    }
   ]
 }
 
 Rules:
-- 4-5 spots per day, with realistic timing (first spot ~09:00, last ~20:00)
+- Exactly 4 spots per day, with realistic timing (first spot ~09:00, last ~20:00)
 - Cluster geographically — nearby spots on same day
 - Balance indoor/outdoor
-- Include 4-6 alternative spots the user can swap in
+- Do NOT emit an "alternatives" field — alternatives are produced by a separate call
+- All Korean text fields must respect the max-char caps above — keep it terse, omit English glosses
 - visitScore: 1=30min, 2=1h, 3=1.5h, 4=2h, 5=3h+
 - "lat"/"lng": include the spot's actual decimal coordinates IF and ONLY IF you
   are confident — do NOT guess. The downstream geocoder will resolve coordinates
@@ -200,6 +189,36 @@ constraint when picking activities and clustering them into days:
 The per-segment actual transport mode (walk / subway / taxi / drive) is decided
 later by Google Directions, NOT by this prompt. Your job is only to pick and
 cluster activities so the radius budget is respected.`;
+
+// ─── Alternatives prompt ─────────────────────────────────────────────────────
+// Split out from ITINERARY_PROMPT so each LLM call produces a smaller payload —
+// the original combined response was hitting the model's context cap on small
+// local Ollama runtimes (4k window) and getting truncated mid-string. This
+// prompt runs in parallel with the itinerary call (see api.js generateItinerary).
+export const ALTERNATIVES_PROMPT = `You are an expert AI travel planner. For the given trip, suggest 3 alternative spots the traveler can swap in to replace activities on their itinerary.
+
+Output STRICTLY valid JSON object:
+{
+  "alternatives": [
+    {
+      "id": "alt-unique-id",
+      "name": "Korean name only — no English glosses in parentheses",
+      "type": "category in Korean (max 8 chars)",
+      "summary": "swap reason in Korean (max 25 chars)",
+      "replaces": "which spot category this can replace (max 10 chars)",
+      "area": "district in Korean (max 10 chars)",
+      "visitScore": 1-5,
+      "indoor": true/false
+    }
+  ]
+}
+
+Rules:
+- EXACTLY 3 alternatives — no more, no less
+- All Korean text fields must respect the max-char caps above
+- visitScore: 1=30min, 2=1h, 3=1.5h, 4=2h, 5=3h+
+- Do NOT include "days" or any other top-level fields — only "alternatives"
+- Pick alternatives that match the trip's destination, tags, and travel style — they should be realistic swap-ins, not generic tourist clichés`;
 
 // ─── Dynamic builders ────────────────────────────────────────────────────────
 

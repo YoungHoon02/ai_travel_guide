@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 import { Polyline } from "react-leaflet";
 import { buildTransitLikeRoute } from "../utils.js";
-import { fetchGoogleDirections, fetchOsrmGeometry, GMAPS_TRAVEL_MODE_MAP } from "../api.js";
+import { fetchGoogleDirections, fetchOsrmGeometry, buildStepSegments, GMAPS_TRAVEL_MODE_MAP } from "../api.js";
 import { osrmProfileForMove } from "../constants.js";
 
 export default function RoutedPolylines({ defs, moveId, onSegmentClick }) {
@@ -71,6 +71,32 @@ export default function RoutedPolylines({ defs, moveId, onSegmentClick }) {
                     opacity: 0.92,
                     lineCap: "round",
                     lineJoin: "round",
+                  }}
+                  positions={seg.path}
+                  eventHandlers={{ click: (e) => onSegmentClick(def, e, dirInfo) }}
+                />
+              ))}
+            </Fragment>
+          );
+        }
+
+        const stepSegments = buildStepSegments(dirInfo);
+        const hasMixedModes =
+          stepSegments.length > 1 &&
+          new Set(stepSegments.map((s) => s.mode)).size > 1;
+        if (hasMixedModes) {
+          return (
+            <Fragment key={def.id}>
+              {stepSegments.map((seg, idx) => (
+                <Polyline
+                  key={`${def.id}-step-${idx}`}
+                  pathOptions={{
+                    color: seg.color,
+                    weight: seg.mode === "WALKING" ? (def.weight ?? 7) - 2 : def.weight ?? 7,
+                    opacity: 0.92,
+                    lineCap: "round",
+                    lineJoin: "round",
+                    ...(seg.mode === "WALKING" ? { dashArray: "4 6" } : {}),
                   }}
                   positions={seg.path}
                   eventHandlers={{ click: (e) => onSegmentClick(def, e, dirInfo) }}

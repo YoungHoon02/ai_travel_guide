@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { fetchGoogleDirections } from "../api.js";
+import { fetchGoogleDirections, buildStepSegments } from "../api.js";
 
 // Wait this long after the last edit to a day's stop sequence before kicking
 // off the leg chain fetch. Drag/toggle bursts collapse into a single fetch.
@@ -139,6 +139,11 @@ export function useEditDayRouting({
   selectedLodgingLatLng,
   tripStartDate,
   activeDay,
+  // Day-anchor start time as "HH:MM" (local). Defaults to "09:00".
+  dayStartTime = "09:00",
+  // Routes API transitPreferences. null/undefined → use Google's defaults.
+  // Expected shape: { allowedTravelModes?: ["BUS"|"SUBWAY"|"TRAIN"|"LIGHT_RAIL"|"RAIL"][], routingPreference?: "LESS_WALKING"|"FEWER_TRANSFERS" }
+  transitPreferences = null,
 }) {
   // Shape: [{ legIndex, fromId, toId, fromName, toName, fromLatLng, toLatLng,
   //           stayDurationMin, travelMode, routeData, isLoading, error, real }]
@@ -153,17 +158,22 @@ export function useEditDayRouting({
   const lastMoveRef = useRef(null);
 
   // Anchor for departure-time chain calculation. Uses the parsed start date
-  // at 09:00 local when available, otherwise today at 09:00. activeDay is
-  // applied as a 24h offset inside computeLegDepartureMs.
+  // at the user-selected dayStartTime when available, otherwise today at
+  // dayStartTime. activeDay is applied as a 24h offset inside
+  // computeLegDepartureMs.
   const tripBaseDateMs = useMemo(() => {
+    const [hStr = "09", mStr = "00"] = String(dayStartTime ?? "09:00").split(":");
+    const h = Math.max(0, Math.min(23, Number(hStr) || 0));
+    const m = Math.max(0, Math.min(59, Number(mStr) || 0));
+    const timeFragment = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`;
     if (tripStartDate) {
-      const parsed = Date.parse(`${tripStartDate}T09:00:00`);
+      const parsed = Date.parse(`${tripStartDate}T${timeFragment}`);
       if (!Number.isNaN(parsed)) return parsed;
     }
     const base = new Date();
-    base.setHours(9, 0, 0, 0);
+    base.setHours(h, m, 0, 0);
     return base.getTime();
-  }, [tripStartDate]);
+  }, [tripStartDate, dayStartTime]);
 
   // Fetch the chain of legs starting at startLegIndex through to the end of
   // the day. Each leg's departure time is computed from the previous leg's
@@ -200,11 +210,16 @@ export function useEditDayRouting({
       let routeData = null;
       let error = null;
       try {
+        const fetchOpts = {};
+        if (departureTime) fetchOpts.departureTime = departureTime;
+        if (transitPreferences && leg.travelMode === "TRANSIT") {
+          fetchOpts.transitPreferences = transitPreferences;
+        }
         routeData = await fetchLegDirectionsWithFallback(
           leg.fromLatLng,
           leg.toLatLng,
           leg.travelMode,
-          departureTime ? { departureTime } : {}
+          fetchOpts
         );
         if (!routeData) error = "경로를 찾지 못했습니다";
       } catch (e) {
@@ -218,7 +233,7 @@ export function useEditDayRouting({
       );
       setEditDayLegs(working);
     }
-  }, [tripBaseDateMs, activeDay]);
+  }, [tripBaseDateMs, activeDay, transitPreferences]);
 
   // Debounced trigger for the leg chain fetch. While editDayStops is changing
   // (drag, toggle, day switch) the effect rebuilds the leg skeleton (so the
@@ -358,6 +373,10 @@ export function useEditDayRouting({
         const usableTraffic = traffic.filter(
           (t) => Array.isArray(t.path) && t.path.length >= 2 && t.color
         );
+        const stepSegments = buildStepSegments(route);
+        const hasMixedModes =
+          stepSegments.length > 1 &&
+          new Set(stepSegments.map((s) => s.mode)).size > 1;
         if (usableTraffic.length > 0) {
           for (const t of usableTraffic) {
             segments.push({
@@ -366,6 +385,17 @@ export function useEditDayRouting({
               weight: 6,
               opacity: 0.95,
               dashed: false,
+            });
+          }
+        } else if (hasMixedModes) {
+          // TRANSIT leg with WALK→TRANSIT→WALK transitions — colored per step.
+          for (const seg of stepSegments) {
+            segments.push({
+              positions: seg.path,
+              color: seg.color,
+              weight: seg.mode === "WALKING" ? 4 : 6,
+              opacity: 0.92,
+              dashed: seg.mode === "WALKING",
             });
           }
         } else {
