@@ -3628,6 +3628,22 @@ img.dest-card__thumb {
   word-break: keep-all;
   overflow-wrap: anywhere;
 }
+.tl-item__step-line-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 18px;
+  padding: 0 5px;
+  margin-right: 6px;
+  border: 1.5px solid;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+  vertical-align: middle;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.25);
+}
 .tl-item__step-meta {
   color: var(--mgs-text-dim);
   font-size: 10px;

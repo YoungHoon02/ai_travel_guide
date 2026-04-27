@@ -118,6 +118,11 @@ const ROUTES_BASE_FIELD_MASK = [
 const ROUTES_TRANSIT_FIELD_MASK = [
   "routes.legs.steps.transitDetails.transitLine.name",
   "routes.legs.steps.transitDetails.transitLine.nameShort",
+  // Real-world line colors — Google returns hex strings like "#0072BC" for
+  // 서울 1호선, "#00A84D" for 2호선, etc. We use these to paint polylines so
+  // the map matches official transit signage instead of generic mode colors.
+  "routes.legs.steps.transitDetails.transitLine.color",
+  "routes.legs.steps.transitDetails.transitLine.textColor",
   "routes.legs.steps.transitDetails.transitLine.vehicle.type",
   "routes.legs.steps.transitDetails.transitLine.vehicle.name",
   "routes.legs.steps.transitDetails.headsign",
@@ -161,6 +166,16 @@ function parseDurationSeconds(durationText) {
   return Number.isFinite(v) ? v : null;
 }
 
+// Validate hex color from Google Routes API. Routes API typically returns
+// "#RRGGBB" but we defensively accept "#RGB" too and reject anything else
+// (e.g. CSS keywords, malformed strings) before piping to inline styles.
+function sanitizeHexColor(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(trimmed)) return trimmed;
+  return null;
+}
+
 function normalizeTransitStep(transitDetails) {
   if (!transitDetails) return null;
   const line = transitDetails.transitLine ?? {};
@@ -169,6 +184,8 @@ function normalizeTransitStep(transitDetails) {
   return {
     lineName: line.name ?? "",
     lineShort: line.nameShort ?? "",
+    lineColor: sanitizeHexColor(line.color),
+    lineTextColor: sanitizeHexColor(line.textColor),
     vehicleType: vehicle.type ?? "",
     vehicleName: vehicle.name ?? "",
     headsign: transitDetails.headsign ?? "",
@@ -245,9 +262,13 @@ export function colorForStepMode(mode) {
 }
 
 // Build per-step polyline segments from a normalized direction result. Each
-// returned entry is { mode, color, path }, suitable for rendering as a
-// distinct polyline. Falls back to [] when steps lack geometry — caller
-// should fall back to the leg-level `polylinePath` in that case.
+// returned entry is { mode, color, path, lineLabel? }, suitable for rendering
+// as a distinct polyline. For TRANSIT steps we prefer the Google-supplied
+// real-world line color (서울 1호선 남색, 2호선 초록색, etc.) and fall back
+// to the generic mode color when the line color is missing.
+//
+// Falls back to [] when steps lack geometry — caller should fall back to the
+// leg-level `polylinePath` in that case.
 export function buildStepSegments(direction) {
   if (!direction || !Array.isArray(direction.steps)) return [];
   const out = [];
@@ -255,7 +276,15 @@ export function buildStepSegments(direction) {
     const path = step.polylinePath;
     if (!Array.isArray(path) || path.length < 2) continue;
     const mode = String(step.travelMode ?? "").toUpperCase();
-    out.push({ mode, color: colorForStepMode(mode), path });
+    const lineColor = mode === "TRANSIT" ? step.transit?.lineColor : null;
+    out.push({
+      mode,
+      color: lineColor || colorForStepMode(mode),
+      path,
+      lineLabel: mode === "TRANSIT"
+        ? (step.transit?.lineShort || step.transit?.lineName || step.transit?.vehicleName || "")
+        : "",
+    });
   }
   return out;
 }
@@ -267,6 +296,8 @@ function normalizeLegacyTransitStep(transit) {
   return {
     lineName: line.name ?? "",
     lineShort: line.short_name ?? "",
+    lineColor: sanitizeHexColor(line.color),
+    lineTextColor: sanitizeHexColor(line.text_color),
     vehicleType: vehicle.type ?? "",
     vehicleName: vehicle.name ?? "",
     headsign: transit.headsign ?? "",
@@ -1184,6 +1215,104 @@ function resolveFnConfig(fnName) {
 function sanitizeGeminiResponse(data) {
   if (!data?.candidates) return data;
   return { ...data, candidates: data.candidates.map((c) => ({ ...c, content: c.content ? { ...c.content, parts: (c.content.parts ?? []).map(({ thoughtSignature, ...rest }) => rest) } : c.content })) };
+}
+
+/**
+ * Multi-turn chat LLM call that returns raw text (no JSON parsing).
+ *
+ * Why this exists: callGenericLLM forces JSON-only output via response_format
+ * and a single user message. Co-Pilot needs multi-turn history AND can return
+ * either text-only counter-questions OR text+JSON modifications. Caller does
+ * its own parsing, so this helper just owns the provider routing + auth +
+ * error logging that all chat-flavored consumers share.
+ *
+ * @param {Object} args
+ * @param {string} args.systemPrompt
+ * @param {Array<{role:"user"|"assistant", content:string}>} args.messages
+ * @param {Function} [args.onLog]
+ * @param {string} [args.fnName="copilot"]  per-function provider override key
+ * @returns {Promise<{text:string, raw:any}>}
+ */
+export async function callChatLLM({ systemPrompt, messages, onLog, fnName = "copilot" }) {
+  const cfg = resolveFnConfig(fnName);
+  const timestamp = new Date().toISOString();
+  if (!cfg.key) {
+    if (onLog) onLog({ provider: "simulation", model: "rule-based", responseText: "No API key", error: true, timestamp, fn: fnName });
+    throw new Error("LLM API key not configured");
+  }
+  let reqBody = null;
+  let resData = null;
+  let raw = "";
+  try {
+    if (isOpenAICompatProvider(cfg.provider)) {
+      const apiUrl = openAICompatUrl(cfg.provider);
+      const headers = { "Content-Type": "application/json" };
+      if (needsOpenAIAuthHeader(cfg.provider)) headers.Authorization = `Bearer ${cfg.key}`;
+      const apiMsgs = [{ role: "system", content: systemPrompt }, ...messages];
+      reqBody = { model: cfg.model, messages: apiMsgs, max_tokens: 4096, temperature: 0.7 };
+      // Ollama-only: extend context window so longer schedules fit. LM Studio
+      // and OpenAI reject this field — keep behavior conditional.
+      if (cfg.provider === "ollama") reqBody.options = { num_ctx: 8192 };
+      const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`${cfg.provider} ${res.status}: ${errText.slice(0, 300)}`);
+      }
+      resData = await res.json();
+      raw = resData.choices?.[0]?.message?.content ?? "";
+    } else if (cfg.provider === "gemini") {
+      const geminiMessages = messages.map((m) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.content }],
+      }));
+      reqBody = {
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: geminiMessages,
+        generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
+      };
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cfg.model)}:generateContent?key=${encodeURIComponent(cfg.key)}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(reqBody) }
+      );
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`gemini ${res.status}: ${errText.slice(0, 300)}`);
+      }
+      resData = await res.json();
+      raw = (resData.candidates?.[0]?.content?.parts ?? []).map((p) => p.text).filter(Boolean).join("\n");
+    } else if (cfg.provider === "claude") {
+      const claudeMessages = messages.map((m) => ({
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: m.content,
+      }));
+      reqBody = { model: cfg.model, system: systemPrompt, max_tokens: 4096, temperature: 0.7, messages: claudeMessages };
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": cfg.key,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify(reqBody),
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`claude ${res.status}: ${errText.slice(0, 300)}`);
+      }
+      resData = await res.json();
+      raw = (resData.content ?? []).map((item) => item.text).filter(Boolean).join("\n");
+    } else {
+      throw new Error(`Unsupported provider: ${cfg.provider}`);
+    }
+    const logResData = cfg.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
+    if (onLog) onLog({ provider: cfg.provider, model: cfg.model, requestBody: reqBody, responseData: logResData, responseText: raw, timestamp, fn: fnName });
+    return { text: raw, raw: resData };
+  } catch (e) {
+    console.error(`[ChatLLM:${fnName}] error:`, e);
+    if (onLog) onLog({ provider: cfg.provider + " (error)", model: cfg.model, requestBody: reqBody, responseText: raw || e.message, error: true, timestamp, fn: fnName });
+    throw e;
+  }
 }
 
 

@@ -70,6 +70,27 @@
 
 // ─── Time helpers ────────────────────────────────────────────────────────────
 
+/**
+ * Map a startTime to a coarse semantic tag the LLM can reason over.
+ * Bands chosen to match common Korean travel-day phrasing:
+ *   06-11 → "morning"   (오전, 아침)
+ *   11-13 → "lunch"     (점심)
+ *   13-17 → "afternoon" (오후)
+ *   17-21 → "dinner"    (저녁)
+ *   21+ / pre-06 → "night" (밤, 늦은 시간)
+ */
+export function semanticTagForTime(startTime) {
+  if (!startTime || typeof startTime !== "string") return null;
+  const [h] = startTime.split(":").map((n) => parseInt(n, 10));
+  if (!Number.isFinite(h)) return null;
+  if (h < 6) return "night";
+  if (h < 11) return "morning";
+  if (h < 13) return "lunch";
+  if (h < 17) return "afternoon";
+  if (h < 21) return "dinner";
+  return "night";
+}
+
 /** "HH:MM" → minutes since midnight. */
 export function timeToMin(hhmm) {
   if (!hhmm || typeof hhmm !== "string") return 0;
@@ -292,13 +313,13 @@ export function recalculateDayTimes(schedule, day, { transitMinutes = 30 } = {})
   const recomputed = activities.map((a) => {
     if (a.locked) {
       cursor = timeToMin(a.endTime);
-      return a;
+      return { ...a, semanticTag: semanticTagForTime(a.startTime) };
     }
     cursor += transitMinutes; // transit into this activity
     const start = minToTime(cursor);
     cursor += a.duration;
     const end = minToTime(cursor);
-    return { ...a, startTime: start, endTime: end };
+    return { ...a, startTime: start, endTime: end, semanticTag: semanticTagForTime(start) };
   });
 
   const result = [...others];
@@ -313,6 +334,38 @@ export function recalculateDayTimes(schedule, day, { transitMinutes = 30 } = {})
     result.push({ ...endAnchor, startTime: newEndTime, endTime: newEndTime });
   }
   return result;
+}
+
+/**
+ * Compute a stable hash for the schedule's structural identity. Used as a
+ * race-condition guard: when an LLM call takes 5-10s and the user edits a
+ * slot in the meantime, we don't want the LLM response to silently overwrite
+ * the user's edit. The LLM is asked to echo the same hash; on apply we
+ * compare against the current schedule's hash.
+ *
+ * Hash inputs are id + day + startTime + endTime + name + locked. Insertion
+ * order doesn't matter (slots are sorted before hashing). Output is a short
+ * base36 string — not cryptographic, just collision-resistant enough for
+ * single-user racing windows.
+ */
+export function scheduleHash(schedule) {
+  if (!Array.isArray(schedule) || schedule.length === 0) return "0";
+  const sorted = [...schedule].sort((a, b) => {
+    if (a.day !== b.day) return a.day - b.day;
+    const ta = timeToMin(a.startTime ?? "00:00");
+    const tb = timeToMin(b.startTime ?? "00:00");
+    if (ta !== tb) return ta - tb;
+    return String(a.id).localeCompare(String(b.id));
+  });
+  // Fast non-crypto string hash (djb2 variant).
+  let h = 5381;
+  for (const s of sorted) {
+    const key = `${s.id}|${s.day}|${s.startTime}|${s.endTime}|${s.name ?? ""}|${s.locked ? 1 : 0}`;
+    for (let i = 0; i < key.length; i += 1) {
+      h = ((h << 5) + h + key.charCodeAt(i)) | 0;
+    }
+  }
+  return (h >>> 0).toString(36);
 }
 
 /**
@@ -334,9 +387,24 @@ export function recalculateDayTimes(schedule, day, { transitMinutes = 30 } = {})
  *
  * Returns { applied, merged, report, touchedDays }.
  */
-export function applyPatches(schedule, patches, { force = false } = {}) {
+export function applyPatches(schedule, patches, { force = false, expectedHash = null } = {}) {
   if (!Array.isArray(patches) || patches.length === 0) {
     return { applied: false, merged: schedule, report: "no patches", touchedDays: [] };
+  }
+  // Race-condition guard: if caller passes the hash the LLM was responding to
+  // and the schedule has since changed, reject the patch entirely so the
+  // user's intervening edits aren't overwritten.
+  if (expectedHash != null) {
+    const currentHash = scheduleHash(schedule);
+    if (currentHash !== expectedHash) {
+      return {
+        applied: false,
+        merged: schedule,
+        report: `schedule changed during LLM call (hash ${expectedHash} → ${currentHash})`,
+        touchedDays: [],
+        staleHash: true,
+      };
+    }
   }
   const byId = new Map(schedule.map((s) => [s.id, s]));
   const lockedIds = new Set(schedule.filter((s) => s.locked).map((s) => s.id));
@@ -618,21 +686,93 @@ export function scheduleFromItineraryLLM(itinerary, lodgingInfo, dayCount) {
 /**
  * Summarize schedule as compact text for LLM injection. Used by Co-Pilot
  * system prompt so the model sees the current plan in a predictable format.
+ *
+ * Optional filters reduce token cost when only part of the trip is relevant:
+ *   - days?: number[] — restrict to these day numbers (e.g. [2] for "today")
+ *   - slotIds?: Set<string>|string[] — restrict to these slots
+ *   - includeLodgingAnchors?: boolean (default true) — include the locked
+ *     anchors of any included day so LLM has the day's bounds
+ *
+ * When both filters are passed, slot-id wins for activity slots and lodging
+ * anchors are pulled from the included slots' days.
  */
-export function scheduleToLLMText(schedule) {
-  const days = new Set(schedule.map((s) => s.day));
+export function scheduleToLLMText(schedule, opts = {}) {
+  const { days: daysFilter, slotIds, includeLodgingAnchors = true } = opts;
+  const slotIdSet = slotIds instanceof Set ? slotIds : (Array.isArray(slotIds) ? new Set(slotIds) : null);
+
+  let included = schedule;
+  if (slotIdSet) {
+    const matched = schedule.filter((s) => slotIdSet.has(s.id));
+    if (includeLodgingAnchors) {
+      const matchedDays = new Set(matched.map((s) => s.day));
+      const anchors = schedule.filter((s) => s.kind === "lodging" && matchedDays.has(s.day));
+      const merged = new Map();
+      for (const s of [...matched, ...anchors]) merged.set(s.id, s);
+      included = [...merged.values()];
+    } else {
+      included = matched;
+    }
+  } else if (Array.isArray(daysFilter) && daysFilter.length > 0) {
+    const dset = new Set(daysFilter);
+    included = schedule.filter((s) => dset.has(s.day));
+  }
+
+  const days = new Set(included.map((s) => s.day));
   const lines = [];
   for (const d of [...days].sort((a, b) => a - b)) {
-    const slots = getSlotsForDay(schedule, d);
+    // Filter to only the included slots for this day, then sort like getSlotsForDay
+    const slots = included
+      .filter((s) => s.day === d)
+      .sort((a, b) => timeToMin(a.startTime) - timeToMin(b.startTime));
     lines.push(`--- DAY ${d} ---`);
     for (const s of slots) {
       const tag = s.kind === "lodging" ? `[LODGING${s.anchor === "start" ? "/START" : "/END"}]` : "[ACTIVITY]";
       const locked = s.locked ? " LOCKED" : "";
       const indoor = s.indoor ? "indoor" : "outdoor";
+      // semanticTag derived in recalculateDayTimes — fall back to live compute
+      // for slots that pre-date Phase 5 (still in store from older builds).
+      const sem = s.semanticTag ?? semanticTagForTime(s.startTime);
+      const semStr = s.kind === "activity" && sem ? ` [${sem}]` : "";
       lines.push(
-        `  ${s.startTime}-${s.endTime} ${tag} ${s.name} (${s.area}, ${indoor})${locked} id=${s.id}`
+        `  ${s.startTime}-${s.endTime} ${tag}${semStr} ${s.name} (${s.area}, ${indoor})${locked} id=${s.id}`
       );
     }
   }
   return lines.join("\n");
+}
+
+/**
+ * Heuristic scope detector for Co-Pilot — analyzes user message to decide
+ * which days are relevant, so we can pass a smaller schedule to the LLM.
+ *
+ * Returns { days?: number[], reason: string }. Caller forwards days to
+ * scheduleToLLMText when present, or uses the full schedule when absent.
+ *
+ * Detection (Korean):
+ *   - "오늘", "지금" → today's day (if currentDay provided)
+ *   - "내일" → today + 1
+ *   - "DAY 3" / "3일차" / "3일째" → that specific day
+ *   - "전체", "모든 일정" / no temporal cue → null (= full schedule)
+ */
+export function detectScopeFromMessage(message, { currentDay = null, dayCount = null } = {}) {
+  const text = String(message ?? "");
+  if (!text) return { days: null, reason: "empty" };
+  if (/전체|모든 일정|trip|whole|all/i.test(text)) return { days: null, reason: "explicit-all" };
+
+  // Explicit day: "DAY N", "N일차", "N일째"
+  const dayMatch = text.match(/(?:DAY\s*|\b)(\d{1,2})\s*(?:일차|일째)?/i);
+  if (dayMatch) {
+    const n = parseInt(dayMatch[1], 10);
+    if (Number.isFinite(n) && n >= 1 && (dayCount == null || n <= dayCount)) {
+      return { days: [n], reason: `explicit-day-${n}` };
+    }
+  }
+
+  if (currentDay) {
+    if (/오늘|지금|now|today/i.test(text)) return { days: [currentDay], reason: "today" };
+    if (/내일|tomorrow/i.test(text) && (dayCount == null || currentDay + 1 <= dayCount)) {
+      return { days: [currentDay + 1], reason: "tomorrow" };
+    }
+  }
+  return { days: null, reason: "no-temporal-cue" };
 }

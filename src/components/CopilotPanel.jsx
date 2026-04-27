@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ACTIVE_LLM } from "../api.js";
+import { ACTIVE_LLM, callChatLLM } from "../api.js";
 import {
   validateSchedule,
   scheduleToLLMText,
@@ -7,6 +7,9 @@ import {
   removeSlot,
   getPrimaryLodging,
   applyPatches,
+  detectScopeFromMessage,
+  getDayCount,
+  scheduleHash,
 } from "../store/schedule.js";
 
 /**
@@ -27,12 +30,13 @@ import {
  *   compact: boolean                — slimmer UI for side-mount
  */
 
-const OLLAMA_URL =
-  (typeof import.meta !== "undefined" && import.meta.env?.VITE_OLLAMA_URL) ||
-  "http://localhost:11434";
-
-function buildSystemPrompt(schedule, currentTime, weather, location) {
-  const scheduleText = scheduleToLLMText(schedule);
+function buildSystemPrompt(schedule, currentTime, weather, location, scopeOpts) {
+  const scheduleText = scheduleToLLMText(schedule, scopeOpts ?? {});
+  // Tell the LLM exactly which slice it's seeing so it doesn't propose changes
+  // for slots it can't see — important once we filter by day.
+  const scopeNote = scopeOpts?.days?.length
+    ? `\n_(이 응답에 포함된 일정은 DAY ${scopeOpts.days.join(", ")} 만 입니다. 다른 날 일정은 변경하지 마세요.)_`
+    : "";
   return `당신은 AI 여행 Co-Pilot입니다. 사용자의 실시간 돌발 상황에 맞춰 여행 일정을 지능적으로 수정합니다.
 모든 응답은 반드시 한국어로 작성하세요.
 
@@ -41,7 +45,7 @@ function buildSystemPrompt(schedule, currentTime, weather, location) {
 - 날씨: ${weather ?? "-"}
 - 위치: ${location ?? "-"}
 
-## 현재 일정 (TimeSlot 형식)
+## 현재 일정 (TimeSlot 형식)${scopeNote}
 ${scheduleText}
 
 ## 핵심 규칙: 역질문 프로토콜 (Counter-Question Protocol)
@@ -100,85 +104,8 @@ ${scheduleText}
 - **부분 수정 시 시간 cascade는 시스템이 자동 처리**: 슬롯 C의 startTime만 바꾸면 D/E는 자동으로 밀립니다. patches에 D/E를 넣지 마세요
 - 새 슬롯 insert 시 unique한 id 부여 (예: \`slot-new-1\`)
 - duration 은 분 단위입니다
-- 대체 장소 추천 시 같은 area 내 또는 인접 area 의 실제 존재하는 장소를 제안하세요`;
-}
-
-async function fetchLLM(systemPrompt, chatMessages) {
-  const cfg = ACTIVE_LLM;
-  if (!cfg.key) throw new Error("API key not configured");
-
-  if (cfg.provider === "openai" || cfg.provider === "ollama") {
-    const isOllama = cfg.provider === "ollama";
-    const apiUrl = isOllama
-      ? `${OLLAMA_URL}/v1/chat/completions`
-      : "https://api.openai.com/v1/chat/completions";
-    const headers = { "Content-Type": "application/json" };
-    if (!isOllama) headers.Authorization = `Bearer ${cfg.key}`;
-    const messages = [{ role: "system", content: systemPrompt }, ...chatMessages];
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ model: cfg.model, messages, max_tokens: 4096, temperature: 0.7 }),
-    });
-    if (!res.ok) throw new Error(`${cfg.provider} ${res.status}`);
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content ?? "";
-  }
-
-  if (cfg.provider === "gemini") {
-    const geminiMessages = chatMessages.map((m) => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content }],
-    }));
-    const reqBody = {
-      systemInstruction: { parts: [{ text: systemPrompt }] },
-      contents: geminiMessages,
-      generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
-    };
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cfg.model)}:generateContent?key=${encodeURIComponent(cfg.key)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(reqBody),
-      }
-    );
-    if (!res.ok) throw new Error(`gemini ${res.status}`);
-    const data = await res.json();
-    return (data.candidates?.[0]?.content?.parts ?? [])
-      .map((p) => p.text)
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  if (cfg.provider === "claude") {
-    const claudeMessages = chatMessages.map((m) => ({
-      role: m.role === "assistant" ? "assistant" : "user",
-      content: m.content,
-    }));
-    const reqBody = {
-      model: cfg.model,
-      system: systemPrompt,
-      max_tokens: 4096,
-      temperature: 0.7,
-      messages: claudeMessages,
-    };
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": cfg.key,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify(reqBody),
-    });
-    if (!res.ok) throw new Error(`claude ${res.status}`);
-    const data = await res.json();
-    return (data.content ?? []).map((item) => item.text).filter(Boolean).join("\n");
-  }
-
-  throw new Error(`Unknown provider: ${cfg.provider}`);
+- 대체 장소 추천 시 같은 area 내 또는 인접 area 의 실제 존재하는 장소를 제안하세요
+- 슬롯 옆 \`[morning|lunch|afternoon|dinner|night]\` 표시는 시간대 라벨입니다. 사용자가 "오전 일정", "저녁 일정" 같이 표현하면 그 시간대 슬롯들을 대상으로 판단하세요 (시스템이 자동으로 부여, LLM이 직접 채울 필요 없음)`;
 }
 
 function parseResponse(raw) {
@@ -273,24 +200,36 @@ export default function CopilotPanel({
     setLoading(true);
 
     try {
-      const systemPrompt = buildSystemPrompt(schedule, currentTime, weather, location);
+      // Heuristic scope detection — if the user said "오늘", "내일", "DAY 3"
+      // etc, we send only that day's slots to the LLM to save tokens AND keep
+      // the model focused. Falls back to full schedule on no temporal cue.
+      const dayCount = getDayCount(schedule);
+      // currentDay is inferred from currentTime when caller doesn't provide
+      // a day index — for now we default to day 1 when ambiguous.
+      const inferredCurrentDay = 1;
+      const { days: scopeDays } = detectScopeFromMessage(text, {
+        currentDay: inferredCurrentDay,
+        dayCount,
+      });
+      const scopeOpts = scopeDays ? { days: scopeDays } : {};
+      // Capture schedule hash BEFORE the LLM call. Used as race-condition
+      // guard on apply — if the user edits between request and response, the
+      // patch is rejected rather than silently overwriting their changes.
+      const requestHash = scheduleHash(schedule);
+      const systemPrompt = buildSystemPrompt(schedule, currentTime, weather, location, scopeOpts);
       const apiMessages = [
         ...messages.map((m) => ({ role: m.role, content: m.content })),
         { role: "user", content: text },
       ];
-      const raw = await fetchLLM(systemPrompt, apiMessages);
+      const { text: raw } = await callChatLLM({
+        systemPrompt,
+        messages: apiMessages,
+        onLog,
+        fnName: "copilot",
+      });
       const parsed = parseResponse(raw);
-
-      if (onLog) {
-        onLog({
-          provider: ACTIVE_LLM.provider,
-          model: ACTIVE_LLM.model,
-          userMessage: text,
-          responseText: parsed.text,
-          timestamp: new Date().toISOString(),
-          fn: "copilot",
-        });
-      }
+      // callChatLLM already pushes one log entry with full request/response —
+      // no second user-facing log needed here.
 
       setMessages((prev) => [...prev, { role: "assistant", content: parsed.text }]);
 
@@ -298,18 +237,29 @@ export default function CopilotPanel({
       // automatic, locked-protected), "full" → legacy applyProposedSchedule
       // (full array replace). Both end at onScheduleChange with merged state.
       if (parsed.scope === "partial") {
-        const { applied, merged, report } = applyPatches(schedule, parsed.patches);
+        const { applied, merged, report, staleHash } = applyPatches(schedule, parsed.patches, {
+          expectedHash: requestHash,
+        });
         if (applied) {
           onScheduleChange?.(merged);
           if (parsed.changes) setChanges(parsed.changes);
           if (report) console.info("[Co-Pilot] partial applied with skips:", report);
         } else {
-          setMessages((prev) => [
-            ...prev,
-            { role: "assistant", content: `⚠️ 부분 수정 적용 실패: ${report}` },
-          ]);
+          const userMsg = staleHash
+            ? `⚠️ 응답을 적용하려는 사이 일정이 변경되어 적용을 취소했습니다. 동일한 요청을 다시 보내주세요.`
+            : `⚠️ 부분 수정 적용 실패: ${report}`;
+          setMessages((prev) => [...prev, { role: "assistant", content: userMsg }]);
         }
       } else if (parsed.scope === "full") {
+        // Same race guard as the partial path — reject if the schedule has
+        // changed during the LLM call.
+        if (scheduleHash(schedule) !== requestHash) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: `⚠️ 응답을 적용하려는 사이 일정이 변경되어 적용을 취소했습니다. 동일한 요청을 다시 보내주세요.` },
+          ]);
+          return;
+        }
         const { applied, merged, report } = applyProposedSchedule(schedule, parsed.modifiedSchedule);
         if (applied) {
           onScheduleChange?.(merged);

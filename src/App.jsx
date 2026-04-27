@@ -1980,11 +1980,28 @@ export default function App() {
                                                   const instruction = isTransit
                                                     ? step.transit.lineShort || step.transit.lineName || step.transit.vehicleName || "대중교통 탑승"
                                                     : stripInstructionHtml(step.instruction) || (stepMode === "WALKING" ? "도보 이동" : "이동");
+                                                  const lineColor = isTransit ? step.transit?.lineColor : null;
+                                                  const lineTextColor = isTransit ? step.transit?.lineTextColor : null;
                                                   return (
                                                     <li key={sIdx} className="tl-item__step">
                                                       <span className="tl-item__step-icon" aria-hidden="true">{stepIcon}</span>
                                                       <div className="tl-item__step-body">
-                                                        <span className="tl-item__step-instruction">{instruction}</span>
+                                                        <span className="tl-item__step-instruction">
+                                                          {isTransit && lineColor && (
+                                                            <span
+                                                              className="tl-item__step-line-badge"
+                                                              style={{
+                                                                background: lineColor,
+                                                                color: lineTextColor || "#ffffff",
+                                                                borderColor: lineColor,
+                                                              }}
+                                                              aria-label={`노선 색상 ${lineColor}`}
+                                                            >
+                                                              {step.transit.lineShort || step.transit.lineName?.[0] || "·"}
+                                                            </span>
+                                                          )}
+                                                          {instruction}
+                                                        </span>
                                                         {isTransit && (
                                                           <>
                                                             {(step.transit.departureStop || step.transit.arrivalStop) && (
