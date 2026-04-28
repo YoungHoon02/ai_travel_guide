@@ -22,8 +22,9 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import { calcProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil, parseBooleanEnv } from "./utils.js";
-import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callLLM, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
+import { calcSlotProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil, parseBooleanEnv } from "./utils.js";
+import { useScheduleHistory } from "./hooks/useScheduleHistory.js";
+import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
 import {
   useEditDayRouting,
   LEG_MODE_OPTIONS,
@@ -277,7 +278,7 @@ export default function App() {
     setRecommended([]);
     setCustomLodging(null);
     setSelectedLodgingId("");
-    setSchedule([]);
+    resetSchedule([]);
     setOptimizedDayPicks(null);
     resetEditDayLegsRef.current?.();
     setHighlightItemId(null);
@@ -287,11 +288,22 @@ export default function App() {
 
   const [loadingElapsed, setLoadingElapsed] = useState(0);
   const [recommended, setRecommended] = useState([]);
-  // ── Schedule store — TimeSlot[] is the new single source of truth ─────
-  // Replaces legacy dayAssignments. See src/store/schedule.js for Slot shape.
-  // dayAssignments stays available as a derived compatibility value for
-  // downstream code that hasn't been migrated yet (pickedContents, diff views…).
-  const [schedule, setSchedule] = useState([]);
+  // ── Schedule store — TimeSlot[] is the single source of truth ─────────
+  // useScheduleHistory wraps useState with a 3-bucket undo stack (past /
+  // present / future). All user-initiated mutations go through commitSchedule
+  // (pushes prev to past, clears redo). Wizard restart and initial itinerary
+  // load go through resetSchedule (no history push, clears stack so undo
+  // can't pop back across trip boundaries).
+  const {
+    schedule,
+    commitSchedule,
+    resetSchedule,
+    patchSchedule,
+    undo: undoSchedule,
+    redo: redoSchedule,
+    canUndo: canUndoSchedule,
+    canRedo: canRedoSchedule,
+  } = useScheduleHistory([]);
   const dayAssignments = useMemo(() => {
     const out = {};
     const maxDay = Math.max(1, getScheduleDayCount(schedule));
@@ -302,7 +314,7 @@ export default function App() {
   }, [schedule]);
   /** Legacy setter shim — rebuilds schedule from id assignments via adapter. */
   const setDayAssignments = useCallback((updater) => {
-    setSchedule((prevSchedule) => {
+    commitSchedule((prevSchedule) => {
       const prevAssignments = {};
       const maxDay = Math.max(1, getScheduleDayCount(prevSchedule));
       for (let d = 1; d <= maxDay; d += 1) {
@@ -387,11 +399,9 @@ export default function App() {
   };
 
   // ── Variable Handler (AI 변수 조치) ─────────────────────────────────────────
+  // 트립 도중 LLM 채팅은 CopilotPanel 이 자체 로컬 state 로 처리. App 레벨에는
+  // 토글/로그 state 만 남김.
   const [showVarHandler, setShowVarHandler] = useState(false);
-  const [chatHistory, setChatHistory] = useState([]);
-  const [chatInput, setChatInput] = useState("");
-  const [isLLMLoading, setIsLLMLoading] = useState(false);
-  const [modifiedSchedule, setModifiedSchedule] = useState(null);
   const [llmLogs, setLlmLogs] = useState([]);
   const [llmLogOpen, setLlmLogOpen] = useState(false);
   const appendLog = useCallback((entry) => {
@@ -524,7 +534,8 @@ export default function App() {
           };
           const lodgingInfo = customLodging ?? resolvedLodgings?.[0] ?? null;
           const newDayCount = itinerary.days.length || 3;
-          setSchedule(scheduleFromItineraryLLM(enrichedItinerary, lodgingInfo, newDayCount));
+          // Initial itinerary load — bypasses history so undo doesn't go to empty.
+          resetSchedule(scheduleFromItineraryLLM(enrichedItinerary, lodgingInfo, newDayCount));
         }
       }
     })().finally(() => {
@@ -566,7 +577,9 @@ export default function App() {
       if (cancelled) return;
       const fixMap = new Map(fixes.filter(Boolean).map((f) => [f.id, f]));
       if (fixMap.size === 0) return;
-      setSchedule((prev) =>
+      // Transparent geocoding hydration — bypass history so undo doesn't step
+      // back into a state with broken/missing latlng.
+      patchSchedule((prev) =>
         prev.map((s) => {
           const fix = fixMap.get(s.id);
           return fix ? { ...s, latlng: fix.latlng, approximateLatlng: fix.approximateLatlng } : s;
@@ -586,7 +599,7 @@ export default function App() {
     const target = customLodging ?? (dynLodgings ?? []).find((l) => l.id === selectedLodgingId);
     if (!target) return;
     if (currentLodging && currentLodging.name === target.name && currentLodging.latlng?.[0] === target.latlng?.[0]) return;
-    setSchedule((prev) => swapPrimaryLodging(prev, target));
+    commitSchedule((prev) => swapPrimaryLodging(prev, target));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [customLodging, selectedLodgingId, dynLodgings]);
 
@@ -967,42 +980,33 @@ export default function App() {
     return true;
   }, [step, selectedDest, selectedPlanId, country, region, days, selectedLodgingId, selectedSpotIds.length]);
 
-  const pickedContents = useMemo(() => {
-    if (!optimizedDayPicks) return [];
+  // Result 화면이 소비하는 단일 SSOT 파생값 — schedule(Slot[]) 의 activity 만
+  // day → startTime 순으로 평탄화. lodging 앵커는 제외 (테이블/지도 대상이 아님).
+  const resultActivitySlots = useMemo(() => {
+    const maxDay = Math.max(1, getScheduleDayCount(schedule));
     const out = [];
-    const days = Object.keys(optimizedDayPicks).map(Number).sort((a, b) => a - b);
-    for (const d of days) {
-      const ids = optimizedDayPicks[d];
-      if (!Array.isArray(ids)) continue;
-      for (const id of ids) {
-        const c = activeContents.find((item) => item.id === id);
-        if (c) out.push({ ...c, assignedDay: d });
-      }
+    for (let d = 1; d <= maxDay; d += 1) {
+      out.push(...getActivitySlots(schedule, d));
     }
     return out;
-  }, [optimizedDayPicks, activeContents]);
-
-  const displayScheduleForResult = useMemo(
-    () => (modifiedSchedule && modifiedSchedule.length > 0 ? modifiedSchedule : pickedContents),
-    [modifiedSchedule, pickedContents]
-  );
+  }, [schedule]);
 
   const segmentDefs = useMemo(() => {
-    const safeContents = displayScheduleForResult
+    const safeContents = resultActivitySlots
       .map((p) => {
         const latlng = asValidLatLng(p.latlng) ?? selectedLodgingLatLng;
         return latlng ? { ...p, latlng } : null;
       })
       .filter(Boolean);
     return buildMoveSegmentDefs(safeContents, move);
-  }, [displayScheduleForResult, move, selectedLodgingLatLng]);
+  }, [resultActivitySlots, move, selectedLodgingLatLng]);
 
   const resultMapMarkers = useMemo(() => {
-    const markers = displayScheduleForResult
+    const markers = resultActivitySlots
       .map((p, idx) => {
         const markerLatLng = asValidLatLng(p.latlng) ?? selectedLodgingLatLng;
         if (!markerLatLng) return null;
-        const assignedDay = Number(p.assignedDay) || 1;
+        const assignedDay = Number(p.day) || 1;
         return {
           id: p.id,
           key: `${p.id}-${assignedDay}-${idx}`,
@@ -1010,7 +1014,7 @@ export default function App() {
           assignedDay,
           number: idx + 1,
           name: p.name,
-          summary: p.summary ?? "",
+          summary: p.notes ?? p.llmStayNote ?? "",
         };
       })
       .filter(Boolean);
@@ -1024,33 +1028,17 @@ export default function App() {
     );
     const spreadById = new Map(spread.map((m, idx) => [idx, [m.lat, m.lng]]));
     return markers.map((m, idx) => ({ ...m, latlng: spreadById.get(idx) ?? m.latlng }));
-  }, [displayScheduleForResult, selectedLodgingLatLng]);
+  }, [resultActivitySlots, selectedLodgingLatLng]);
 
   const scheduleByDay = useMemo(() => {
-    // When modifiedSchedule is active, use it (it's a flat array with assignedDay)
-    if (modifiedSchedule) {
-      const days = [...new Set(modifiedSchedule.map((item) => item.assignedDay))].sort();
-      return days
-        .map((d) => ({
-          day: d,
-          items: modifiedSchedule
-            .filter((item) => item.assignedDay === d)
-            .sort((a, b) => (a.time ?? "").localeCompare(b.time ?? "")),
-        }))
-        .filter((g) => g.items.length > 0);
+    const maxDay = Math.max(1, getScheduleDayCount(schedule));
+    const groups = [];
+    for (let d = 1; d <= maxDay; d += 1) {
+      const items = getActivitySlots(schedule, d);
+      if (items.length > 0) groups.push({ day: d, items });
     }
-    if (!optimizedDayPicks) return [];
-    const days = Object.keys(optimizedDayPicks).map(Number).sort((a, b) => a - b);
-    return days
-      .map((d) => ({
-        day: d,
-        items: (optimizedDayPicks[d] ?? []).map((id) => {
-          const c = activeContents.find((item) => item.id === id);
-          return c ? { ...c, assignedDay: d } : null;
-        }).filter(Boolean),
-      }))
-      .filter((g) => g.items.length > 0);
-  }, [optimizedDayPicks, modifiedSchedule, activeContents]);
+    return groups;
+  }, [schedule]);
 
   const groupedPickContents = useMemo(() => {
     const base = recommended.length ? recommended : activeContents;
@@ -1497,17 +1485,30 @@ export default function App() {
     resetGeneratedPlanState();
     setMapInfo("핀 또는 이동 경로를 클릭하면 해당 일정이 강조됩니다.");
     setShowVarHandler(false);
-    setChatHistory([]);
-    setModifiedSchedule(null);
     setScheduleDirections([]);
   };
 
 
   // ── LLM send handler ────────────────────────────────────────────────────────
-  const activeSchedule = displayScheduleForResult;
+  // activeSchedule 은 Result 화면 derived activity Slot[] 그대로. trip-time
+  // 진행률·경로·LLM 컨텍스트의 단일 입력.
+  const activeSchedule = resultActivitySlots;
+  // 오늘이 trip 의 몇일차인지 — tripStartDate 와 today 차이로 계산.
+  // Trip 시작 전이면 1, trip 종료 이후면 마지막 day 로 클램프.
+  const currentTripDay = useMemo(() => {
+    const startStr = planInputParsed?.startDate;
+    const maxDay = Math.max(1, getScheduleDayCount(schedule));
+    if (!startStr) return 1;
+    const start = Date.parse(`${startStr}T00:00:00`);
+    if (Number.isNaN(start)) return 1;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const diffDays = Math.floor((today.getTime() - start) / (24 * 60 * 60 * 1000));
+    return Math.max(1, Math.min(maxDay, diffDays + 1));
+  }, [planInputParsed?.startDate, schedule]);
   const planProgress = useMemo(
-    () => calcProgress(activeSchedule, currentTimeStr),
-    [activeSchedule, currentTimeStr]
+    () => calcSlotProgress(schedule, currentTimeStr, currentTripDay),
+    [schedule, currentTimeStr, currentTripDay]
   );
 
   // ── Schedule Directions (Google Maps Directions API) ──────────────────────
@@ -1520,45 +1521,6 @@ export default function App() {
     }
     fetchScheduleDirections(activeSchedule, move).then(setScheduleDirections);
   }, [gmapsReady, activeSchedule, move]);
-
-  const handleSendToLLM = useCallback(async () => {
-    const text = chatInput.trim();
-    if (!text || isLLMLoading) return;
-    const userMsg = { role: "user", content: text };
-    setChatHistory((h) => [...h, userMsg]);
-    setChatInput("");
-    setIsLLMLoading(true);
-    // Push REQ log immediately
-    const reqEntry = { provider: "…", model: "…", userMessage: text, timestamp: new Date().toISOString(), pending: true };
-    let logIdx;
-    setLlmLogs((prev) => { logIdx = prev.length; return [...prev, sanitizeLogEntry(reqEntry)]; });
-    try {
-      const result = await callLLM({
-        userMessage: text,
-        plan: activeSchedule,
-        currentTime: currentTimeStr,
-        location: locationName ?? (userLocation ? `${userLocation.lat.toFixed(4)},${userLocation.lng.toFixed(4)}` : null),
-        weather,
-        progress: planProgress,
-        history: chatHistory,
-        directions: scheduleDirections,
-        onLog: (log) => resolveLogAt(logIdx, log),
-      });
-      setChatHistory((h) => [...h, { role: "assistant", content: result.text, modifiedSchedule: result.modifiedSchedule }]);
-      if (result.modifiedSchedule && result.modifiedSchedule.length > 0) {
-        const enriched = result.modifiedSchedule.map((item) => {
-          const original = activeContents.find((c) => c.id === item.id);
-          // Merge: start with original data (for display fields), then apply LLM-provided scheduling fields
-          return original
-            ? { ...original, time: item.time, assignedDay: item.assignedDay }
-            : item;
-        });
-        setModifiedSchedule(enriched);
-      }
-    } finally {
-      setIsLLMLoading(false);
-    }
-  }, [chatInput, isLLMLoading, activeSchedule, currentTimeStr, locationName, userLocation, weather, planProgress, chatHistory, scheduleDirections]);
 
   const progressActiveIndex = step >= RESULT_STEP ? STEP_LABELS.length - 1 : step;
 
@@ -2092,7 +2054,11 @@ export default function App() {
                             <ErrorBoundary label="Co-Pilot 패널">
                               <CopilotPanel
                                 schedule={schedule}
-                                onScheduleChange={setSchedule}
+                                onScheduleChange={commitSchedule}
+                                onUndo={undoSchedule}
+                                onRedo={redoSchedule}
+                                canUndo={canUndoSchedule}
+                                canRedo={canRedoSchedule}
                                 currentTime={currentTimeStr}
                                 weather={weather ? `${weather.description} ${weather.temp}` : "맑음"}
                                 location={`${region} ${country}`}
@@ -2470,10 +2436,10 @@ export default function App() {
               )}
               <span className="realtime-bar__item realtime-bar__progress">
                 ✅ 완료 {planProgress.done.length}곳 · 남은 {planProgress.remaining.length}곳
-                {planProgress.next && <span className="realtime-bar__sub">다음: {planProgress.next.name} ({planProgress.next.time})</span>}
+                {planProgress.next && <span className="realtime-bar__sub">다음: {planProgress.next.name} ({planProgress.next.startTime ?? planProgress.next.time})</span>}
               </span>
-              {modifiedSchedule && (
-                <span className="realtime-bar__badge--modified">🔄 AI 수정 일정 적용 중</span>
+              {canUndoSchedule && (
+                <span className="realtime-bar__badge--modified">↩ Co-Pilot 변경 적용됨 — 되돌리기 가능</span>
               )}
             </div>
 
@@ -2519,15 +2485,15 @@ export default function App() {
                           const isNext = planProgress.next?.id === p.id;
                           return (
                             <tr key={p.id} className={`${highlightIds.includes(p.id) ? "row-highlight" : ""} ${isDone ? "row-done" : ""} ${isNext ? "row-next" : ""}`}>
-                              <td>DAY{p.assignedDay}</td>
-                              <td>{p.time}</td>
+                              <td>DAY{p.day}</td>
+                              <td>{p.startTime}</td>
                               <td>
                                 {p.name}
                                 {isDone && <span className="schedule-done-badge">✓ 완료</span>}
                                 {isNext && <span className="schedule-next-badge">▶ 다음</span>}
                                 <br />
                                 <small>
-                                  {p.type} · {p.area}
+                                  {p.category} · {p.area}
                                 </small>
                                 {p.llmStayNote ? (
                                   <small className="schedule-stay-note">{p.llmStayNote}</small>
@@ -2631,26 +2597,42 @@ export default function App() {
             </div>
 
             {/* ── AI 변수 조치 Panel ────────────────────────────────────────── */}
+            {/* 컨텍스트(시간/위치/날씨/진행/구간/주변)는 VariableHandlerPanel 이
+                담당하고, 실제 LLM 채팅은 children 으로 슬롯 인된 CopilotPanel
+                이 처리합니다. Edit View 와 같은 컴포넌트라서 race guard·locked
+                보호·partial patch·scope 절감이 trip-time 에서도 그대로 작동. */}
             <VariableHandlerPanel
               show={showVarHandler}
               onToggle={() => setShowVarHandler((v) => !v)}
-              chatHistory={chatHistory}
-              chatInput={chatInput}
-              onChatInputChange={setChatInput}
-              onSend={handleSendToLLM}
-              isLoading={isLLMLoading}
               currentTime={currentTimeStr}
               location={locationName ?? (userLocation ? `${userLocation.lat.toFixed(3)}, ${userLocation.lng.toFixed(3)}` : null)}
               weather={weather}
               progress={planProgress}
-              modifiedSchedule={modifiedSchedule}
-              onApplyOriginal={() => setModifiedSchedule(null)}
               nearbyPlaces={nearbyPlaces}
               nearbyPlaceType={nearbyPlaceType}
               onNearbyTypeChange={handleNearbyTypeChange}
               hasGoogleMaps={Boolean(window.__googleMapsLoaded)}
               scheduleDirections={scheduleDirections}
-            />
+            >
+              <ErrorBoundary label="Co-Pilot 패널 (trip-time)">
+                <CopilotPanel
+                  schedule={schedule}
+                  onScheduleChange={commitSchedule}
+                  onUndo={undoSchedule}
+                  onRedo={redoSchedule}
+                  canUndo={canUndoSchedule}
+                  canRedo={canRedoSchedule}
+                  currentTime={currentTimeStr}
+                  weather={weather ? `${weather.icon ?? ""} ${weather.temp ?? ""} ${weather.description ?? ""}`.trim() : "맑음"}
+                  location={locationName ?? `${country ?? ""} ${region ?? ""}`.trim()}
+                  progress={planProgress}
+                  directions={scheduleDirections}
+                  currentDay={currentTripDay}
+                  onLog={appendLog}
+                  compact
+                />
+              </ErrorBoundary>
+            </VariableHandlerPanel>
           </motion.div>
         )}
       </AnimatePresence>

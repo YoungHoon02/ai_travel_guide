@@ -5543,6 +5543,25 @@ img.dest-card__thumb {
   white-space: nowrap;
   max-width: 60%;
 }
+.copilot-panel__history {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 8px;
+}
+.copilot-panel__history-btn {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(94, 207, 207, 0.4);
+  color: var(--mgs-cyan);
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+.copilot-panel__history-btn:hover:not(:disabled) { background: rgba(94, 207, 207, 0.2); }
+.copilot-panel__history-btn:disabled { opacity: 0.3; cursor: not-allowed; }
 
 .copilot-panel__messages {
   flex: 1;

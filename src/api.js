@@ -1,11 +1,10 @@
-import { escapeHtml, parseBooleanEnv, simulateLLMResponse } from "./utils.js";
+import { escapeHtml, parseBooleanEnv } from "./utils.js";
 import {
   DEST_SYSTEM_PROMPT,
   TRANSPORT_PROMPT,
   LODGING_PROMPT,
   ITINERARY_PROMPT,
   ALTERNATIVES_PROMPT,
-  buildRealtimeSystemPrompt,
 } from "./prompts/index.js";
 
 // ─── Local JSON DB loader ──────────────────────────────────────────────────────
@@ -1315,61 +1314,6 @@ export async function callChatLLM({ systemPrompt, messages, onLog, fnName = "cop
   }
 }
 
-
-export async function callLLM({ userMessage, plan, currentTime, location, weather, progress, history, directions, onLog }) {
-  if (!ACTIVE_LLM.key) {
-    const reqLog = { provider: "simulation", model: "rule-based", userMessage, timestamp: new Date().toISOString() };
-    await new Promise((r) => setTimeout(r, 700));
-    const result = simulateLLMResponse(userMessage, plan, currentTime);
-    if (onLog) onLog({ ...reqLog, responseText: result.text, modifiedSchedule: result.modifiedSchedule });
-    return result;
-  }
-  const systemContent = buildRealtimeSystemPrompt({ plan, currentTime, location, weather, progress, directions });
-  const chatMessages = [...history.map((h) => ({ role: h.role, content: h.content })), { role: "user", content: userMessage }];
-  let reqBody = null; let resData = null; let raw = "";
-
-  try {
-    if (isOpenAICompatProvider(ACTIVE_LLM.provider)) {
-      const apiUrl = openAICompatUrl(ACTIVE_LLM.provider);
-      const headers = { "Content-Type": "application/json" };
-      if (needsOpenAIAuthHeader(ACTIVE_LLM.provider)) headers.Authorization = `Bearer ${ACTIVE_LLM.key}`;
-      const messages = [{ role: "system", content: systemContent }, ...chatMessages];
-      reqBody = { model: ACTIVE_LLM.model, messages, max_tokens: 4096, temperature: 0.7 };
-      const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
-      if (!res.ok) {
-        const errText = await res.text().catch(() => "");
-        throw new Error(`${ACTIVE_LLM.provider} ${res.status}: ${errText.slice(0, 300)}`);
-      }
-      resData = await res.json();
-      raw = resData.choices?.[0]?.message?.content ?? "";
-    } else if (ACTIVE_LLM.provider === "gemini") {
-      const geminiMessages = chatMessages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
-      reqBody = { systemInstruction: { parts: [{ text: systemContent }] }, contents: geminiMessages, generationConfig: { temperature: 0.7, maxOutputTokens: 8192 } };
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(ACTIVE_LLM.model)}:generateContent?key=${encodeURIComponent(ACTIVE_LLM.key)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(reqBody) });
-      if (!res.ok) throw new Error("gemini");
-      resData = await res.json();
-      raw = (resData.candidates?.[0]?.content?.parts ?? []).map((p) => p.text).filter(Boolean).join("\n");
-    } else if (ACTIVE_LLM.provider === "claude") {
-      const claudeMessages = chatMessages.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
-      reqBody = { model: ACTIVE_LLM.model, system: systemContent, max_tokens: 1200, temperature: 0.7, messages: claudeMessages };
-      const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json", "x-api-key": ACTIVE_LLM.key, "anthropic-version": "2023-06-01" }, body: JSON.stringify(reqBody) });
-      if (!res.ok) throw new Error("claude");
-      resData = await res.json();
-      raw = (resData.content ?? []).map((item) => item.text).filter(Boolean).join("\n");
-    }
-    const jsonMatch = raw.match(/```json\s*([\s\S]*?)```/);
-    let modifiedSchedule = null;
-    if (jsonMatch) { try { modifiedSchedule = JSON.parse(jsonMatch[1]).modifiedSchedule ?? null; } catch (e) { console.error("[LLM] JSON parse error:", e); } }
-    const result = { text: raw.replace(/```json[\s\S]*?```/g, "").trim(), modifiedSchedule };
-    const logResData = ACTIVE_LLM.provider === "gemini" ? sanitizeGeminiResponse(resData) : resData;
-    if (onLog) onLog({ provider: ACTIVE_LLM.provider, model: ACTIVE_LLM.model, userMessage, requestBody: reqBody, responseData: logResData, responseText: result.text, modifiedSchedule, timestamp: new Date().toISOString() });
-    return result;
-  } catch {
-    const fallback = simulateLLMResponse(userMessage, plan, currentTime);
-    if (onLog) onLog({ provider: ACTIVE_LLM.provider + " (fallback)", model: "rule-based", userMessage, requestBody: reqBody, responseText: fallback.text, modifiedSchedule: fallback.modifiedSchedule, error: true, timestamp: new Date().toISOString() });
-    return fallback;
-  }
-}
 
 // ─── JSON repair helper ───────────────────────────────────────────────────────
 // Stack-based repair: inserts missing } before ] when an object is still open,

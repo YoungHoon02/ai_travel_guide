@@ -3,7 +3,7 @@
  *
  * Prompts are organized by domain:
  *   - planning.js  — wizard flow (destination, transport, lodging, itinerary, parser)
- *   - realtime.js  — Live Co-Pilot (in-trip schedule adaptation)
+ *   - copilot.js   — unified Co-Pilot (Edit View + Trip-time chat surface)
  *   - utility.js   — one-off helpers (globe geography, etc.)
  *
  * Import from here (`../prompts/index.js` or `../prompts`) to avoid worrying
@@ -21,6 +21,6 @@ export {
   buildPlanParserPrompt,
 } from "./planning.js";
 
-export { buildRealtimeSystemPrompt } from "./realtime.js";
+export { buildCopilotSystemPrompt } from "./copilot.js";
 
 export { GLOBE_GEOGRAPHY_PROMPT } from "./utility.js";

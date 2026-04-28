@@ -65,12 +65,37 @@ export default function LLMLogSidebar({ logs, open, onToggle, onClear, view, onV
                   <span className="llm-log-msg__label">RES</span>
                   <div className="llm-log-msg__content">
                     <p className="llm-log-msg__text">{log.responseText}</p>
-                    {log.modifiedSchedule && log.modifiedSchedule.length > 0 && (
-                      <div className="llm-log-msg__schedule">
-                        <strong>modifiedSchedule ({log.modifiedSchedule.length})</strong>
-                        <ol>{log.modifiedSchedule.map((item, idx) => (<li key={idx}>{item.time} {item.name}</li>))}</ol>
-                      </div>
-                    )}
+                    {log.responseData && (() => {
+                      const text = log.responseText ?? "";
+                      const m = text.match(/```json\s*([\s\S]*?)```/);
+                      if (!m) return null;
+                      try {
+                        const parsed = JSON.parse(m[1]);
+                        const scope = parsed.scope ?? (Array.isArray(parsed.modifiedSchedule) ? "full" : null);
+                        if (!scope) return null;
+                        return (
+                          <div className="llm-log-msg__schedule">
+                            <strong>scope: {scope}</strong>
+                            {Array.isArray(parsed.patches) && parsed.patches.length > 0 && (
+                              <ol>{parsed.patches.map((p, idx) => (
+                                <li key={idx}>
+                                  {p.op}{p.id ? ` ${p.id}` : ""}{p.fields?.startTime ? ` → ${p.fields.startTime}` : ""}{p.slot?.name ? ` (${p.slot.name})` : ""}{p.fields?.name ? ` (${p.fields.name})` : ""}
+                                </li>
+                              ))}</ol>
+                            )}
+                            {Array.isArray(parsed.changes) && parsed.changes.length > 0 && (
+                              <ul className="llm-log-msg__changes">
+                                {parsed.changes.map((c, idx) => (
+                                  <li key={idx}>{c.action}: {c.oldName ?? ""}{c.newName ? ` → ${c.newName}` : ""} {c.reason ? `— ${c.reason}` : ""}</li>
+                                ))}
+                              </ul>
+                            )}
+                          </div>
+                        );
+                      } catch {
+                        return null;
+                      }
+                    })()}
                     {log.responseData && (
                       <button type="button" className="llm-log-msg__expand" onClick={() => setExpandedIdx(expandedIdx === `res-${i}` ? null : `res-${i}`)}>
                         {expandedIdx === `res-${i}` ? "▾ Response Body 접기" : "▸ Response Body 펼치기"}

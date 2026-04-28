@@ -22,15 +22,32 @@ export function minutesToTime(mins) {
 // ─── Schedule progress ────────────────────────────────────────────────────────
 
 /**
- * Given a schedule array (items with a `time` field "HH:MM") and the current
- * time as "HH:MM", return lists of done/remaining items plus the next item.
+ * TimeSlot-native progress calculator for the unified schedule store.
+ *
+ * Operates on Slot[] (kind: "activity"|"lodging", startTime, day):
+ *   - Skips lodging anchors (only activity slots count toward done/remaining)
+ *   - Multi-day aware: slots in earlier days are auto-done, later days remaining,
+ *     same-day slots compared by startTime against currentTimeStr
+ *   - currentDay defaults to 1 (trip start) when caller can't compute it
  */
-export function calcProgress(schedule, currentTimeStr) {
+export function calcSlotProgress(schedule, currentTimeStr, currentDay = 1) {
   const nowMins = timeToMinutes(currentTimeStr);
-  const done = schedule.filter((item) => timeToMinutes(item.time) < nowMins);
-  const remaining = schedule.filter((item) => timeToMinutes(item.time) >= nowMins);
-  const next = remaining[0] ?? null;
-  return { done, remaining, next, nowMins };
+  const activities = (schedule ?? [])
+    .filter((s) => s?.kind === "activity")
+    .slice()
+    .sort((a, b) => {
+      if (a.day !== b.day) return a.day - b.day;
+      return timeToMinutes(a.startTime) - timeToMinutes(b.startTime);
+    });
+  const done = [];
+  const remaining = [];
+  for (const s of activities) {
+    if (s.day < currentDay) { done.push(s); continue; }
+    if (s.day > currentDay) { remaining.push(s); continue; }
+    if (timeToMinutes(s.startTime) < nowMins) done.push(s);
+    else remaining.push(s);
+  }
+  return { done, remaining, next: remaining[0] ?? null, nowMins };
 }
 
 // ─── HTML escape ─────────────────────────────────────────────────────────────
@@ -168,60 +185,3 @@ export function assignOptimalDays(ids, lodgingLatLng, contents) {
   return buckets;
 }
 
-// ─── LLM simulation ──────────────────────────────────────────────────────────
-
-/**
- * Rule-based response simulator used when no OpenAI key is configured.
- * Handles three scenarios: late start (delay), rain, and cancellation.
- */
-export function simulateLLMResponse(userMessage, plan) {
-  const msg = userMessage;
-  const hourMatch = msg.match(/(\d{1,2})\s*시/);
-  const mentionedHour = hourMatch ? parseInt(hourMatch[1], 10) : null;
-
-  const isDelay = /늦잠|늦게|늦어|출발|지각|12시|오후|지연/.test(msg);
-  const isRain = /비|우천|날씨|폭우|우산/.test(msg);
-  const isCancellation = /취소|못|안|빠질|건너|skip/.test(msg);
-  const mentionedSpot = plan.find((item) => msg.includes(item.name));
-
-  if (isDelay && mentionedHour !== null) {
-    const cutMins = mentionedHour * 60;
-    const remaining = plan.filter((item) => timeToMinutes(item.time) >= cutMins);
-    const skipped = plan.filter((item) => timeToMinutes(item.time) < cutMins);
-    const skippedNames = skipped.map((i) => i.name).join(", ");
-    const modifiedSchedule = remaining.length ? remaining : plan;
-    return {
-      text: `✅ **상황 분석**: 현재 ${mentionedHour}시 출발로 인해 ${skippedNames ? `**${skippedNames}**` : "일부 오전 일정"}은 시간상 불가능합니다.\n\n📋 **수정 제안**: ${String(mentionedHour).padStart(2, "0")}:00 이후 일정부터 시작합니다. ${remaining.length === 0 ? "남은 일정이 없습니다 — 자유 여행을 즐기세요 😊" : `총 ${remaining.length}개 장소가 유지됩니다.`}`,
-      modifiedSchedule,
-    };
-  }
-
-  if (isRain) {
-    const outdoorSpots = plan.filter((item) => !item.indoor);
-    const indoorSpots = plan.filter((item) => item.indoor);
-    if (outdoorSpots.length === 0) {
-      return {
-        text: "☔ **날씨 분석**: 현재 일정은 모두 실내 위주입니다. 비가 오더라도 일정 변동 없이 진행 가능합니다!",
-        modifiedSchedule: null,
-      };
-    }
-    const outdoorNames = outdoorSpots.map((i) => i.name).join(", ");
-    return {
-      text: `☔ **날씨 분석**: **${outdoorNames}**는 야외 일정입니다. 비가 올 경우 이동 시 우산 필수이며, 특히 야외 공원·신사는 관람이 불편할 수 있습니다.\n\n💡 **제안**: 실내 일정(${indoorSpots.map((i) => i.name).join(", ")})을 먼저 배치하고, 날씨 호전 시 야외로 이동하는 것을 추천합니다. 일정 순서를 조정할까요?`,
-      modifiedSchedule: null,
-    };
-  }
-
-  if (isCancellation && mentionedSpot) {
-    const modified = plan.filter((item) => item.id !== mentionedSpot.id);
-    return {
-      text: `✅ **${mentionedSpot.name}** 일정을 제거했습니다. 남은 ${modified.length}개 일정으로 여행을 진행합니다. 해당 시간(${mentionedSpot.time})에 주변 장소를 탐방하거나 휴식을 취할 수 있습니다.`,
-      modifiedSchedule: modified,
-    };
-  }
-
-  return {
-    text: `🤔 **상황 파악 중**: "${userMessage.slice(0, 40)}..." — 현재 일정(${plan.length}개 장소)을 분석했습니다.\n\n구체적인 상황을 알려주시면 더 정확한 도움을 드릴 수 있습니다.\n\n예: "늦잠 자서 12시에 출발", "비가 와서 야외 일정 변경", "팀랩 예약 취소"`,
-    modifiedSchedule: null,
-  };
-}

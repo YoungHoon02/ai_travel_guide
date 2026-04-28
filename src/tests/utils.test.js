@@ -1,22 +1,21 @@
 /**
  * Unit tests for src/utils.js
  *
- * Covers: timeToMinutes, minutesToTime, calcProgress, escapeHtml,
+ * Covers: timeToMinutes, minutesToTime, calcSlotProgress, escapeHtml,
  *         distSq, orderNearestNeighborFrom, buildTransitLikeRoute,
- *         sumVisitScores, assignOptimalDays, simulateLLMResponse
+ *         sumVisitScores, assignOptimalDays
  */
 import { describe, it, expect } from "vitest";
 import {
   timeToMinutes,
   minutesToTime,
-  calcProgress,
+  calcSlotProgress,
   escapeHtml,
   distSq,
   orderNearestNeighborFrom,
   buildTransitLikeRoute,
   sumVisitScores,
   assignOptimalDays,
-  simulateLLMResponse,
 } from "../utils.js";
 
 // ─── timeToMinutes ────────────────────────────────────────────────────────────
@@ -81,46 +80,67 @@ describe("minutesToTime", () => {
   });
 });
 
-// ─── calcProgress ─────────────────────────────────────────────────────────────
+// ─── calcSlotProgress ────────────────────────────────────────────────────────
 
-const SAMPLE_SCHEDULE = [
-  { id: "a", name: "A", time: "09:00", indoor: true },
-  { id: "b", name: "B", time: "11:00", indoor: false },
-  { id: "c", name: "C", time: "14:00", indoor: true },
-  { id: "d", name: "D", time: "18:00", indoor: false },
+const SAMPLE_SLOT_SCHEDULE = [
+  { id: "lodge-d1-start", kind: "lodging", anchor: "start", day: 1, startTime: "09:00" },
+  { id: "a", kind: "activity", day: 1, startTime: "09:30", name: "A" },
+  { id: "b", kind: "activity", day: 1, startTime: "11:00", name: "B" },
+  { id: "lodge-d1-end", kind: "lodging", anchor: "end", day: 1, startTime: "20:00" },
+  { id: "lodge-d2-start", kind: "lodging", anchor: "start", day: 2, startTime: "09:00" },
+  { id: "c", kind: "activity", day: 2, startTime: "10:00", name: "C" },
+  { id: "d", kind: "activity", day: 2, startTime: "14:00", name: "D" },
+  { id: "lodge-d2-end", kind: "lodging", anchor: "end", day: 2, startTime: "20:00" },
 ];
 
-describe("calcProgress", () => {
-  it("before any slot → all items remaining, none done", () => {
-    const { done, remaining, next } = calcProgress(SAMPLE_SCHEDULE, "07:00");
+describe("calcSlotProgress", () => {
+  it("excludes lodging anchors from done/remaining", () => {
+    const { done, remaining } = calcSlotProgress(SAMPLE_SLOT_SCHEDULE, "23:00", 2);
+    const allIds = [...done, ...remaining].map((s) => s.id);
+    expect(allIds).not.toContain("lodge-d1-start");
+    expect(allIds).not.toContain("lodge-d1-end");
+    expect(allIds).not.toContain("lodge-d2-start");
+    expect(allIds).not.toContain("lodge-d2-end");
+  });
+
+  it("on day 1 before any slot → all 4 activities remaining", () => {
+    const { done, remaining, next } = calcSlotProgress(SAMPLE_SLOT_SCHEDULE, "08:00", 1);
     expect(done).toHaveLength(0);
-    expect(remaining).toHaveLength(4);
+    expect(remaining.map((s) => s.id)).toEqual(["a", "b", "c", "d"]);
     expect(next?.id).toBe("a");
   });
 
-  it("between first and second slot", () => {
-    const { done, remaining, next } = calcProgress(SAMPLE_SCHEDULE, "10:00");
-    expect(done.map((i) => i.id)).toEqual(["a"]);
-    expect(remaining.map((i) => i.id)).toEqual(["b", "c", "d"]);
+  it("on day 1 mid-day → past day-1 slots done, day-2 still remaining", () => {
+    const { done, remaining, next } = calcSlotProgress(SAMPLE_SLOT_SCHEDULE, "10:00", 1);
+    expect(done.map((s) => s.id)).toEqual(["a"]);
+    expect(remaining.map((s) => s.id)).toEqual(["b", "c", "d"]);
     expect(next?.id).toBe("b");
   });
 
-  it("after all slots → all done, none remaining", () => {
-    const { done, remaining, next } = calcProgress(SAMPLE_SCHEDULE, "22:00");
-    expect(done).toHaveLength(4);
+  it("on day 2 → all day-1 activities auto-done regardless of time", () => {
+    const { done, remaining, next } = calcSlotProgress(SAMPLE_SLOT_SCHEDULE, "08:00", 2);
+    expect(done.map((s) => s.id)).toEqual(["a", "b"]);
+    expect(remaining.map((s) => s.id)).toEqual(["c", "d"]);
+    expect(next?.id).toBe("c");
+  });
+
+  it("after all slots on last day → all done, no next", () => {
+    const { done, remaining, next } = calcSlotProgress(SAMPLE_SLOT_SCHEDULE, "23:00", 2);
+    expect(done.map((s) => s.id)).toEqual(["a", "b", "c", "d"]);
     expect(remaining).toHaveLength(0);
     expect(next).toBeNull();
   });
 
-  it("exactly on a slot boundary treats it as remaining (>=)", () => {
-    const { done, remaining } = calcProgress(SAMPLE_SCHEDULE, "14:00");
-    expect(done.map((i) => i.id)).toEqual(["a", "b"]);
-    expect(remaining.map((i) => i.id)).toEqual(["c", "d"]);
+  it("empty schedule returns empty result", () => {
+    const r = calcSlotProgress([], "12:00", 1);
+    expect(r.done).toEqual([]);
+    expect(r.remaining).toEqual([]);
+    expect(r.next).toBeNull();
   });
 
-  it("returns correct nowMins value", () => {
-    const { nowMins } = calcProgress(SAMPLE_SCHEDULE, "13:30");
-    expect(nowMins).toBe(13 * 60 + 30);
+  it("defaults currentDay to 1 when not provided", () => {
+    const { remaining } = calcSlotProgress(SAMPLE_SLOT_SCHEDULE, "08:00");
+    expect(remaining.map((s) => s.id)).toEqual(["a", "b", "c", "d"]);
   });
 });
 
@@ -312,88 +332,3 @@ describe("assignOptimalDays", () => {
   });
 });
 
-// ─── simulateLLMResponse ──────────────────────────────────────────────────────
-
-const FULL_PLAN = [
-  { id: "a", name: "오모테산도", time: "10:00", indoor: true },
-  { id: "b", name: "메이지 신궁", time: "11:30", indoor: false },
-  { id: "c", name: "우에노 공원", time: "14:00", indoor: false },
-  { id: "d", name: "아키하바라", time: "16:00", indoor: true },
-  { id: "e", name: "신주쿠 골든가이", time: "20:00", indoor: false },
-];
-
-describe("simulateLLMResponse — delay scenario", () => {
-  it("filters out spots before the mentioned hour", () => {
-    const res = simulateLLMResponse("늦잠 자서 13시에 출발해요", FULL_PLAN);
-    // 10:00 and 11:30 are before 13:00 → should be skipped
-    expect(res.modifiedSchedule).not.toBeNull();
-    expect(res.modifiedSchedule.every((i) => timeToMinutes(i.time) >= 13 * 60)).toBe(true);
-  });
-
-  it("response text mentions the mentioned hour", () => {
-    const res = simulateLLMResponse("12시에 출발", FULL_PLAN);
-    expect(res.text).toContain("12시");
-  });
-
-  it("keeps all spots when none are before the mentioned hour", () => {
-    const res = simulateLLMResponse("늦잠 자서 8시에 출발", FULL_PLAN);
-    // All spots are at 10:00+ so none should be skipped
-    expect(res.modifiedSchedule).toEqual(FULL_PLAN);
-  });
-
-  it("returns full plan (fallback) when remaining would be empty", () => {
-    const res = simulateLLMResponse("늦잠 자서 23시에 출발합니다", FULL_PLAN);
-    // All spots are before 23:00 → remaining is empty → returns plan
-    expect(res.modifiedSchedule).toHaveLength(FULL_PLAN.length);
-  });
-});
-
-describe("simulateLLMResponse — rain scenario", () => {
-  it("identifies outdoor and indoor spots correctly", () => {
-    const res = simulateLLMResponse("비가 와서 어떻게 해야 하나요?", FULL_PLAN);
-    expect(res.text).toContain("메이지 신궁");
-    expect(res.text).toContain("우에노 공원");
-    expect(res.text).toContain("신주쿠 골든가이");
-    // Indoor spots should be in the "recommendation" part
-    expect(res.text).toContain("오모테산도");
-    expect(res.text).toContain("아키하바라");
-  });
-
-  it("modifiedSchedule is null for rain (advice only)", () => {
-    const res = simulateLLMResponse("오늘 비가 오는데요", FULL_PLAN);
-    expect(res.modifiedSchedule).toBeNull();
-  });
-
-  it("when all spots are indoor, replies with all-indoor message", () => {
-    const allIndoor = FULL_PLAN.map((s) => ({ ...s, indoor: true }));
-    const res = simulateLLMResponse("비가 오네요", allIndoor);
-    expect(res.text).toContain("실내 위주");
-    expect(res.modifiedSchedule).toBeNull();
-  });
-});
-
-describe("simulateLLMResponse — cancellation scenario", () => {
-  it("removes the mentioned spot from the plan", () => {
-    const res = simulateLLMResponse("아키하바라 취소됐어요", FULL_PLAN);
-    expect(res.modifiedSchedule).not.toBeNull();
-    expect(res.modifiedSchedule.some((i) => i.id === "d")).toBe(false);
-    expect(res.modifiedSchedule).toHaveLength(FULL_PLAN.length - 1);
-  });
-
-  it("response text mentions the cancelled spot", () => {
-    const res = simulateLLMResponse("신주쿠 골든가이 취소", FULL_PLAN);
-    expect(res.text).toContain("신주쿠 골든가이");
-  });
-});
-
-describe("simulateLLMResponse — unknown scenario (fallback)", () => {
-  it("returns null modifiedSchedule", () => {
-    const res = simulateLLMResponse("오늘 날씨가 좋네요", FULL_PLAN);
-    expect(res.modifiedSchedule).toBeNull();
-  });
-
-  it("response text contains plan length", () => {
-    const res = simulateLLMResponse("무엇을 추천하세요?", FULL_PLAN);
-    expect(res.text).toContain(`${FULL_PLAN.length}`);
-  });
-});
