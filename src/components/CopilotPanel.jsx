@@ -201,6 +201,7 @@ export default function CopilotPanel({
       if (parsed.scope === "partial") {
         const { applied, merged, report, staleHash } = applyPatches(schedule, parsed.patches, {
           expectedHash: requestHash,
+          allowedDays: scopeDays ? new Set(scopeDays) : null,
         });
         if (applied) {
           onScheduleChange?.(merged);

@@ -438,6 +438,15 @@ function fetchLegacyGoogleDirections(originLatLng, destLatLng, travelMode = "DRI
  *   departureTime — ISO 8601 UTC override. Only applied for TRANSIT/DRIVING.
  *   Defaults to the current moment when not provided (existing behaviour).
  */
+// Routes API rejects departureTime that is in the past or within ~30s of now.
+// Clamp any supplied time to at least 90 seconds from now so TRAFFIC_AWARE
+// and TRANSIT departure requests never hit INVALID_ARGUMENT on past schedules.
+const DEPARTURE_MIN_FUTURE_MS = 90_000;
+function clampDepartureTime(isoString) {
+  const requested = isoString ? new Date(isoString).getTime() : Date.now();
+  return new Date(Math.max(requested, Date.now() + DEPARTURE_MIN_FUTURE_MS)).toISOString();
+}
+
 async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, apiKey, opts = {}) {
   const isTransit = travelMode === "TRANSIT";
   const isDriving = travelMode === "DRIVING";
@@ -471,7 +480,7 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
   };
 
   if (isTransit) {
-    baseBody.departureTime = opts.departureTime ?? new Date().toISOString();
+    baseBody.departureTime = clampDepartureTime(opts.departureTime);
     // transitPreferences: { allowedTravelModes?: [...], routingPreference?: "LESS_WALKING"|"FEWER_TRANSFERS" }
     // Forwarded only when caller supplies explicit preferences — Routes API
     // rejects empty objects with INVALID_ARGUMENT.
@@ -489,7 +498,7 @@ async function fetchRoutesApiDirections(originLatLng, destLatLng, travelMode, ap
   }
   if (travelMode === "DRIVING") {
     baseBody.routingPreference = "TRAFFIC_AWARE";
-    baseBody.departureTime = opts.departureTime ?? new Date().toISOString();
+    baseBody.departureTime = clampDepartureTime(opts.departureTime);
   }
 
   const requestVariants = [];

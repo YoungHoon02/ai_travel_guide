@@ -425,11 +425,15 @@ select:focus, .field input:focus {
   display: grid;
   grid-template-columns: 360px 1fr;
   gap: 2px;
+  flex: 1;          /* fill remaining height in result-page flex column */
+  min-height: 0;    /* allow grid to shrink below content size */
+  overflow: hidden;
   border: 1px solid var(--mgs-border);
   background: var(--mgs-border);
 }
 .result-layout > * {
   background: var(--mgs-bg-card);
+  min-height: 0;
 }
 
 .panel {
@@ -440,13 +444,14 @@ select:focus, .field input:focus {
   clip-path: none;
 }
 
-.sidebar { overflow: hidden; }
+.sidebar { overflow: hidden; display: flex; flex-direction: column; }
 
 .panel-header {
   padding: 10px 16px;
   border-bottom: 2px solid var(--mgs-border);
   background: var(--mgs-bg);
   position: relative;
+  flex-shrink: 0;
 }
 .panel-header::before {
   content: "";
@@ -461,7 +466,8 @@ select:focus, .field input:focus {
 .panel-header p { margin-top: 4px; color: var(--mgs-text-dim); font-size: 10px; }
 
 .panel-body { padding: 10px; }
-.panel-body--schedule { padding: 0; max-height: calc(100vh - 140px); overflow: auto; }
+/* schedule panel fills the remaining sidebar height and scrolls internally */
+.panel-body--schedule { padding: 0; flex: 1; overflow: auto; max-height: none; }
 
 /* ─── Schedule table ───────────────────────────────────────────────────── */
 .schedule-table { width: 100%; border-collapse: separate; border-spacing: 0; border: none; border-radius: 0; }
@@ -501,13 +507,38 @@ tr:last-child td { border-bottom: none; }
 .row-highlight td { background: rgba(94,207,207,0.05); }
 .row-highlight td:first-child { box-shadow: inset 3px 0 0 var(--mgs-cyan); }
 
+/* Co-Pilot 수정됨 — 3.5s fade-out flash */
+@keyframes copilot-row-flash {
+  0%   { background: rgba(94,207,207,0.18); }
+  40%  { background: rgba(94,207,207,0.10); }
+  100% { background: transparent; }
+}
+.row-copilot-changed td { animation: copilot-row-flash 3.5s ease-out forwards; }
+.row-copilot-changed td:first-child { box-shadow: inset 3px 0 0 var(--mgs-cyan); }
+
+.schedule-copilot-badge {
+  display: inline-block; margin-left: 5px; font-size: 8px;
+  background: rgba(94,207,207,0.1); color: var(--mgs-cyan);
+  border-radius: 0; padding: 1px 6px; font-weight: 700;
+  vertical-align: middle; text-transform: uppercase;
+  border: 1px solid rgba(94,207,207,0.25);
+}
+
+.schedule-duration {
+  font-size: 10px;
+  color: var(--mgs-text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
 .thumb { width: 50px; height: 36px; border-radius: 0; object-fit: cover; border: 1px solid var(--mgs-border-light); }
 .thumb-highlight { outline: 2px solid var(--mgs-cyan); }
 
 /* ─── Map area ─────────────────────────────────────────────────────────── */
-.map-area { display: grid; grid-template-rows: auto 1fr; }
+/* flex column so map-box fills the remaining grid cell height */
+.map-area { display: flex; flex-direction: column; }
 
 .map-top {
+  flex-shrink: 0;
   padding: 8px 14px;
   border-bottom: 2px solid var(--mgs-border);
   display: flex; justify-content: space-between; align-items: center;
@@ -515,7 +546,8 @@ tr:last-child td { border-bottom: none; }
 }
 .map-top h3 { margin: 0; color: var(--mgs-orange); text-transform: uppercase; font-size: 12px; letter-spacing: 0.08em; }
 
-.map-box { position: relative; height: calc(100vh - 80px); min-height: 560px; }
+/* fills remaining flex space in map-area — no hardcoded calc(100vh) */
+.map-box { position: relative; flex: 1; min-height: 200px; }
 
 .map-info {
   position: absolute; right: 12px; top: 12px; z-index: 999;
@@ -699,18 +731,50 @@ tr:last-child td { border-bottom: none; }
 @keyframes lodging-pin-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }
 
 /* ─── Responsive ───────────────────────────────────────────────────────── */
+
+/* ≤1400px: 사이드바 폭 축소 */
+@media (max-width: 1400px) {
+  .result-layout { grid-template-columns: 300px 1fr; }
+}
+
+/* ≤1000px: 단일 컬럼 — result-layout을 flex column으로 변환 */
 @media (max-width: 1000px) {
   .progress { flex-wrap: wrap; }
   .intro-grid { grid-template-columns: 1fr; }
   .grid-3 { grid-template-columns: 1fr; }
-  .result-layout { grid-template-columns: 1fr; }
-  .map-box { height: 60vh; min-height: 420px; }
+  .result-layout {
+    grid-template-columns: 1fr;
+    flex: none;          /* 단일 컬럼에선 자연 높이 사용 */
+    overflow: visible;
+  }
+  .result-page { height: auto; overflow: auto; }  /* 단일 컬럼에선 스크롤 */
+  .map-box { min-height: 360px; height: 55vh; flex: none; }
+  .panel-body--schedule { max-height: 45vh; flex: none; }
   .day-slots-overview { grid-template-columns: 1fr; }
   .content-list--pick { grid-template-columns: 1fr; }
+  .var-handler { width: 100%; right: 0; border-radius: 8px 8px 0 0; }
+}
+
+/* ≤768px: 태블릿/모바일 */
+@media (max-width: 768px) {
+  .realtime-bar { grid-template-columns: 1fr 1fr; }
+  .map-box { height: 45vh; min-height: 280px; }
+  .panel-body--schedule { max-height: 40vh; }
+  .var-handler { width: 100%; right: 0; }
+  .copilot-fab { bottom: 56px; }
+  .copilot-panel-wrap { right: 0; width: 100%; max-width: 100%; bottom: 118px; }
+}
+
+/* ≤480px: 소형 모바일 */
+@media (max-width: 480px) {
+  .realtime-bar { grid-template-columns: 1fr; }
+  .result-layout { gap: 0; }
+  .realtime-bar__progress { margin-left: 0; }
 }
 
 /* ── result-page ──────────────────────────────────────────────────────── */
-.result-page { display: flex; flex-direction: column; gap: 2px; }
+/* height: 100% fills .app (100vh). The map-box then auto-fills via flex. */
+.result-page { display: flex; flex-direction: column; gap: 2px; height: 100%; }
 
 /* ── Real-time status bar ─────────────────────────────────────────────── */
 .realtime-bar {
@@ -731,6 +795,15 @@ tr:last-child td { border-bottom: none; }
 .realtime-bar__item { display: flex; align-items: baseline; gap: 5px; color: var(--mgs-text); }
 .realtime-bar__sub { font-size: 9px; opacity: 0.6; margin-left: 3px; }
 .realtime-bar__progress { margin-left: auto; }
+.realtime-bar__nav-btn {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 2px 7px;
+  background: var(--mgs-orange); color: var(--mgs-bg);
+  border-radius: 4px; text-decoration: none;
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+  transition: opacity 0.15s;
+}
+.realtime-bar__nav-btn:hover { opacity: 0.8; }
 .realtime-bar__badge--modified {
   background: var(--mgs-orange); color: #0a1a1e;
   font-size: 9px; font-weight: 700; border-radius: 0; padding: 2px 8px; text-transform: uppercase;
@@ -758,11 +831,18 @@ tr:last-child td { border-bottom: none; }
 
 /* ── Variable Handler Panel ───────────────────────────────────────────── */
 .var-handler {
+  position: fixed;
+  bottom: 0;
+  right: 0;
+  width: 380px;
+  max-width: 100vw;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column-reverse; /* toggle at bottom, body above */
   background: var(--mgs-bg-card);
   border: 1px solid var(--mgs-border);
-  border-radius: 0;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.4);
-  overflow: visible;
+  border-radius: 8px 8px 0 0;
+  box-shadow: 0 -4px 24px rgba(0,0,0,0.5);
   clip-path: none;
 }
 
@@ -770,11 +850,12 @@ tr:last-child td { border-bottom: none; }
   width: 100%; display: flex; align-items: center; gap: 10px;
   padding: 10px 18px;
   background: var(--mgs-bg);
-  border: none; border-bottom: 2px solid var(--mgs-border);
+  border: none; border-top: 2px solid var(--mgs-border);
   color: var(--mgs-orange);
   font-size: 12px; font-weight: 700;
   cursor: pointer; text-align: left; font-family: inherit;
   text-transform: uppercase; letter-spacing: 0.08em;
+  border-radius: 8px 8px 0 0;
 }
 .var-handler__toggle:hover { background: var(--mgs-bg-light); }
 .var-handler__toggle-icon { font-size: 16px; }
@@ -791,6 +872,8 @@ tr:last-child td { border-bottom: none; }
   padding: 12px 14px;
   display: grid;
   gap: 2px;
+  overflow-y: auto;
+  max-height: calc(80vh - 44px);
 }
 
 /* Context strip — grid cells */
@@ -5463,7 +5546,7 @@ img.dest-card__thumb {
 
 .copilot-fab {
   position: absolute;
-  bottom: 20px;
+  bottom: 72px;
   right: 20px;
   width: 52px;
   height: 52px;
@@ -5492,7 +5575,7 @@ img.dest-card__thumb {
 
 .copilot-panel-wrap {
   position: absolute;
-  bottom: 84px;
+  bottom: 136px;
   right: 20px;
   width: 380px;
   max-width: calc(100% - 40px);

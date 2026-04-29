@@ -387,7 +387,7 @@ export function scheduleHash(schedule) {
  *
  * Returns { applied, merged, report, touchedDays }.
  */
-export function applyPatches(schedule, patches, { force = false, expectedHash = null } = {}) {
+export function applyPatches(schedule, patches, { force = false, expectedHash = null, allowedDays = null } = {}) {
   if (!Array.isArray(patches) || patches.length === 0) {
     return { applied: false, merged: schedule, report: "no patches", touchedDays: [] };
   }
@@ -424,6 +424,7 @@ export function applyPatches(schedule, patches, { force = false, expectedHash = 
     if (op === "replace") {
       const existing = byId.get(patch.id);
       if (!existing) { skipped.push(`replace: id ${patch.id} not found`); continue; }
+      if (allowedDays && !allowedDays.has(existing.day)) { skipped.push(`replace: day ${existing.day} outside scope`); continue; }
       if (existing.locked && !force) { skipped.push(`replace: locked ${patch.id}`); continue; }
       // Merge fields but keep id + day immutable. endTime is recomputed if
       // duration or startTime changed (recalculateDayTimes does this anyway,
@@ -443,6 +444,7 @@ export function applyPatches(schedule, patches, { force = false, expectedHash = 
     if (op === "remove") {
       const existing = byId.get(patch.id);
       if (!existing) { skipped.push(`remove: id ${patch.id} not found`); continue; }
+      if (allowedDays && !allowedDays.has(existing.day)) { skipped.push(`remove: day ${existing.day} outside scope`); continue; }
       if (existing.locked && !force) { skipped.push(`remove: locked ${patch.id}`); continue; }
       next = next.filter((s) => s.id !== existing.id);
       byId.delete(existing.id);
@@ -453,6 +455,7 @@ export function applyPatches(schedule, patches, { force = false, expectedHash = 
       const slot = patch.slot;
       if (!slot || !slot.id) { skipped.push("insert: missing slot or id"); continue; }
       if (byId.has(slot.id)) { skipped.push(`insert: duplicate id ${slot.id}`); continue; }
+      if (allowedDays && !allowedDays.has(slot.day)) { skipped.push(`insert: day ${slot.day} outside scope`); continue; }
       // afterId=null/undefined means insert at the start of its day. Position
       // doesn't matter for correctness because recalculateDayTimes resorts by
       // startTime — we just need the slot in the array.
@@ -772,6 +775,11 @@ export function detectScopeFromMessage(message, { currentDay = null, dayCount = 
     if (/오늘|지금|now|today/i.test(text)) return { days: [currentDay], reason: "today" };
     if (/내일|tomorrow/i.test(text) && (dayCount == null || currentDay + 1 <= dayCount)) {
       return { days: [currentDay + 1], reason: "tomorrow" };
+    }
+    // Early-end / rest intent without explicit day reference → current day only.
+    // Treats "일찍 쉬고 싶다" as a single-day event, not a multi-day policy.
+    if (/일찍|조기|쉬고|마무리|끝내|그만|퇴근|호텔로|숙소로|종료/.test(text)) {
+      return { days: [currentDay], reason: "early-end-today" };
     }
   }
   return { days: null, reason: "no-temporal-cue" };

@@ -304,6 +304,31 @@ export default function App() {
     canUndo: canUndoSchedule,
     canRedo: canRedoSchedule,
   } = useScheduleHistory([]);
+
+  // ── Co-Pilot sidebar highlight — track which slot IDs were modified by the
+  // Result-page Co-Pilot so the schedule table can flash those rows.
+  const [copilotChangedIds, setCopilotChangedIds] = useState([]);
+  const copilotChangedTimerRef = useRef(null);
+  const handleResultCopilotChange = useCallback((newSchedule) => {
+    const changedIds = newSchedule
+      .filter((s) => s.kind === "activity")
+      .filter((s) => {
+        const old = schedule.find((o) => o.id === s.id);
+        if (!old) return true;
+        return old.startTime !== s.startTime || old.day !== s.day || old.name !== s.name;
+      })
+      .map((s) => s.id);
+    commitSchedule(newSchedule);
+    if (changedIds.length > 0) {
+      if (copilotChangedTimerRef.current) clearTimeout(copilotChangedTimerRef.current);
+      setCopilotChangedIds(changedIds);
+      copilotChangedTimerRef.current = setTimeout(() => {
+        setCopilotChangedIds([]);
+        copilotChangedTimerRef.current = null;
+      }, 3500);
+    }
+  }, [schedule, commitSchedule]);
+
   const dayAssignments = useMemo(() => {
     const out = {};
     const maxDay = Math.max(1, getScheduleDayCount(schedule));
@@ -2436,7 +2461,20 @@ export default function App() {
               )}
               <span className="realtime-bar__item realtime-bar__progress">
                 ✅ 완료 {planProgress.done.length}곳 · 남은 {planProgress.remaining.length}곳
-                {planProgress.next && <span className="realtime-bar__sub">다음: {planProgress.next.name} ({planProgress.next.startTime ?? planProgress.next.time})</span>}
+                {planProgress.next && (
+                  <>
+                    <span className="realtime-bar__sub">다음: {planProgress.next.name} ({planProgress.next.startTime ?? planProgress.next.time})</span>
+                    <a
+                      href={planProgress.next.latlng
+                        ? `https://www.google.com/maps/dir/?api=1&destination=${planProgress.next.latlng[0]},${planProgress.next.latlng[1]}`
+                        : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(planProgress.next.name)}`
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="realtime-bar__nav-btn"
+                    >🗺 길 안내</a>
+                  </>
+                )}
               </span>
               {canUndoSchedule && (
                 <span className="realtime-bar__badge--modified">↩ Co-Pilot 변경 적용됨 — 되돌리기 가능</span>
@@ -2483,12 +2521,20 @@ export default function App() {
                         {group.items.map((p) => {
                           const isDone = planProgress.done.some((d) => d.id === p.id);
                           const isNext = planProgress.next?.id === p.id;
+                          const isCopilotChanged = copilotChangedIds.includes(p.id);
+                          const isHighlighted = highlightIds.includes(p.id);
                           return (
-                            <tr key={p.id} className={`${highlightIds.includes(p.id) ? "row-highlight" : ""} ${isDone ? "row-done" : ""} ${isNext ? "row-next" : ""}`}>
+                            <tr key={p.id} className={[
+                              isHighlighted ? "row-highlight" : "",
+                              isCopilotChanged ? "row-copilot-changed" : "",
+                              isDone ? "row-done" : "",
+                              isNext ? "row-next" : "",
+                            ].filter(Boolean).join(" ")}>
                               <td>DAY{p.day}</td>
                               <td>{p.startTime}</td>
                               <td>
                                 {p.name}
+                                {isCopilotChanged && <span className="schedule-copilot-badge">✦ 수정됨</span>}
                                 {isDone && <span className="schedule-done-badge">✓ 완료</span>}
                                 {isNext && <span className="schedule-next-badge">▶ 다음</span>}
                                 <br />
@@ -2500,10 +2546,18 @@ export default function App() {
                                 ) : null}
                               </td>
                               <td className="schedule-stay-cell">
-                                <ScoreStars value={p.visitScore} />
+                                {p.duration > 0 ? (
+                                  <span className="schedule-duration">
+                                    {p.duration >= 60
+                                      ? `${Math.floor(p.duration / 60)}h${p.duration % 60 > 0 ? `${p.duration % 60}m` : ""}`
+                                      : `${p.duration}m`}
+                                  </span>
+                                ) : (
+                                  <ScoreStars value={p.visitScore} />
+                                )}
                               </td>
                               <td>
-                                <img className={`thumb ${highlightIds.includes(p.id) ? "thumb-highlight" : ""}`} src={p.img} alt={p.name} />
+                                <img className={`thumb ${isHighlighted ? "thumb-highlight" : ""}`} src={p.img} alt={p.name} />
                               </td>
                             </tr>
                           );
@@ -2595,47 +2649,47 @@ export default function App() {
                 </div>
               </section>
             </div>
-
-            {/* ── AI 변수 조치 Panel ────────────────────────────────────────── */}
-            {/* 컨텍스트(시간/위치/날씨/진행/구간/주변)는 VariableHandlerPanel 이
-                담당하고, 실제 LLM 채팅은 children 으로 슬롯 인된 CopilotPanel
-                이 처리합니다. Edit View 와 같은 컴포넌트라서 race guard·locked
-                보호·partial patch·scope 절감이 trip-time 에서도 그대로 작동. */}
-            <VariableHandlerPanel
-              show={showVarHandler}
-              onToggle={() => setShowVarHandler((v) => !v)}
-              currentTime={currentTimeStr}
-              location={locationName ?? (userLocation ? `${userLocation.lat.toFixed(3)}, ${userLocation.lng.toFixed(3)}` : null)}
-              weather={weather}
-              progress={planProgress}
-              nearbyPlaces={nearbyPlaces}
-              nearbyPlaceType={nearbyPlaceType}
-              onNearbyTypeChange={handleNearbyTypeChange}
-              hasGoogleMaps={Boolean(window.__googleMapsLoaded)}
-              scheduleDirections={scheduleDirections}
-            >
-              <ErrorBoundary label="Co-Pilot 패널 (trip-time)">
-                <CopilotPanel
-                  schedule={schedule}
-                  onScheduleChange={commitSchedule}
-                  onUndo={undoSchedule}
-                  onRedo={redoSchedule}
-                  canUndo={canUndoSchedule}
-                  canRedo={canRedoSchedule}
-                  currentTime={currentTimeStr}
-                  weather={weather ? `${weather.icon ?? ""} ${weather.temp ?? ""} ${weather.description ?? ""}`.trim() : "맑음"}
-                  location={locationName ?? `${country ?? ""} ${region ?? ""}`.trim()}
-                  progress={planProgress}
-                  directions={scheduleDirections}
-                  currentDay={currentTripDay}
-                  onLog={appendLog}
-                  compact
-                />
-              </ErrorBoundary>
-            </VariableHandlerPanel>
           </motion.div>
         )}
       </AnimatePresence>
+      {/* ── AI 변수 조치 Panel ─────────────────────────────────────────────
+          AnimatePresence 밖에 렌더링: Framer Motion 의 transform(scale/y)이
+          position:fixed 의 기준축을 viewport → 변환된 ancestor 로 바꿔버려
+          패널이 지도 아래에 묻히는 문제를 방지한다. */}
+      {step >= RESULT_STEP && (
+        <VariableHandlerPanel
+          show={showVarHandler}
+          onToggle={() => setShowVarHandler((v) => !v)}
+          currentTime={currentTimeStr}
+          location={locationName ?? (userLocation ? `${userLocation.lat.toFixed(3)}, ${userLocation.lng.toFixed(3)}` : null)}
+          weather={weather}
+          progress={planProgress}
+          nearbyPlaces={nearbyPlaces}
+          nearbyPlaceType={nearbyPlaceType}
+          onNearbyTypeChange={handleNearbyTypeChange}
+          hasGoogleMaps={Boolean(window.__googleMapsLoaded)}
+          scheduleDirections={scheduleDirections}
+        >
+          <ErrorBoundary label="Co-Pilot 패널 (trip-time)">
+            <CopilotPanel
+              schedule={schedule}
+              onScheduleChange={handleResultCopilotChange}
+              onUndo={undoSchedule}
+              onRedo={redoSchedule}
+              canUndo={canUndoSchedule}
+              canRedo={canRedoSchedule}
+              currentTime={currentTimeStr}
+              weather={weather ? `${weather.icon ?? ""} ${weather.temp ?? ""} ${weather.description ?? ""}`.trim() : "맑음"}
+              location={locationName ?? `${country ?? ""} ${region ?? ""}`.trim()}
+              progress={planProgress}
+              directions={scheduleDirections}
+              currentDay={currentTripDay}
+              onLog={appendLog}
+              compact
+            />
+          </ErrorBoundary>
+        </VariableHandlerPanel>
+      )}
       {!isMockupFrame && !isRealMobile && (
         <>
           <button
