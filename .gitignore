@@ -4,3 +4,6 @@ dist/
 .env.local
 .env.*.local
 *.log
+
+# Local-only legacy UI backup (snapshot before redesign)
+src/legacy/
