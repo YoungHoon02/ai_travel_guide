@@ -22,7 +22,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import { calcSlotProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil, parseBooleanEnv } from "./utils.js";
+import { calcSlotProgress, sumVisitScores as sumVisitScoresUtil, assignOptimalDays as assignOptimalDaysUtil, parseBooleanEnv, nearestSlot } from "./utils.js";
 import { useScheduleHistory } from "./hooks/useScheduleHistory.js";
 import { loadPlansDB, fetchWeather, fetchNearbyPlaces, fetchScheduleDirections, reverseGeocode, callDestinationLLM, forwardGeocode, generateLodgings, generateItinerary, callGenericLLM as callGenericLLMExported, fetchPlacePhoto } from "./api.js";
 import {
@@ -48,6 +48,7 @@ import AutoDetectPlanInput, { PlanInputPreview } from "./components/AutoDetectPl
 import StarfieldBackground from "./components/StarfieldBackground.jsx";
 import GoogleMapView from "./components/GoogleMapView.jsx";
 import HotelBrowseModal, { bookingSearchUrl, agodaSearchUrl, googleMapsUrl } from "./components/HotelBrowseModal.jsx";
+import PlanLibraryModal from "./components/PlanLibraryModal.jsx";
 import { buildLuckyThemePrompt } from "./prompts/index.js";
 import DestPreviewMap from "./components/DestPreviewMap.jsx";
 import GlobeDart from "./components/GlobeDart.jsx";
@@ -66,6 +67,16 @@ import {
   createActivitySlot,
   findSlotById,
 } from "./store/schedule.js";
+import {
+  createPlan as createPlanRecord,
+  updatePlan as updatePlanRecord,
+  addRevision as addPlanRevision,
+  getPlan as getPlanRecord,
+  loadPlans as loadAllPlans,
+} from "./store/plans.js";
+import { scheduleToPlan, planToSchedule, suggestPlanName } from "./store/scheduleAdapter.js";
+import TripTimeView from "./components/TripTimeView.jsx";
+import { useGeolocation } from "./hooks/useGeolocation.js";
 
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -284,6 +295,13 @@ export default function App() {
     setHighlightItemId(null);
     setHighlightIds([]);
     setTransitPopup(null);
+    setCurrentPlanId(null);
+    setLastSavedAt(null);
+    if (planSaveTimerRef.current) {
+      clearTimeout(planSaveTimerRef.current);
+      planSaveTimerRef.current = null;
+    }
+    lastSnapshotForRevisionRef.current = null;
   }, []);
 
   const [loadingElapsed, setLoadingElapsed] = useState(0);
@@ -305,11 +323,28 @@ export default function App() {
     canRedo: canRedoSchedule,
   } = useScheduleHistory([]);
 
+  // ── Plan persistence — currentPlanId ties the in-memory schedule to a
+  // localStorage Plan record. Created when an itinerary is first generated,
+  // updated on every meaningful schedule change (debounced), cleared on wizard
+  // reset. Also tracks last-save timestamp for the UI indicator.
+  const [currentPlanId, setCurrentPlanId] = useState(null);
+  const [lastSavedAt, setLastSavedAt] = useState(null);
+  const planSaveTimerRef = useRef(null);
+  const lastSnapshotForRevisionRef = useRef(null);
+  const [savedPlanCount, setSavedPlanCount] = useState(() => {
+    try { return loadAllPlans().length; } catch { return 0; }
+  });
+  const refreshSavedPlanCount = useCallback(() => {
+    try { setSavedPlanCount(loadAllPlans().length); } catch { /* noop */ }
+  }, []);
+
   // ── Co-Pilot sidebar highlight — track which slot IDs were modified by the
   // Result-page Co-Pilot so the schedule table can flash those rows.
   const [copilotChangedIds, setCopilotChangedIds] = useState([]);
   const copilotChangedTimerRef = useRef(null);
-  const handleResultCopilotChange = useCallback((newSchedule) => {
+  // Second-arg meta: { triggerInput, scope, changes } from CopilotPanel.
+  // Used for plan_revisions audit trail (Track B Phase 2).
+  const handleResultCopilotChange = useCallback((newSchedule, meta = {}) => {
     const changedIds = newSchedule
       .filter((s) => s.kind === "activity")
       .filter((s) => {
@@ -318,6 +353,7 @@ export default function App() {
         return old.startTime !== s.startTime || old.day !== s.day || old.name !== s.name;
       })
       .map((s) => s.id);
+    const beforeSnapshot = schedule;
     commitSchedule(newSchedule);
     if (changedIds.length > 0) {
       if (copilotChangedTimerRef.current) clearTimeout(copilotChangedTimerRef.current);
@@ -327,7 +363,23 @@ export default function App() {
         copilotChangedTimerRef.current = null;
       }, 3500);
     }
-  }, [schedule, commitSchedule]);
+    // Persist Co-Pilot revision (audit trail) when tied to a saved plan.
+    if (currentPlanId && (meta.triggerInput || changedIds.length > 0)) {
+      try {
+        addPlanRevision(currentPlanId, {
+          triggerType: "user_input",
+          triggerInput: meta.triggerInput ?? "",
+          beforeSnapshot,
+          afterSnapshot: newSchedule,
+          diffSummary:
+            meta.changes ??
+            `${changedIds.length}개 슬롯 변경 (scope: ${meta.scope ?? "?"})`,
+        });
+      } catch (err) {
+        console.warn("[plans] addRevision failed", err);
+      }
+    }
+  }, [schedule, commitSchedule, currentPlanId]);
 
   const dayAssignments = useMemo(() => {
     const out = {};
@@ -337,6 +389,147 @@ export default function App() {
     }
     return out;
   }, [schedule]);
+
+  // ── Plan auto-save ────────────────────────────────────────────────────────
+  // Builds a meta payload from the current trip context. This is recomputed
+  // on every render (cheap), and only consumed inside the auto-save effect.
+  const planMetaForSave = useMemo(() => {
+    const start = planInputParsed?.startDate ?? null;
+    const end = planInputParsed?.endDate ?? null;
+    const dayCount = getScheduleDayCount(schedule) || planInputParsed?.days || null;
+    const nights = dayCount ? Math.max(0, dayCount - 1) : null;
+    const lodging = getPrimaryLodging(schedule);
+    const center = lodging?.latlng ?? selectedDest?.latlng ?? null;
+    return {
+      name: suggestPlanName({
+        destination: { country, city: region, latlng: center },
+        dates: { start, end, nights, days: dayCount },
+      }),
+      destination: {
+        country: country || "",
+        city: region || "",
+        latlng: Array.isArray(center) ? [center[0], center[1]] : null,
+      },
+      dates: { start, end, nights, days: dayCount },
+      rawInput: planInputRaw || days || "",
+      preferences: activeThemeChip ? [activeThemeChip] : [],
+      status: "ready",
+    };
+  }, [country, region, days, planInputRaw, planInputParsed, activeThemeChip, schedule, selectedDest]);
+
+  // Auto-create a Plan record on first non-empty schedule, then debounce-save
+  // updates on every subsequent schedule change. Skips while the wizard is
+  // pre-step-3 (Result page) — itinerary loading flicker shouldn't churn
+  // localStorage. The patchSchedule path (transparent geocoding) doesn't bypass
+  // this effect, but writes are debounced so it's harmless.
+  useEffect(() => {
+    if (step < RESULT_STEP) return;
+    if (!schedule || schedule.length === 0) return;
+    if (!currentPlanId) {
+      const created = createPlanRecord(scheduleToPlan(schedule, planMetaForSave));
+      setCurrentPlanId(created.id);
+      setLastSavedAt(new Date());
+      return;
+    }
+    if (planSaveTimerRef.current) clearTimeout(planSaveTimerRef.current);
+    planSaveTimerRef.current = setTimeout(() => {
+      const planForSave = scheduleToPlan(schedule, { ...planMetaForSave, id: currentPlanId });
+      updatePlanRecord(currentPlanId, {
+        name: planForSave.name,
+        destination: planForSave.destination,
+        dates: planForSave.dates,
+        rawInput: planForSave.rawInput,
+        preferences: planForSave.preferences,
+        status: planForSave.status,
+        days: planForSave.days,
+      });
+      setLastSavedAt(new Date());
+      planSaveTimerRef.current = null;
+    }, 1000);
+    return () => {
+      if (planSaveTimerRef.current) {
+        clearTimeout(planSaveTimerRef.current);
+        planSaveTimerRef.current = null;
+      }
+    };
+  }, [schedule, step, currentPlanId, planMetaForSave]);
+
+  // Refresh saved-plan count whenever the modal is opened or save fires.
+  useEffect(() => { refreshSavedPlanCount(); }, [planListOpen, lastSavedAt, refreshSavedPlanCount]);
+
+  // Open a plan from the library: rehydrate schedule, hop to Result step,
+  // restore relevant context (country/region/dates so subsequent edits keep
+  // the right metadata).
+  const openPlanFromLibrary = useCallback((plan) => {
+    if (!plan) return;
+    const restored = planToSchedule(plan);
+    if (plan.destination?.country) setCountry(plan.destination.country);
+    if (plan.destination?.city) setRegion(plan.destination.city);
+    if (plan.dates?.days) {
+      const n = plan.dates.nights ?? Math.max(0, plan.dates.days - 1);
+      setDays(`${n}박 ${plan.dates.days}일`);
+    }
+    if (plan.rawInput) setPlanInputRaw(plan.rawInput);
+    if (plan.dates?.start || plan.dates?.end || plan.dates?.days) {
+      setPlanInputParsed({
+        startDate: plan.dates.start ?? null,
+        endDate: plan.dates.end ?? null,
+        days: plan.dates.days ?? null,
+        nights: plan.dates.nights ?? null,
+      });
+    }
+    setCurrentPlanId(plan.id);
+    setLastSavedAt(plan.updatedAt ? new Date(plan.updatedAt) : new Date());
+    resetSchedule(restored);
+    setPlanListOpen(false);
+    setStep(RESULT_STEP);
+  }, [resetSchedule]);
+
+  // After delete/rename: if the deleted plan was the current one, drop ref so
+  // a fresh save creates a new plan rather than ressurrecting the deleted one.
+  const handlePlanLibraryAfterChange = useCallback(() => {
+    refreshSavedPlanCount();
+    if (currentPlanId && !getPlanRecord(currentPlanId)) {
+      setCurrentPlanId(null);
+      setLastSavedAt(null);
+    }
+  }, [currentPlanId, refreshSavedPlanCount]);
+
+  // ── TripTimeView state ───────────────────────────────────────────────────
+  // "edit" = 기존 Result 편집 뷰, "live" = trip-time 전용 화면
+  const [viewMode, setViewMode] = useState("edit");
+
+  // Slot status mutation (완료/스킵). Replaces slot in schedule + commits.
+  const handleSlotStatus = useCallback((slotId, status) => {
+    commitSchedule((prev) =>
+      prev.map((s) => (s.id === slotId ? { ...s, status } : s))
+    );
+  }, [commitSchedule]);
+
+  // Co-Pilot prefill: open the variable handler panel + inject a prefilled message.
+  // We rely on the copilotPrefillRef trick: CopilotPanel reads prefill on mount/update.
+  const copilotPrefillRef = useRef(null);
+  const handleDelayCopilot = useCallback((slotName) => {
+    setShowVarHandler(true);
+    copilotPrefillRef.current = `[${slotName}] 일정이 지연되었습니다. 남은 일정을 조정해 주세요.`;
+  }, []);
+
+  // Restore a revision snapshot: convert PlanItem[] (beforeSnapshot) back to Slot[].
+  // The snapshot stores raw Slot fields inside PlanItem.meta.slotId etc.
+  // We preserve them as-is since they came from scheduleToPlan.
+  const handleRestoreRevision = useCallback((beforeSnapshot) => {
+    if (!Array.isArray(beforeSnapshot)) return;
+    commitSchedule(beforeSnapshot);
+  }, [commitSchedule]);
+
+  // Derive plan revisions for the current plan (read-only; updates on planId change).
+  const [planRevisions, setPlanRevisions] = useState([]);
+  useEffect(() => {
+    if (!currentPlanId) { setPlanRevisions([]); return; }
+    const plan = getPlanRecord(currentPlanId);
+    setPlanRevisions(plan?.revisions ?? []);
+  }, [currentPlanId, lastSavedAt]);
+
   /** Legacy setter shim — rebuilds schedule from id assignments via adapter. */
   const setDayAssignments = useCallback((updater) => {
     commitSchedule((prevSchedule) => {
@@ -376,10 +569,20 @@ export default function App() {
   const currentTimeStr = `${String(nowDate.getHours()).padStart(2, "0")}:${String(nowDate.getMinutes()).padStart(2, "0")}`;
   const currentDateStr = nowDate.toLocaleDateString("ko-KR", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
 
-  // ── Browser Geolocation ────────────────────────────────────────────────────
+  // ── Browser Geolocation — continuous tracking via useGeolocation ─────────
+  // Live GPS: started on-demand when user presses "GPS 시작" in TripTimeView.
+  // Falls back to a one-shot getCurrentPosition for the weather / nearby / map
+  // features that need an approximate location even before tracking begins.
+  const { position: gpsPosition, error: gpsError, isTracking: isGpsTracking, startTracking: startGpsTracking } = useGeolocation();
   const [userLocation, setUserLocation] = useState(null);
   const [locationName, setLocationName] = useState(null);
+  // Prefer live GPS position; fall back to one-shot on mount.
   useEffect(() => {
+    if (gpsPosition) {
+      setUserLocation({ lat: gpsPosition.lat, lng: gpsPosition.lng });
+      reverseGeocode(gpsPosition.lat, gpsPosition.lng).then((n) => n && setLocationName(n));
+      return;
+    }
     if (!navigator.geolocation) return;
     navigator.geolocation.getCurrentPosition(
       async (pos) => {
@@ -388,9 +591,9 @@ export default function App() {
         const name = await reverseGeocode(loc.lat, loc.lng);
         setLocationName(name);
       },
-      () => setUserLocation({ lat: 35.6812, lng: 139.7671 })
+      () => {} // silent fail: userLocation stays null
     );
-  }, []);
+  }, [gpsPosition]);
 
   // ── Weather ────────────────────────────────────────────────────────────────
   const [weather, setWeather] = useState(null);
@@ -2342,6 +2545,16 @@ export default function App() {
                           <button type="button" className="dev-jump__link" onClick={() => setStep(1)}>→ 일정</button>
                           <button type="button" className="dev-jump__link" onClick={() => setStep(2)}>→ 여행 구성</button>
                         </div>
+                        {savedPlanCount > 0 && (
+                          <button
+                            type="button"
+                            className="plan-library-entry"
+                            onClick={() => setPlanListOpen(true)}
+                            title="저장된 플랜 불러오기"
+                          >
+                            📂 내 플랜 ({savedPlanCount})
+                          </button>
+                        )}
                       </>
                     )}
                     {step === 1 && (
@@ -2479,9 +2692,52 @@ export default function App() {
               {canUndoSchedule && (
                 <span className="realtime-bar__badge--modified">↩ Co-Pilot 변경 적용됨 — 되돌리기 가능</span>
               )}
+              {currentPlanId && (
+                <button
+                  type="button"
+                  className="plan-save-indicator"
+                  onClick={() => setPlanListOpen(true)}
+                  title="저장된 플랜 목록 열기"
+                  style={{ background: "transparent", border: "none", cursor: "pointer" }}
+                >
+                  <span className="plan-save-indicator__dot" />
+                  💾 저장됨
+                  {lastSavedAt && (
+                    <span className="realtime-bar__sub">
+                      {lastSavedAt.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}
+                    </span>
+                  )}
+                </button>
+              )}
+              <button
+                type="button"
+                className={`realtime-bar__mode-btn${viewMode === "live" ? " active" : ""}`}
+                onClick={() => setViewMode((m) => m === "live" ? "edit" : "live")}
+                title={viewMode === "live" ? "편집 뷰로 전환" : "여행 중 모드로 전환"}
+              >
+                {viewMode === "live" ? "✏️ 편집 뷰" : "🧭 여행 중"}
+              </button>
             </div>
 
-            <div className="result-layout">
+            {viewMode === "live" && (
+              <TripTimeView
+                schedule={schedule}
+                currentDay={currentTripDay}
+                currentTimeStr={currentTimeStr}
+                nowMins={planProgress.nowMins}
+                userLatLng={userLocation}
+                isGpsTracking={isGpsTracking}
+                onStartGps={startGpsTracking}
+                gpsError={gpsError}
+                planRevisions={planRevisions}
+                onSlotStatus={handleSlotStatus}
+                onDelayCopilot={handleDelayCopilot}
+                onRestoreRevision={handleRestoreRevision}
+                onClose={() => setViewMode("edit")}
+              />
+            )}
+
+            <div className={`result-layout${viewMode === "live" ? " result-layout--hidden" : ""}`}>
               <aside className="panel sidebar">
                 <div className="panel-header">
                   <h3>
@@ -2773,6 +3029,13 @@ export default function App() {
           setSelectedLodgingId(hotel.id);
         }}
         onLog={appendLog}
+      />
+      <PlanLibraryModal
+        isOpen={planListOpen}
+        onClose={() => setPlanListOpen(false)}
+        currentPlanId={currentPlanId}
+        onOpenPlan={openPlanFromLibrary}
+        onAfterChange={handlePlanLibraryAfterChange}
       />
     </div>
   );

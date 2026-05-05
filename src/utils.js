@@ -96,6 +96,50 @@ export function distSq(a, b) {
   return dx * dx + dy * dy;
 }
 
+/** Haversine distance in metres between two [lat, lng] pairs. */
+export function haversineM(a, b) {
+  if (!a || !b) return Infinity;
+  const R = 6371000;
+  const dLat = ((b[0] - a[0]) * Math.PI) / 180;
+  const dLng = ((b[1] - a[1]) * Math.PI) / 180;
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((a[0] * Math.PI) / 180) *
+      Math.cos((b[0] * Math.PI) / 180) *
+      Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
+
+/**
+ * Find the nearest activity slot for the given day and user position.
+ *
+ * @param {Object[]} schedule  Slot[]
+ * @param {{lat: number, lng: number}} userLatLng
+ * @param {number} currentDay
+ * @returns {{ slot: Object|null, distM: number, proximity: "arrived"|"nearby"|"away"|"unknown" }}
+ */
+export function nearestSlot(schedule, userLatLng, currentDay) {
+  if (!userLatLng || !Array.isArray(schedule)) {
+    return { slot: null, distM: Infinity, proximity: "unknown" };
+  }
+  const userPos = [userLatLng.lat, userLatLng.lng];
+  const candidates = schedule.filter(
+    (s) => s.kind === "activity" && s.day === currentDay && Array.isArray(s.latlng)
+  );
+  if (candidates.length === 0) return { slot: null, distM: Infinity, proximity: "unknown" };
+
+  let best = null;
+  let bestDist = Infinity;
+  for (const s of candidates) {
+    const d = haversineM(userPos, s.latlng);
+    if (d < bestDist) { bestDist = d; best = s; }
+  }
+  const proximity =
+    bestDist <= 200 ? "arrived" :
+    bestDist <= 2000 ? "nearby" : "away";
+  return { slot: best, distM: Math.round(bestDist), proximity };
+}
+
 /**
  * Nearest-neighbour ordering: start from `originLatLng`, always pick the
  * closest remaining spot.

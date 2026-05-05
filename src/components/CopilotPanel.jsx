@@ -204,7 +204,11 @@ export default function CopilotPanel({
           allowedDays: scopeDays ? new Set(scopeDays) : null,
         });
         if (applied) {
-          onScheduleChange?.(merged);
+          onScheduleChange?.(merged, {
+            triggerInput: text,
+            scope: "partial",
+            changes: parsed.changes,
+          });
           if (parsed.changes) setChanges(parsed.changes);
           if (report) console.info("[Co-Pilot] partial applied with skips:", report);
         } else {
@@ -225,7 +229,11 @@ export default function CopilotPanel({
         }
         const { applied, merged, report } = applyProposedSchedule(schedule, parsed.modifiedSchedule);
         if (applied) {
-          onScheduleChange?.(merged);
+          onScheduleChange?.(merged, {
+            triggerInput: text,
+            scope: "full",
+            changes: parsed.changes,
+          });
           if (parsed.changes) setChanges(parsed.changes);
         } else {
           setMessages((prev) => [
